@@ -1,0 +1,45 @@
+# Include important documentation files
+include README.md
+include LICENSE
+include CHANGELOG.md
+include AUTHORS.md
+
+# Include configuration files
+include pyproject.toml
+include setup.py
+include requirements*.txt
+include tox.ini
+
+# Include data files
+recursive-include hierarchical_clustering/data *.csv *.json *.txt
+recursive-include hierarchical_clustering/examples *.py *.ipynb
+recursive-include docs *.rst *.md *.py *.txt *.png *.jpg *.svg
+recursive-include tests *.py *.csv *.json
+
+# Exclude unwanted files
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .DS_Store
+recursive-exclude * .git*
+recursive-exclude * *.so
+recursive-exclude * *.dylib
+recursive-exclude * *.dll
+
+# Exclude build artifacts
+exclude .coverage
+exclude .pytest_cache
+recursive-exclude build *
+recursive-exclude dist *
+recursive-exclude *.egg-info *
+
+# Exclude editor files
+recursive-exclude * .vscode
+recursive-exclude * .idea
+recursive-exclude * *.swp
+recursive-exclude * *.swo
+recursive-exclude * *~
+
+# Exclude development files
+exclude .pre-commit-config.yaml
+exclude .github
+recursive-exclude .github *

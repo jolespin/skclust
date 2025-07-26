@@ -1,0 +1,35 @@
+# Optional dependencies for enhanced functionality
+
+# Fast clustering
+fastcluster>=1.2.0
+
+# Tree operations and phylogenetic analysis
+scikit-bio>=0.5.6
+
+# Dynamic tree cutting (may need custom installation)
+# dynamicTreeCut>=0.1.0
+
+# Enhanced network analysis (may need custom installation)
+# ensemble-networkx>=0.1.0
+
+# Additional visualization and analysis
+plotly>=5.0.0
+dash>=2.0.0
+
+# Development and testing
+pytest>=6.0.0
+pytest-cov>=2.10.0
+black>=21.0.0
+isort>=5.0.0
+flake8>=3.8.0
+mypy>=0.800
+
+# Documentation
+sphinx>=4.0.0
+sphinx-rtd-theme>=0.5.0
+nbsphinx>=0.8.0
+myst-parser>=0.15.0
+
+# Jupyter notebooks
+jupyter>=1.0.0
+ipykernel>=6.0.0
