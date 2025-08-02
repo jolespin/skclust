@@ -1,10 +1,13 @@
 # skclust
-
 A comprehensive clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![scikit-learn compatible](https://img.shields.io/badge/sklearn-compatible-orange.svg)](https://scikit-learn.org)
+![Beta](https://img.shields.io/badge/status-beta-orange)
+![Not Production Ready](https://img.shields.io/badge/production-not%20ready-red)
+
+⚠️ **Warning: This is a beta release and has not been thoroughly tested.**
 
 ##  Features
 
