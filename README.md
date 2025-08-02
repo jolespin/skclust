@@ -24,7 +24,7 @@ A comprehensive clustering toolkit with advanced tree cutting, visualization, an
 ### Basic Installation
 
 ```bash
-pip install hierarchical-clustering
+pip install skclust
 ```
 
 ### Development Installation
@@ -422,23 +422,6 @@ labels = clusterer.fit_transform(df_scaled)
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
 
-### Development Setup
-
-```bash
-git clone https://github.com/your-username/hierarchical-clustering.git
-cd hierarchical-clustering
-pip install -e .[dev]
-
-# Run tests
-pytest tests/
-
-# Format code
-black hierarchical_clustering/
-isort hierarchical_clustering/
-
-# Type checking
-mypy hierarchical_clustering/
-```
 
 ##  License
 
