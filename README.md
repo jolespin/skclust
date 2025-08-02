@@ -1,6 +1,6 @@
-# HierarchicalClustering
+# skclust
 
-A comprehensive hierarchical clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities.
+A comprehensive clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -30,8 +30,8 @@ pip install hierarchical-clustering
 ### Development Installation
 
 ```bash
-git clone https://github.com/your-username/hierarchical-clustering.git
-cd hierarchical-clustering
+git clone https://github.com/jolespin/skclust.git
+cd skclust
 pip install -e .[all]
 ```
 
@@ -39,19 +39,19 @@ pip install -e .[all]
 
 ```bash
 # Basic functionality only
-pip install hierarchical-clustering
+pip install skclust
 
 # With fast clustering (fastcluster)
-pip install hierarchical-clustering[fast]
+pip install skclust[fast]
 
 # With tree operations (scikit-bio)
-pip install hierarchical-clustering[tree]
+pip install skclust[tree]
 
 # With all optional features
-pip install hierarchical-clustering[all]
+pip install skclust[all]
 
 # Development installation
-pip install hierarchical-clustering[dev]
+pip install skclust[dev]
 ```
 
 ##  Dependencies
@@ -74,7 +74,7 @@ pip install hierarchical-clustering[dev]
 ##  Quick Start
 
 ```python
-from hierarchical_clustering import HierarchicalClustering
+from skclust import HierarchicalClustering
 import pandas as pd
 import numpy as np
 
@@ -105,7 +105,7 @@ print(f"Found {clusterer.n_clusters_} clusters")
 ### 1. Basic Clustering with Different Methods
 
 ```python
-from hierarchical_clustering import HierarchicalClustering
+from skclust import HierarchicalClustering
 import pandas as pd
 
 # Ward clustering with dynamic cutting
@@ -228,7 +228,7 @@ except ValueError as e:
 ### 7. Convenience Function
 
 ```python
-from hierarchical_clustering import hierarchical_clustering
+from skclust import hierarchical_clustering
 
 # Quick clustering with default parameters
 clusterer = hierarchical_clustering(
@@ -244,7 +244,7 @@ print(f"Quick clustering: {clusterer.n_clusters_} clusters")
 ```python
 import pandas as pd
 import numpy as np
-from hierarchical_clustering import HierarchicalClustering
+from skclust import HierarchicalClustering
 
 # Simulate gene expression data
 np.random.seed(42)

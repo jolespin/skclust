@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Setup script for HierarchicalClustering package.
+Setup script for skclust package.
 """
 
 import os
@@ -20,7 +20,7 @@ except FileNotFoundError:
 # Package metadata
 __version__ = "2025.7.26"
 __author__ = "Josh L. Espinoza"
-__email__ = "josh.espinoza@example.com"  # Update with actual email
+__email__ = "jol.espinoz@gmail.com" 
 
 # Core requirements - these are essential for basic functionality
 install_requires = [
@@ -131,17 +131,16 @@ setup(
     version=__version__,
     author=__author__,
     author_email=__email__,
-    description='A comprehensive hierarchical clustering toolkit with advanced tree cutting and visualization',
+    description='A comprehensive clustering toolkit with advanced tree cutting and visualization',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/your-username/hierarchical-clustering',  # Update with actual repo
+    url='https://github.com/jolespin/skclust',  
     project_urls={
-        'Bug Reports': 'https://github.com/your-username/hierarchical-clustering/issues',
-        'Source': 'https://github.com/your-username/hierarchical-clustering',
-        'Documentation': 'https://hierarchical-clustering.readthedocs.io',
+        'Bug Reports': 'https://github.com/jolespin/skclust/issues',
+        'Source': 'https://github.com/jolespin/skclust',
     },
     packages=find_packages(exclude=['tests', 'tests.*', 'docs', 'examples']),
-    py_modules=['hierarchical_clustering'],  # If it's a single module
+    py_modules=['skclust'],  # If it's a single module
     classifiers=classifiers,
     keywords=' '.join(keywords),
     python_requires=python_requires,
@@ -151,7 +150,7 @@ setup(
     # Entry points for command-line tools (if any)
     entry_points={
         'console_scripts': [
-            # 'hierarchical-cluster=hierarchical_clustering.cli:main',
+            # 'skclust=skclust.cli:main',
         ],
     },
     
@@ -168,7 +167,7 @@ setup(
     
     # For data files outside of packages
     # data_files=[
-    #     ('share/hierarchical_clustering/examples', ['examples/basic_example.py']),
+    #     ('share/skclust/examples', ['examples/basic_example.py']),
     # ],
     
     # Testing

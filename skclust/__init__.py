@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HierarchicalClustering: A comprehensive hierarchical clustering toolkit
+skclust: A comprehensive hierarchical clustering toolkit
 ========================================================================
 
 A scikit-learn compatible implementation of hierarchical clustering with 
