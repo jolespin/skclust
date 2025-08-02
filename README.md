@@ -455,16 +455,6 @@ The original implementation provided the foundation for the hierarchical cluster
 
 If you use this package in your research, please cite:
 
-```bibtex
-@software{hierarchical_clustering,
-  author = {Josh L. Espinoza},
-  title = {HierarchicalClustering: A comprehensive hierarchical clustering toolkit},
-  url = {https://github.com/your-username/hierarchical-clustering},
-  version = {2025.7.26},
-  year = {2025}
-}
-```
-
 **Original Soothsayer implementation:**
 ```bibtex
 @article{espinoza2021predicting,
@@ -480,3 +470,14 @@ If you use this package in your research, please cite:
   url={https://doi.org/10.1371/journal.pcbi.1008857}
 }
 ```
+
+```bibtex
+@software{hierarchical_clustering,
+  author = {Josh L. Espinoza},
+  title = {HierarchicalClustering: A comprehensive hierarchical clustering toolkit},
+  url = {https://github.com/your-username/hierarchical-clustering},
+  version = {2025.7.26},
+  year = {2025}
+}
+```
+
