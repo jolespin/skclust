@@ -9,7 +9,7 @@ advanced tree cutting, visualization, and network analysis capabilities.
 Author: Josh L. Espinoza
 """
 
-__version__ = "2025.8.5"
+__version__ = "2025.8.12"
 __author__ = "Josh L. Espinoza"
 
 import os
@@ -840,6 +840,11 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         Linkage criterion for agglomerative clustering: 'ward', 'complete', 'average', 'single'
     covariance_type : str, default='full'
         Covariance type for GMM: 'full', 'tied', 'diag', 'spherical'
+    coverage_boost : float, default=1.5
+        Multiplier to boost minority class representation. Higher values give more
+        coverage to minority classes. Set to 1.0 for purely proportional sampling.
+    min_samples_per_class : int, default=2
+        Minimum number of representative samples per class, regardless of proportion
     
     Attributes
     ----------
@@ -855,77 +860,14 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         Dictionary storing fitted clusterers for each class (when stratified) or overall
     is_pandas_input_ : bool
         Whether the input was a pandas DataFrame or Series
-        
-        
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import pairwise_distances
-    
-    # Generate sample data
-    X, y = make_classification(n_samples=500, n_features=10, n_classes=3, 
-                             n_informative=8, n_redundant=2, 
-                             class_sep=1.0, random_state=42)
-    
-    # Split into train/test
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, 
-                                                        stratify=y, random_state=42)
-    
-    print("Testing RepresentativeSampler:")
-    print("=" * 40)
-    
-    # Basic usage
-    sampler = RepresentativeSampler(sampling_size=0.1, stratify=True, random_state=42)
-    X_repr = sampler.fit_transform(X_train, y_train)
-    
-    print(f"Original shape: {X_train.shape}")
-    print(f"Representative shape: {X_repr.shape}")
-    print(f"Number of clusters: {sampler.n_clusters_}")
-    print(f"Number of representatives: {np.sum(sampler.representatives_)}")
-    
-    # Test with pandas
-    print("\nTesting with pandas:")
-    df = pd.DataFrame(X_train, index=[f"sample_{i:03d}" for i in range(len(X_train))])
-    y_series = pd.Series(y_train, index=df.index)
-    
-    sampler_pd = RepresentativeSampler(sampling_size=20, stratify=True)
-    repr_df = sampler_pd.fit_transform(df, y_series)
-    
-    print(f"Pandas input shape: {df.shape}")
-    print(f"Pandas output shape: {repr_df.shape}")
-    print(f"Representatives (first 5): {repr_df.index[:5].tolist()}")
-    
-    # Test different algorithms
-    print("\nTesting different algorithms:")
-    algorithms = [
-        ('K-Means', {'clustering_algorithm': 'kmeans'}),
-        ('Agglomerative', {'clustering_algorithm': 'agglomerative', 'linkage': 'ward'}),
-        ('GMM', {'clustering_algorithm': 'gmm', 'covariance_type': 'full'})
-    ]
-    
-    for name, params in algorithms:
-        sampler = RepresentativeSampler(sampling_size=0.1, stratify=True, 
-                                       random_state=42, **params)
-        sampler.fit(X_train, y_train)
-        n_repr = np.sum(sampler.representatives_)
-        print(f"{name:12}: {n_repr} representatives, {sampler.n_clusters_} clusters")
-    
-    print("\nClass distribution comparison:")
-    original_dist = Counter(y_train)
-    print(f"Original: {dict(original_dist)}")
-    
-    for name, params in algorithms:
-        sampler = RepresentativeSampler(sampling_size=0.1, stratify=True, 
-                                       random_state=42, **params)
-        sampler.fit(X_train, y_train)
-        repr_indices = np.where(sampler.representatives_)[0]
-        repr_y = y_train[repr_indices]
-        repr_dist = Counter(repr_y)
-        print(f"{name:12}: {dict(repr_dist)}")
+    report_ : dict
+        Nested dictionary containing evaluation metrics for imbalance handling
     """
     
     def __init__(self, sampling_size=0.1, stratify=True, clustering_algorithm='kmeans',
                  distance_matrix=None, random_state=None, representative_method='centroid',
-                 linkage='ward', covariance_type='full'):
+                 linkage='ward', covariance_type='full', coverage_boost=1.5, 
+                 min_samples_per_class=2):
         self.sampling_size = sampling_size
         self.stratify = stratify
         self.clustering_algorithm = clustering_algorithm
@@ -934,7 +876,231 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         self.representative_method = representative_method
         self.linkage = linkage
         self.covariance_type = covariance_type
+        self.coverage_boost = coverage_boost
+        self.min_samples_per_class = min_samples_per_class
+    
+    def _calculate_adaptive_clusters(self, class_counts, k_total):
+        """
+        Calculate number of clusters per class with coverage boost for minority classes.
         
+        Parameters
+        ----------
+        class_counts : dict
+            Dictionary mapping class labels to their counts
+        k_total : int
+            Total number of clusters to distribute
+            
+        Returns
+        -------
+        cluster_allocation : dict
+            Dictionary mapping class labels to number of clusters
+        """
+        total_samples = sum(class_counts.values())
+        max_class_count = max(class_counts.values())
+        cluster_allocation = {}
+        
+        # Calculate base allocation with coverage boost
+        boosted_weights = {}
+        total_boosted_weight = 0
+        
+        for class_label, class_count in class_counts.items():
+            # Calculate imbalance ratio (how underrepresented this class is)
+            imbalance_ratio = max_class_count / class_count
+            
+            # Apply coverage boost - minority classes get more representation
+            boost_factor = imbalance_ratio ** (1 / self.coverage_boost) if self.coverage_boost > 1.0 else 1.0
+            boosted_weight = (class_count / total_samples) * boost_factor
+            
+            boosted_weights[class_label] = boosted_weight
+            total_boosted_weight += boosted_weight
+        
+        # Normalize and allocate clusters
+        allocated_clusters = 0
+        for class_label, class_count in class_counts.items():
+            # Calculate proportional allocation
+            normalized_weight = boosted_weights[class_label] / total_boosted_weight
+            proportional_clusters = max(1, round(k_total * normalized_weight))
+            
+            # Apply minimum constraint
+            final_clusters = max(self.min_samples_per_class, proportional_clusters)
+            
+            # Cap at class size
+            final_clusters = min(final_clusters, class_count)
+            
+            cluster_allocation[class_label] = final_clusters
+            allocated_clusters += final_clusters
+        
+        # Adjust if we've over-allocated due to minimums
+        if allocated_clusters > k_total:
+            # Proportionally reduce larger allocations first
+            excess = allocated_clusters - k_total
+            sorted_classes = sorted(cluster_allocation.items(), key=lambda x: x[1], reverse=True)
+            
+            for class_label, clusters in sorted_classes:
+                if excess <= 0:
+                    break
+                reduction = min(excess, max(0, clusters - self.min_samples_per_class))
+                cluster_allocation[class_label] -= reduction
+                excess -= reduction
+        
+        return cluster_allocation
+    
+    def _calculate_evaluation_metrics(self, y, representative_indices):
+        """
+        Calculate evaluation metrics for imbalance handling.
+        
+        Parameters
+        ----------
+        y : array-like
+            Original target values
+        representative_indices : array-like
+            Indices of selected representative samples
+            
+        Returns
+        -------
+        report : dict
+            Nested dictionary with evaluation metrics
+        """
+        if y is None:
+            return {}
+        
+        # Get original and representative class distributions
+        original_counts = Counter(y)
+        repr_y = y[representative_indices]
+        repr_counts = Counter(repr_y)
+        
+        total_original = len(y)
+        total_repr = len(representative_indices)
+        
+        # Calculate class-level metrics
+        class_metrics = {}
+        for class_label in original_counts.keys():
+            orig_count = original_counts[class_label]
+            repr_count = repr_counts.get(class_label, 0)
+            
+            orig_prop = orig_count / total_original
+            repr_prop = repr_count / total_repr if total_repr > 0 else 0
+            
+            # Coverage: what percentage of this class is represented
+            coverage = repr_count / orig_count if orig_count > 0 else 0
+            
+            # Proportion change
+            prop_change = (repr_prop - orig_prop) / orig_prop if orig_prop > 0 else 0
+            
+            class_metrics[class_label] = {
+                'original_count': orig_count,
+                'representative_count': repr_count,
+                'original_proportion': orig_prop,
+                'representative_proportion': repr_prop,
+                'coverage_rate': coverage,
+                'proportion_change': prop_change
+            }
+        
+        # Calculate overall metrics
+        # Imbalance Ratio (IR) - ratio of majority to minority class
+        max_count = max(original_counts.values())
+        min_count = min(original_counts.values())
+        original_ir = max_count / min_count if min_count > 0 else float('inf')
+        
+        repr_max_count = max(repr_counts.values()) if repr_counts else 0
+        repr_min_count = min(repr_counts.values()) if repr_counts else 0
+        repr_ir = repr_max_count / repr_min_count if repr_min_count > 0 else float('inf')
+        
+        # Distribution similarity (using Jensen-Shannon divergence)
+        def js_divergence(p, q):
+            """Calculate Jensen-Shannon divergence between two probability distributions."""
+            # Ensure same support
+            all_classes = set(p.keys()) | set(q.keys())
+            p_vec = np.array([p.get(c, 0) for c in all_classes])
+            q_vec = np.array([q.get(c, 0) for c in all_classes])
+            
+            # Normalize
+            p_vec = p_vec / p_vec.sum() if p_vec.sum() > 0 else p_vec
+            q_vec = q_vec / q_vec.sum() if q_vec.sum() > 0 else q_vec
+            
+            # Add small epsilon to avoid log(0)
+            epsilon = 1e-10
+            p_vec = p_vec + epsilon
+            q_vec = q_vec + epsilon
+            
+            # Calculate JS divergence
+            m = 0.5 * (p_vec + q_vec)
+            js = 0.5 * np.sum(p_vec * np.log(p_vec / m)) + 0.5 * np.sum(q_vec * np.log(q_vec / m))
+            return js
+        
+        # Convert counts to proportions for JS divergence
+        orig_props = {k: v/total_original for k, v in original_counts.items()}
+        repr_props = {k: v/total_repr for k, v in repr_counts.items()} if total_repr > 0 else {}
+        
+        js_div = js_divergence(orig_props, repr_props)
+        
+        # Overall sampling rate per class
+        sampling_rates = {}
+        for class_label in original_counts.keys():
+            sampling_rates[class_label] = repr_counts.get(class_label, 0) / original_counts[class_label]
+        
+        overall_metrics = {
+            'total_samples': total_original,
+            'representative_samples': total_repr,
+            'overall_sampling_rate': total_repr / total_original,
+            'original_imbalance_ratio': original_ir,
+            'representative_imbalance_ratio': repr_ir,
+            'imbalance_ratio_change': (repr_ir - original_ir) / original_ir if original_ir != float('inf') else 0,
+            'distribution_similarity_js': js_div,  # Lower is more similar
+            'class_sampling_rates': sampling_rates
+        }
+        
+        # Summary assessment
+        minority_classes = [c for c in original_counts.keys() 
+                          if original_counts[c] == min(original_counts.values())]
+        majority_classes = [c for c in original_counts.keys() 
+                          if original_counts[c] == max(original_counts.values())]
+        
+        avg_minority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
+                                       for c in minority_classes])
+        avg_majority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
+                                       for c in majority_classes])
+        
+        summary = {
+            'minority_classes': minority_classes,
+            'majority_classes': majority_classes,
+            'average_minority_coverage': avg_minority_coverage,
+            'average_majority_coverage': avg_majority_coverage,
+            'coverage_boost_effectiveness': avg_minority_coverage / avg_majority_coverage if avg_majority_coverage > 0 else 0,
+            'recommendation': self._generate_recommendation(overall_metrics, class_metrics)
+        }
+        
+        return {
+            'class_metrics': class_metrics,
+            'overall_metrics': overall_metrics,
+            'summary': summary
+        }
+    
+    def _generate_recommendation(self, overall_metrics, class_metrics):
+        """Generate recommendations based on the metrics."""
+        recommendations = []
+        
+        # Check if distribution changed dramatically
+        if overall_metrics['distribution_similarity_js'] > 0.1:
+            recommendations.append("Distribution significantly altered from original")
+        
+        # Check coverage rates
+        min_coverage = min(metrics['coverage_rate'] for metrics in class_metrics.values())
+        if min_coverage < 0.01:  # Less than 1% coverage
+            recommendations.append("Some classes have very low coverage - consider increasing min_samples_per_class")
+        
+        # Check if imbalance was improved or worsened
+        ir_change = overall_metrics['imbalance_ratio_change']
+        if ir_change > 0.1:
+            recommendations.append("Sampling increased imbalance - consider lowering coverage_boost")
+        elif ir_change < -0.2:
+            recommendations.append("Sampling significantly reduced imbalance - good for minority class representation")
+        
+        if not recommendations:
+            recommendations.append("Sampling appears well-balanced")
+        
+        return recommendations
+
     def fit(self, X, y=None):
         """
         Fit the representative sampler.
@@ -971,6 +1137,13 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         if self.representative_method not in ['centroid', 'medoid']:
             raise ValueError("representative_method must be 'centroid' or 'medoid'")
         
+        # Validate coverage_boost
+        if self.coverage_boost <= 0:
+            raise ValueError("coverage_boost must be positive")
+            
+        if self.min_samples_per_class < 1:
+            raise ValueError("min_samples_per_class must be >= 1")
+        
         # Validate distance matrix if provided
         if self.distance_matrix is not None:
             if self.clustering_algorithm != 'agglomerative':
@@ -996,6 +1169,7 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
             original_index = np.arange(len(X))
         
         # Handle pandas Series for y
+        original_y = y
         if isinstance(y, pd.Series):
             y = y.values
         
@@ -1022,14 +1196,11 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         cluster_counter = 0
         
         if self.stratify:
-            # Calculate class proportions and number of clusters per class
+            # Calculate class proportions and number of clusters per class using adaptive method
             class_counts = Counter(y)
-            total_samples = len(y)
+            cluster_allocation = self._calculate_adaptive_clusters(class_counts, k_total)
             
-            for class_label, class_count in class_counts.items():
-                class_proportion = class_count / total_samples
-                k_class = max(1, round(k_total * class_proportion))
-                
+            for class_label, k_class in cluster_allocation.items():
                 # Get samples for this class
                 class_mask = (y == class_label)
                 X_class = X[class_mask]
@@ -1140,6 +1311,9 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         representative_indices = np.array(representative_indices)
         representative_scores = np.array(representative_scores)
         self.n_clusters_ = len(representative_indices)
+        
+        # Calculate evaluation metrics
+        self.report_ = self._calculate_evaluation_metrics(original_y, representative_indices)
         
         # Calculate scores for all samples (distance to cluster centroid or medoid score)
         all_scores = self._calculate_all_scores(X, cluster_labels, representative_indices)
