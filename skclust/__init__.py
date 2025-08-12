@@ -867,7 +867,7 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
     def __init__(self, sampling_size=0.1, stratify=True, clustering_algorithm='kmeans',
                  distance_matrix=None, random_state=None, representative_method='centroid',
                  linkage='ward', covariance_type='full', coverage_boost=1.5, 
-                 min_samples_per_class=2):
+                 min_samples_per_class=2, max_clusters_per_class=None):
         self.sampling_size = sampling_size
         self.stratify = stratify
         self.clustering_algorithm = clustering_algorithm
@@ -878,6 +878,7 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
         self.covariance_type = covariance_type
         self.coverage_boost = coverage_boost
         self.min_samples_per_class = min_samples_per_class
+        self.max_clusters_per_class = max_clusters_per_class
     
     def _calculate_adaptive_clusters(self, class_counts, k_total):
         """
@@ -923,6 +924,10 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
             
             # Apply minimum constraint
             final_clusters = max(self.min_samples_per_class, proportional_clusters)
+            
+            # Apply maximum constraint if specified
+            if self.max_clusters_per_class is not None:
+                final_clusters = min(final_clusters, self.max_clusters_per_class)
             
             # Cap at class size
             final_clusters = min(final_clusters, class_count)
