@@ -18,7 +18,7 @@ except FileNotFoundError:
     long_description = "A comprehensive hierarchical clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities."
 
 # Package metadata
-__version__ = "2025.7.26"
+__version__ = "2025.8.5"
 __author__ = "Josh L. Espinoza"
 __email__ = "jol.espinoz@gmail.com" 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skclust"
-version = "2025.7.26"
+version = "2025.8.5"
 authors = [
     {name = "Josh L. Espinoza", email = "jol.espinoz@gmail.com"},
 ]

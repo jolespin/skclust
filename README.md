@@ -7,7 +7,7 @@ A comprehensive clustering toolkit with advanced tree cutting, visualization, an
 ![Beta](https://img.shields.io/badge/status-beta-orange)
 ![Not Production Ready](https://img.shields.io/badge/production-not%20ready-red)
 
-?????? **Warning: This is a beta release and has not been thoroughly tested.**
+**Warning: This is a beta release and has not been thoroughly tested.**
 
 ##  Features
 
