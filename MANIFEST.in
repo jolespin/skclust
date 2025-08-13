@@ -2,19 +2,10 @@
 include README.md
 include LICENSE
 include CHANGELOG.md
-include AUTHORS.md
 
 # Include configuration files
-include pyproject.toml
 include setup.py
 include requirements*.txt
-include tox.ini
-
-# Include data files
-recursive-include hierarchical_clustering/data *.csv *.json *.txt
-recursive-include hierarchical_clustering/examples *.py *.ipynb
-recursive-include docs *.rst *.md *.py *.txt *.png *.jpg *.svg
-recursive-include tests *.py *.csv *.json
 
 # Exclude unwanted files
 recursive-exclude * __pycache__

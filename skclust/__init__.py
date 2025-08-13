@@ -9,7 +9,7 @@ advanced tree cutting, visualization, and network analysis capabilities.
 Author: Josh L. Espinoza
 """
 
-__version__ = "2025.8.12"
+__version__ = "2025.8.12.post1"
 __author__ = "Josh L. Espinoza"
 
 import os
@@ -56,14 +56,14 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import (
     silhouette_samples, 
     silhouette_score,
+    pairwise_distances_argmin_min,
 )
 
 
 from sklearn.cluster import (
     KMeans, 
-    AgglomerativeClustering,
+    MiniBatchKMeans,
 )
-from sklearn.mixture import GaussianMixture
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import (
     check_X_y, 
@@ -71,6 +71,7 @@ from sklearn.utils.validation import (
 )
 from sklearn.utils.multiclass import check_classification_targets
 
+from loguru import logger
 
 try:
     from fastcluster import linkage as fast_linkage
@@ -813,351 +814,50 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 
         return summary_dict
 
-class RepresentativeSampler(BaseEstimator, TransformerMixin):
+
+class KMeansRepresentativeSampler(BaseEstimator, TransformerMixin):
     """
-    A scikit-learn compatible class that selects representative samples
-    through clustering, maintaining class proportions when stratified.
+    K-means-based sampler for creating test sets with many clusters (k = 10% of data).
+    Optimized for large datasets where traditional clustering would be too slow.
     
     Parameters
     ----------
-    sampling_size : float or int, default=0.1
-        If float (0 < sampling_size < 1.0): proportion of samples to select
-        If int (sampling_size >= 1): exact number of samples to select
+    sampling_size : float, default=0.1
+        Proportion of data to use as test set (determines k = sampling_size * n_samples)
     stratify : bool, default=True
-        Whether to maintain original class proportions in the clustering
-    clustering_algorithm : str, default='kmeans'
-        Clustering algorithm to use: 'kmeans', 'agglomerative', or 'gmm'
-    distance_matrix : array-like of shape (n_samples, n_samples), default=None
-        Precomputed distance matrix. Only used with agglomerative clustering.
-        If provided, X should be ignored during clustering (but still passed for validation)
-    random_state : int, default=None
-        Random state for reproducible results
-    representative_method : str, default='centroid'
-        Method to select representative sample from each cluster:
-        - 'centroid': Sample closest to cluster centroid
-        - 'medoid': Sample with minimum sum of distances to all other samples in cluster
-    linkage : str, default='ward'
-        Linkage criterion for agglomerative clustering: 'ward', 'complete', 'average', 'single'
-    covariance_type : str, default='full'
-        Covariance type for GMM: 'full', 'tied', 'diag', 'spherical'
+        Whether to maintain class proportions in clustering
+    method : str, default='minibatch'
+        Clustering method: 'minibatch' (fast), 'hierarchical' (balanced), 'kmeans' (slow but exact)
+    batch_size : int, default=1000
+        Batch size for MiniBatchKMeans (only used with method='minibatch')
     coverage_boost : float, default=1.5
-        Multiplier to boost minority class representation. Higher values give more
-        coverage to minority classes. Set to 1.0 for purely proportional sampling.
-    min_samples_per_class : int, default=2
-        Minimum number of representative samples per class, regardless of proportion
-    
-    Attributes
-    ----------
-    n_clusters_ : int
-        Total number of clusters created
-    labels_ : array-like of shape (n_samples,) or pandas Series
-        Cluster labels for each sample. Returns pandas Series if input was pandas.
-    representatives_ : array-like of shape (n_samples,) or pandas Series
-        Boolean mask indicating which samples are representatives. Returns pandas Series if input was pandas.
-    scores_ : array-like of shape (n_samples,) or pandas Series  
-        Representative scores for all samples (higher is better). Returns pandas Series if input was pandas.
-    clusterers_ : dict
-        Dictionary storing fitted clusterers for each class (when stratified) or overall
-    is_pandas_input_ : bool
-        Whether the input was a pandas DataFrame or Series
-    report_ : dict
-        Nested dictionary containing evaluation metrics for imbalance handling
+        Boost factor for minority classes when stratified
+    min_clusters_per_class : int, default=10
+        Minimum clusters per class regardless of proportion
+    random_state : int, default=None
+        Random state for reproducibility
     """
     
-    def __init__(self, sampling_size=0.1, stratify=True, clustering_algorithm='kmeans',
-                 distance_matrix=None, random_state=None, representative_method='centroid',
-                 linkage='ward', covariance_type='full', coverage_boost=1.5, 
-                 min_samples_per_class=2, max_clusters_per_class=None):
+    def __init__(self, sampling_size=0.1, stratify=True, method='minibatch', 
+                 batch_size=1000, coverage_boost=1.5, min_clusters_per_class=10,
+                 random_state=None):
         self.sampling_size = sampling_size
         self.stratify = stratify
-        self.clustering_algorithm = clustering_algorithm
-        self.distance_matrix = distance_matrix
-        self.random_state = random_state
-        self.representative_method = representative_method
-        self.linkage = linkage
-        self.covariance_type = covariance_type
+        self.method = method
+        self.batch_size = batch_size
         self.coverage_boost = coverage_boost
-        self.min_samples_per_class = min_samples_per_class
-        self.max_clusters_per_class = max_clusters_per_class
+        self.min_clusters_per_class = min_clusters_per_class
+        self.random_state = random_state
     
-    def _calculate_adaptive_clusters(self, class_counts, k_total):
-        """
-        Calculate number of clusters per class with coverage boost for minority classes.
-        
-        Parameters
-        ----------
-        class_counts : dict
-            Dictionary mapping class labels to their counts
-        k_total : int
-            Total number of clusters to distribute
-            
-        Returns
-        -------
-        cluster_allocation : dict
-            Dictionary mapping class labels to number of clusters
-        """
-        total_samples = sum(class_counts.values())
-        max_class_count = max(class_counts.values())
-        cluster_allocation = {}
-        
-        # Calculate base allocation with coverage boost
-        boosted_weights = {}
-        total_boosted_weight = 0
-        
-        for class_label, class_count in class_counts.items():
-            # Calculate imbalance ratio (how underrepresented this class is)
-            imbalance_ratio = max_class_count / class_count
-            
-            # Apply coverage boost - minority classes get more representation
-            boost_factor = imbalance_ratio ** (1 / self.coverage_boost) if self.coverage_boost > 1.0 else 1.0
-            boosted_weight = (class_count / total_samples) * boost_factor
-            
-            boosted_weights[class_label] = boosted_weight
-            total_boosted_weight += boosted_weight
-        
-        # Normalize and allocate clusters
-        allocated_clusters = 0
-        for class_label, class_count in class_counts.items():
-            # Calculate proportional allocation
-            normalized_weight = boosted_weights[class_label] / total_boosted_weight
-            proportional_clusters = max(1, round(k_total * normalized_weight))
-            
-            # Apply minimum constraint
-            final_clusters = max(self.min_samples_per_class, proportional_clusters)
-            
-            # Apply maximum constraint if specified
-            if self.max_clusters_per_class is not None:
-                final_clusters = min(final_clusters, self.max_clusters_per_class)
-            
-            # Cap at class size
-            final_clusters = min(final_clusters, class_count)
-            
-            cluster_allocation[class_label] = final_clusters
-            allocated_clusters += final_clusters
-        
-        # Adjust if we've over-allocated due to minimums
-        if allocated_clusters > k_total:
-            # Proportionally reduce larger allocations first
-            excess = allocated_clusters - k_total
-            sorted_classes = sorted(cluster_allocation.items(), key=lambda x: x[1], reverse=True)
-            
-            for class_label, clusters in sorted_classes:
-                if excess <= 0:
-                    break
-                reduction = min(excess, max(0, clusters - self.min_samples_per_class))
-                cluster_allocation[class_label] -= reduction
-                excess -= reduction
-        
-        return cluster_allocation
-    
-    def _calculate_evaluation_metrics(self, y, representative_indices):
-        """
-        Calculate evaluation metrics for imbalance handling.
-        
-        Parameters
-        ----------
-        y : array-like
-            Original target values
-        representative_indices : array-like
-            Indices of selected representative samples
-            
-        Returns
-        -------
-        report : dict
-            Nested dictionary with evaluation metrics
-        """
-        if y is None:
-            return {}
-        
-        # Get original and representative class distributions
-        original_counts = Counter(y)
-        repr_y = y[representative_indices]
-        repr_counts = Counter(repr_y)
-        
-        total_original = len(y)
-        total_repr = len(representative_indices)
-        
-        # Calculate class-level metrics
-        class_metrics = {}
-        for class_label in original_counts.keys():
-            orig_count = original_counts[class_label]
-            repr_count = repr_counts.get(class_label, 0)
-            
-            orig_prop = orig_count / total_original
-            repr_prop = repr_count / total_repr if total_repr > 0 else 0
-            
-            # Coverage: what percentage of this class is represented
-            coverage = repr_count / orig_count if orig_count > 0 else 0
-            
-            # Proportion change
-            prop_change = (repr_prop - orig_prop) / orig_prop if orig_prop > 0 else 0
-            
-            class_metrics[class_label] = {
-                'original_count': orig_count,
-                'representative_count': repr_count,
-                'original_proportion': orig_prop,
-                'representative_proportion': repr_prop,
-                'coverage_rate': coverage,
-                'proportion_change': prop_change
-            }
-        
-        # Calculate overall metrics
-        # Imbalance Ratio (IR) - ratio of majority to minority class
-        max_count = max(original_counts.values())
-        min_count = min(original_counts.values())
-        original_ir = max_count / min_count if min_count > 0 else float('inf')
-        
-        repr_max_count = max(repr_counts.values()) if repr_counts else 0
-        repr_min_count = min(repr_counts.values()) if repr_counts else 0
-        repr_ir = repr_max_count / repr_min_count if repr_min_count > 0 else float('inf')
-        
-        # Distribution similarity (using Jensen-Shannon divergence)
-        def js_divergence(p, q):
-            """Calculate Jensen-Shannon divergence between two probability distributions."""
-            # Ensure same support
-            all_classes = set(p.keys()) | set(q.keys())
-            p_vec = np.array([p.get(c, 0) for c in all_classes])
-            q_vec = np.array([q.get(c, 0) for c in all_classes])
-            
-            # Normalize
-            p_vec = p_vec / p_vec.sum() if p_vec.sum() > 0 else p_vec
-            q_vec = q_vec / q_vec.sum() if q_vec.sum() > 0 else q_vec
-            
-            # Add small epsilon to avoid log(0)
-            epsilon = 1e-10
-            p_vec = p_vec + epsilon
-            q_vec = q_vec + epsilon
-            
-            # Calculate JS divergence
-            m = 0.5 * (p_vec + q_vec)
-            js = 0.5 * np.sum(p_vec * np.log(p_vec / m)) + 0.5 * np.sum(q_vec * np.log(q_vec / m))
-            return js
-        
-        # Convert counts to proportions for JS divergence
-        orig_props = {k: v/total_original for k, v in original_counts.items()}
-        repr_props = {k: v/total_repr for k, v in repr_counts.items()} if total_repr > 0 else {}
-        
-        js_div = js_divergence(orig_props, repr_props)
-        
-        # Overall sampling rate per class
-        sampling_rates = {}
-        for class_label in original_counts.keys():
-            sampling_rates[class_label] = repr_counts.get(class_label, 0) / original_counts[class_label]
-        
-        overall_metrics = {
-            'total_samples': total_original,
-            'representative_samples': total_repr,
-            'overall_sampling_rate': total_repr / total_original,
-            'original_imbalance_ratio': original_ir,
-            'representative_imbalance_ratio': repr_ir,
-            'imbalance_ratio_change': (repr_ir - original_ir) / original_ir if original_ir != float('inf') else 0,
-            'distribution_similarity_js': js_div,  # Lower is more similar
-            'class_sampling_rates': sampling_rates
-        }
-        
-        # Summary assessment
-        minority_classes = [c for c in original_counts.keys() 
-                          if original_counts[c] == min(original_counts.values())]
-        majority_classes = [c for c in original_counts.keys() 
-                          if original_counts[c] == max(original_counts.values())]
-        
-        avg_minority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
-                                       for c in minority_classes])
-        avg_majority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
-                                       for c in majority_classes])
-        
-        summary = {
-            'minority_classes': minority_classes,
-            'majority_classes': majority_classes,
-            'average_minority_coverage': avg_minority_coverage,
-            'average_majority_coverage': avg_majority_coverage,
-            'coverage_boost_effectiveness': avg_minority_coverage / avg_majority_coverage if avg_majority_coverage > 0 else 0,
-            'recommendation': self._generate_recommendation(overall_metrics, class_metrics)
-        }
-        
-        return {
-            'class_metrics': class_metrics,
-            'overall_metrics': overall_metrics,
-            'summary': summary
-        }
-    
-    def _generate_recommendation(self, overall_metrics, class_metrics):
-        """Generate recommendations based on the metrics."""
-        recommendations = []
-        
-        # Check if distribution changed dramatically
-        if overall_metrics['distribution_similarity_js'] > 0.1:
-            recommendations.append("Distribution significantly altered from original")
-        
-        # Check coverage rates
-        min_coverage = min(metrics['coverage_rate'] for metrics in class_metrics.values())
-        if min_coverage < 0.01:  # Less than 1% coverage
-            recommendations.append("Some classes have very low coverage - consider increasing min_samples_per_class")
-        
-        # Check if imbalance was improved or worsened
-        ir_change = overall_metrics['imbalance_ratio_change']
-        if ir_change > 0.1:
-            recommendations.append("Sampling increased imbalance - consider lowering coverage_boost")
-        elif ir_change < -0.2:
-            recommendations.append("Sampling significantly reduced imbalance - good for minority class representation")
-        
-        if not recommendations:
-            recommendations.append("Sampling appears well-balanced")
-        
-        return recommendations
-
     def fit(self, X, y=None):
         """
-        Fit the representative sampler.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Training data
-        y : array-like of shape (n_samples,), default=None
-            Target values. Required when stratify=True
-            
-        Returns
-        -------
-        self : object
-            Returns the instance itself
+        Fit the test sampler to create clusters and identify representatives.
         """
-        # Validate inputs
+        # Input validation
         if self.stratify and y is None:
             raise ValueError("y is required when stratify=True")
-            
-        # Handle both float and int sampling_size
-        if isinstance(self.sampling_size, float):
-            if not (0 < self.sampling_size < 1.0):
-                raise ValueError("When sampling_size is float, it must be between 0 and 1.0 (exclusive)")
-        elif isinstance(self.sampling_size, int):
-            if self.sampling_size < 1:
-                raise ValueError("When sampling_size is int, it must be >= 1")
-        else:
-            raise ValueError("sampling_size must be float or int")
-            
-        if self.clustering_algorithm not in ['kmeans', 'agglomerative', 'gmm']:
-            raise ValueError("clustering_algorithm must be 'kmeans', 'agglomerative', or 'gmm'")
-            
-        if self.representative_method not in ['centroid', 'medoid']:
-            raise ValueError("representative_method must be 'centroid' or 'medoid'")
         
-        # Validate coverage_boost
-        if self.coverage_boost <= 0:
-            raise ValueError("coverage_boost must be positive")
-            
-        if self.min_samples_per_class < 1:
-            raise ValueError("min_samples_per_class must be >= 1")
-        
-        # Validate distance matrix if provided
-        if self.distance_matrix is not None:
-            if self.clustering_algorithm != 'agglomerative':
-                raise ValueError("distance_matrix can only be used with agglomerative clustering")
-            self.distance_matrix = check_array(self.distance_matrix)
-            if self.distance_matrix.shape[0] != self.distance_matrix.shape[1]:
-                raise ValueError("distance_matrix must be square")
-        
-        # Store original index information for pandas support
+        # Handle pandas input
         self.is_pandas_input_ = False
         original_index = None
         
@@ -1173,277 +873,264 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
             X = check_array(X)
             original_index = np.arange(len(X))
         
-        # Handle pandas Series for y
-        original_y = y
         if isinstance(y, pd.Series):
             y = y.values
-        
-        # Validate distance matrix dimensions match X after pandas conversion
-        if self.distance_matrix is not None and self.distance_matrix.shape[0] != X.shape[0]:
-            raise ValueError("distance_matrix dimensions must match number of samples in X")
         
         if self.stratify:
             X, y = check_X_y(X, y)
             check_classification_targets(y)
         
         n_samples = X.shape[0]
+        k_total = max(1, int(n_samples * self.sampling_size))
         
-        # Calculate k_total based on sampling_size type
-        if isinstance(self.sampling_size, float):
-            k_total = max(1, int(n_samples * self.sampling_size))
-        else:  # int
-            k_total = min(self.sampling_size, n_samples)  # Cap at n_samples
-        
-        representative_indices = []
-        representative_scores = []
-        cluster_labels = np.full(n_samples, -1, dtype=int)
-        self.clusterers_ = {}
-        cluster_counter = 0
+        logger.info(f"Creating {k_total} clusters for test set from {n_samples} samples...")
         
         if self.stratify:
-            # Calculate class proportions and number of clusters per class using adaptive method
-            class_counts = Counter(y)
-            cluster_allocation = self._calculate_adaptive_clusters(class_counts, k_total)
-            
-            for class_label, k_class in cluster_allocation.items():
-                # Get samples for this class
-                class_mask = (y == class_label)
-                X_class = X[class_mask]
-                class_indices = np.where(class_mask)[0]
-                
-                # Get distance matrix subset if provided
-                distance_matrix_class = None
-                if self.distance_matrix is not None:
-                    distance_matrix_class = self.distance_matrix[np.ix_(class_mask, class_mask)]
-                
-                if len(X_class) < k_class:
-                    warnings.warn(f"Class {class_label} has fewer samples ({len(X_class)}) "
-                                f"than requested clusters ({k_class}). Using all samples.")
-                    k_class = len(X_class)
-                
-                # Cluster within this class
-                if k_class == 1 or len(X_class) == 1:
-                    # If only one cluster or one sample, select the sample closest to mean
-                    if len(X_class) == 1:
-                        repr_idx = 0
-                        score = 0.0
-                    else:
-                        centroid = np.mean(X_class, axis=0)
-                        distances = np.linalg.norm(X_class - centroid, axis=1)
-                        repr_idx = np.argmin(distances)
-                        score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
-                    
-                    representative_indices.append(class_indices[repr_idx])
-                    representative_scores.append(score)
-                    cluster_labels[class_indices] = cluster_counter
-                    cluster_counter += 1
-                else:
-                    # Perform clustering within class
-                    clusterer = self._create_clusterer(k_class)
-                    class_cluster_labels = self._fit_predict_clusterer(clusterer, X_class, distance_matrix_class)
-                    
-                    # Store clusterer
-                    self.clusterers_[class_label] = clusterer
-                    
-                    # Find representative for each cluster
-                    for cluster_id in range(k_class):
-                        cluster_mask = (class_cluster_labels == cluster_id)
-                        cluster_samples = X_class[cluster_mask]
-                        cluster_indices = class_indices[cluster_mask]
-                        
-                        if len(cluster_samples) == 0:
-                            continue
-                            
-                        # Get distance matrix subset for this cluster if available
-                        distance_matrix_cluster = None
-                        if distance_matrix_class is not None:
-                            cluster_mask_indices = np.where(cluster_mask)[0]
-                            distance_matrix_cluster = distance_matrix_class[np.ix_(cluster_mask_indices, cluster_mask_indices)]
-                        
-                        repr_idx, score = self._find_representative(cluster_samples, distance_matrix_cluster)
-                        
-                        representative_indices.append(cluster_indices[repr_idx])
-                        representative_scores.append(score)
-                        
-                        # Update cluster labels
-                        cluster_labels[cluster_indices] = cluster_counter
-                        cluster_counter += 1
+            representatives = self._stratified_clustering(X, y, k_total)
         else:
-            # No stratification - cluster all data together
-            if k_total >= n_samples:
-                warnings.warn(f"Requested {k_total} clusters but only {n_samples} samples available. "
-                            f"Using {n_samples} clusters (all samples).")
-                k_total = n_samples
-            
-            if k_total == 1:
-                # Single cluster - find sample closest to overall centroid
-                centroid = np.mean(X, axis=0)
-                distances = np.linalg.norm(X - centroid, axis=1)
-                repr_idx = np.argmin(distances)
-                score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
-                
-                representative_indices.append(repr_idx)
-                representative_scores.append(score)
-                cluster_labels[:] = 0
-            else:
-                # Multiple clusters
-                clusterer = self._create_clusterer(k_total)
-                cluster_labels = self._fit_predict_clusterer(clusterer, X, self.distance_matrix)
-                
-                # Store clusterer
-                self.clusterers_['overall'] = clusterer
-                
-                # Find representative for each cluster
-                for cluster_id in range(k_total):
-                    cluster_mask = (cluster_labels == cluster_id)
-                    cluster_samples = X[cluster_mask]
-                    cluster_indices = np.where(cluster_mask)[0]
-                    
-                    if len(cluster_samples) == 0:
-                        continue
-                    
-                    # Get distance matrix subset for this cluster if available
-                    distance_matrix_cluster = None
-                    if self.distance_matrix is not None:
-                        distance_matrix_cluster = self.distance_matrix[np.ix_(cluster_mask, cluster_mask)]
-                    
-                    repr_idx, score = self._find_representative(cluster_samples, distance_matrix_cluster)
-                    
-                    representative_indices.append(cluster_indices[repr_idx])
-                    representative_scores.append(score)
+            representatives = self._global_clustering(X, k_total)
         
-        # Convert to numpy arrays
-        representative_indices = np.array(representative_indices)
-        representative_scores = np.array(representative_scores)
-        self.n_clusters_ = len(representative_indices)
+        # Create boolean mask for representatives
+        self.n_clusters_ = len(representatives)
+        representatives_mask = np.zeros(n_samples, dtype=bool)
+        representatives_mask[representatives] = True
         
-        # Calculate evaluation metrics
-        self.report_ = self._calculate_evaluation_metrics(original_y, representative_indices)
-        
-        # Calculate scores for all samples (distance to cluster centroid or medoid score)
-        all_scores = self._calculate_all_scores(X, cluster_labels, representative_indices)
-        
-        # Create sklearn-style attributes
         if self.is_pandas_input_:
-            # Return pandas objects with original indices
-            self.labels_ = pd.Series(cluster_labels, index=original_index, name='cluster')
-            
-            # Create boolean mask for representatives
-            representatives_mask = np.zeros(n_samples, dtype=bool)
-            representatives_mask[representative_indices] = True
-            self.representatives_ = pd.Series(representatives_mask, index=original_index, name='is_representative')
-            
-            self.scores_ = pd.Series(all_scores, index=original_index, name='score')
+            self.representatives_ = pd.Series(representatives_mask, index=original_index, 
+                                            name='is_representative')
+            self.representative_indices_ = pd.Index(original_index[representatives], 
+                                                  name='representative_indices')
         else:
-            # Return numpy arrays
-            self.labels_ = cluster_labels
-            
-            # Create boolean mask for representatives
-            representatives_mask = np.zeros(n_samples, dtype=bool)
-            representatives_mask[representative_indices] = True
             self.representatives_ = representatives_mask
-            
-            self.scores_ = all_scores
+            self.representative_indices_ = representatives
         
+        logger.info(f"Selected {self.n_clusters_} representatives as test set")
         return self
     
-    def _create_clusterer(self, n_clusters):
-        """Create a clusterer based on the specified algorithm."""
-        if self.clustering_algorithm == 'kmeans':
-            return KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init=10)
-        elif self.clustering_algorithm == 'agglomerative':
-            if self.distance_matrix is not None:
-                return AgglomerativeClustering(
-                    n_clusters=n_clusters, 
-                    metric='precomputed', 
-                    linkage=self.linkage
-                )
-            else:
-                return AgglomerativeClustering(
-                    n_clusters=n_clusters, 
-                    linkage=self.linkage
-                )
-        elif self.clustering_algorithm == 'gmm':
-            return GaussianMixture(
-                n_components=n_clusters, 
+    def _global_clustering(self, X, k_total):
+        """Non-stratified clustering for the entire dataset."""
+        logger.info(f"Performing global clustering with k={k_total}...")
+        
+        if self.method == 'minibatch':
+            clusterer = MiniBatchKMeans(
+                n_clusters=k_total,
+                batch_size=self.batch_size,
                 random_state=self.random_state,
-                covariance_type=self.covariance_type
+                n_init=3
             )
-    
-    def _fit_predict_clusterer(self, clusterer, X, distance_matrix=None):
-        """Fit and predict with the clusterer, handling different algorithm types."""
-        if self.clustering_algorithm == 'agglomerative' and distance_matrix is not None:
-            # Use precomputed distance matrix
-            return clusterer.fit_predict(distance_matrix)
-        elif self.clustering_algorithm == 'gmm':
-            # GMM uses fit then predict
-            clusterer.fit(X)
-            return clusterer.predict(X)
-        else:
-            # Standard fit_predict
-            return clusterer.fit_predict(X)
-    
-    def _find_representative(self, cluster_samples, distance_matrix_cluster=None):
-        """
-        Find the most representative sample in a cluster.
-        
-        Parameters
-        ----------
-        cluster_samples : array-like of shape (n_cluster_samples, n_features)
-            Samples in the cluster
-        distance_matrix_cluster : array-like of shape (n_cluster_samples, n_cluster_samples), default=None
-            Precomputed distance matrix for the cluster samples
+            labels = clusterer.fit_predict(X)
+            centroids = clusterer.cluster_centers_
             
-        Returns
-        -------
-        repr_idx : int
-            Index of the representative sample within the cluster
-        score : float
-            Representative score (higher is better)
-        """
-        if len(cluster_samples) == 1:
-            return 0, 1.0
-        
-        if self.representative_method == 'centroid':
-            # Find sample closest to cluster centroid
-            centroid = np.mean(cluster_samples, axis=0)
-            distances = np.linalg.norm(cluster_samples - centroid, axis=1)
-            repr_idx = np.argmin(distances)
-            score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
+        elif self.method == 'hierarchical':
+            # Use hierarchical approach for better quality
+            return self._hierarchical_clustering(X, k_total)
             
-        elif self.representative_method == 'medoid':
-            # Find sample with minimum sum of distances to all others (medoid)
-            if distance_matrix_cluster is not None:
-                # Use precomputed distance matrix
-                distances_matrix = distance_matrix_cluster
+        else:  # kmeans
+            clusterer = KMeans(
+                n_clusters=k_total,
+                n_init=1,
+                random_state=self.random_state
+            )
+            labels = clusterer.fit_predict(X)
+            centroids = clusterer.cluster_centers_
+        
+        # Find representatives (closest to centroids)
+        representatives = []
+        for cluster_id in range(k_total):
+            cluster_mask = (labels == cluster_id)
+            if np.any(cluster_mask):
+                cluster_indices = np.where(cluster_mask)[0]
+                cluster_samples = X[cluster_mask]
+                
+                # Find sample closest to centroid
+                centroid = centroids[cluster_id]
+                distances = np.linalg.norm(cluster_samples - centroid, axis=1)
+                best_idx = cluster_indices[np.argmin(distances)]
+                representatives.append(best_idx)
+        
+        return np.array(representatives)
+    
+    def _stratified_clustering(self, X, y, k_total):
+        """Stratified clustering maintaining class proportions."""
+        class_counts = Counter(y)
+        total_samples = len(y)
+        representatives = []
+        
+        logger.info(f"Stratified clustering across {len(class_counts)} classes...")
+        
+        # Calculate cluster allocation per class
+        cluster_allocation = self._calculate_cluster_allocation(class_counts, k_total, total_samples)
+        
+        for class_label, k_class in cluster_allocation.items():
+            logger.info(f"  Class {class_label}: {k_class} clusters from {class_counts[class_label]} samples")
+            
+            class_mask = (y == class_label)
+            X_class = X[class_mask]
+            class_indices = np.where(class_mask)[0]
+            
+            if k_class == 1 or len(X_class) <= k_class:
+                # Too few samples for clustering
+                if len(X_class) <= k_class:
+                    representatives.extend(class_indices)
+                else:
+                    # Single cluster - select centroid
+                    centroid = np.mean(X_class, axis=0)
+                    distances = np.linalg.norm(X_class - centroid, axis=1)
+                    best_idx = class_indices[np.argmin(distances)]
+                    representatives.append(best_idx)
             else:
-                # Compute distance matrix
-                distances_matrix = pairwise_distances(cluster_samples)
-            
-            sum_distances = np.sum(distances_matrix, axis=1)
-            repr_idx = np.argmin(sum_distances)
-            score = 1.0 / (1.0 + sum_distances[repr_idx])  # Positive score
+                # Cluster within class
+                class_representatives = self._cluster_class(X_class, class_indices, k_class)
+                representatives.extend(class_representatives)
         
-        return repr_idx, score
+        return np.array(representatives)
+    
+    def _cluster_class(self, X_class, class_indices, k_class):
+        """Cluster samples within a single class."""
+        if self.method == 'minibatch':
+            clusterer = MiniBatchKMeans(
+                n_clusters=k_class,
+                batch_size=min(self.batch_size, len(X_class)),
+                random_state=self.random_state,
+                n_init=3
+            )
+        else:  # kmeans or hierarchical
+            clusterer = KMeans(
+                n_clusters=k_class,
+                n_init=1,
+                random_state=self.random_state
+            )
+        
+        labels = clusterer.fit_predict(X_class)
+        
+        representatives = []
+        for cluster_id in range(k_class):
+            cluster_mask = (labels == cluster_id)
+            if np.any(cluster_mask):
+                cluster_samples = X_class[cluster_mask]
+                cluster_class_indices = class_indices[cluster_mask]
+                
+                # Find representative (closest to centroid)
+                centroid = clusterer.cluster_centers_[cluster_id]
+                distances = np.linalg.norm(cluster_samples - centroid, axis=1)
+                best_idx = cluster_class_indices[np.argmin(distances)]
+                representatives.append(best_idx)
+        
+        return representatives
+    
+    def _hierarchical_clustering(self, X, k_total):
+        """Hierarchical clustering for better quality with large k."""
+        # Level 1: Create macro-clusters (manageable number)
+        n_macro = min(500, k_total // 10)  # ~10-40 samples per macro-cluster
+        
+        logger.info(f"  Level 1: {n_macro} macro-clusters")
+        macro_clusterer = MiniBatchKMeans(
+            n_clusters=n_macro,
+            batch_size=self.batch_size,
+            random_state=self.random_state,
+            n_init=3
+        )
+        macro_labels = macro_clusterer.fit_predict(X)
+        
+        # Level 2: Sub-cluster within each macro-cluster
+        representatives = []
+        clusters_per_macro = k_total // n_macro
+        remaining_clusters = k_total % n_macro
+        
+        logger.info(f"  Level 2: ~{clusters_per_macro} micro-clusters per macro-cluster")
+        
+        for macro_id in range(n_macro):
+            macro_mask = (macro_labels == macro_id)
+            if not np.any(macro_mask):
+                continue
+                
+            macro_indices = np.where(macro_mask)[0]
+            macro_samples = X[macro_mask]
+            
+            # Determine number of micro-clusters for this macro-cluster
+            n_micro = clusters_per_macro
+            if macro_id < remaining_clusters:
+                n_micro += 1
+            
+            n_micro = min(n_micro, len(macro_samples))
+            
+            if n_micro <= 1:
+                # Single representative
+                if len(macro_samples) == 1:
+                    representatives.append(macro_indices[0])
+                else:
+                    centroid = np.mean(macro_samples, axis=0)
+                    distances = np.linalg.norm(macro_samples - centroid, axis=1)
+                    best_idx = macro_indices[np.argmin(distances)]
+                    representatives.append(best_idx)
+            else:
+                # Micro-clustering
+                micro_clusterer = KMeans(n_clusters=n_micro, n_init=1, random_state=self.random_state)
+                micro_labels = micro_clusterer.fit_predict(macro_samples)
+                
+                for micro_id in range(n_micro):
+                    micro_mask = (micro_labels == micro_id)
+                    if np.any(micro_mask):
+                        micro_samples = macro_samples[micro_mask]
+                        micro_indices = macro_indices[micro_mask]
+                        
+                        centroid = micro_clusterer.cluster_centers_[micro_id]
+                        distances = np.linalg.norm(micro_samples - centroid, axis=1)
+                        best_idx = micro_indices[np.argmin(distances)]
+                        representatives.append(best_idx)
+        
+        return np.array(representatives)
+    
+    def _calculate_cluster_allocation(self, class_counts, k_total, total_samples):
+        """Calculate how many clusters each class should get."""
+        max_class_count = max(class_counts.values())
+        cluster_allocation = {}
+        
+        # Calculate boosted weights
+        boosted_weights = {}
+        total_boosted_weight = 0
+        
+        for class_label, class_count in class_counts.items():
+            imbalance_ratio = max_class_count / class_count
+            boost_factor = imbalance_ratio ** (1 / self.coverage_boost) if self.coverage_boost > 1.0 else 1.0
+            boosted_weight = (class_count / total_samples) * boost_factor
+            
+            boosted_weights[class_label] = boosted_weight
+            total_boosted_weight += boosted_weight
+        
+        # Allocate clusters
+        allocated_total = 0
+        for class_label, class_count in class_counts.items():
+            normalized_weight = boosted_weights[class_label] / total_boosted_weight
+            proportional_clusters = max(1, round(k_total * normalized_weight))
+            
+            # Apply constraints
+            final_clusters = max(self.min_clusters_per_class, proportional_clusters)
+            final_clusters = min(final_clusters, class_count)  # Can't have more clusters than samples
+            
+            cluster_allocation[class_label] = final_clusters
+            allocated_total += final_clusters
+        
+        # Adjust if over-allocated
+        if allocated_total > k_total:
+            excess = allocated_total - k_total
+            # Reduce from largest allocations first
+            sorted_classes = sorted(cluster_allocation.items(), key=lambda x: x[1], reverse=True)
+            
+            for class_label, clusters in sorted_classes:
+                if excess <= 0:
+                    break
+                reduction = min(excess, max(0, clusters - self.min_clusters_per_class))
+                cluster_allocation[class_label] -= reduction
+                excess -= reduction
+        
+        return cluster_allocation
     
     def transform(self, X):
-        """
-        Return the representative samples.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features) or pandas DataFrame
-            Input data (should be same as fit data)
-            
-        Returns
-        -------
-        X_representative : array-like or pandas DataFrame
-            Representative samples
-        """
+        """Return the representative samples (test set)."""
         if not hasattr(self, 'representatives_'):
-            raise ValueError("This RepresentativeSampler instance is not fitted yet.")
+            raise ValueError("This KMeansRepresentativeSampler instance is not fitted yet.")
         
-        # Handle pandas input
         if isinstance(X, (pd.DataFrame, pd.Series)):
             return X[self.representatives_]
         else:
@@ -1451,82 +1138,43 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
             return X[self.representatives_]
     
     def fit_transform(self, X, y=None):
-        """
-        Fit the sampler and return representative samples.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features) or pandas DataFrame
-            Input data
-        y : array-like of shape (n_samples,), default=None
-            Target values
-            
-        Returns
-        -------
-        X_representative : array-like or pandas DataFrame
-            Representative samples
-        """
+        """Fit the sampler and return the test set."""
         return self.fit(X, y).transform(X)
     
-    def _calculate_all_scores(self, X, cluster_labels, representative_indices):
+    def get_train_sampling_split(self, X, y=None):
         """
-        Calculate scores for all samples based on their relationship to cluster representatives.
+        Get train/test split with representatives as test set.
         
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Input data
-        cluster_labels : array-like of shape (n_samples,)
-            Cluster labels for each sample
-        representative_indices : array-like
-            Indices of representative samples
-            
         Returns
         -------
-        all_scores : array-like of shape (n_samples,)
-            Scores for all samples
+        X_train, X_test, y_train, y_test : arrays
+            Train/test split where test set contains the cluster representatives
         """
-        n_samples = X.shape[0]
-        all_scores = np.zeros(n_samples)
+        if not hasattr(self, 'representatives_'):
+            raise ValueError("This KMeansRepresentativeSampler instance is not fitted yet.")
         
-        # For each cluster, calculate scores for all samples in that cluster
-        unique_clusters = np.unique(cluster_labels)
-        
-        for cluster_id in unique_clusters:
-            cluster_mask = (cluster_labels == cluster_id)
-            cluster_samples = X[cluster_mask]
-            cluster_indices = np.where(cluster_mask)[0]
-            
-            if len(cluster_samples) == 0:
-                continue
-            
-            if self.representative_method == 'centroid':
-                # Score based on inverse distance to cluster centroid (higher = closer)
-                centroid = np.mean(cluster_samples, axis=0)
-                distances = np.linalg.norm(cluster_samples - centroid, axis=1)
-                # Use inverse distance so closer samples have higher scores
-                scores = 1.0 / (1.0 + distances)  # Always positive, closer = higher
-                
-            elif self.representative_method == 'medoid':
-                # Score based on inverse sum of distances (higher = more central)
-                if len(cluster_samples) == 1:
-                    scores = np.array([1.0])
-                else:
-                    distances_matrix = pairwise_distances(cluster_samples)
-                    sum_distances = np.sum(distances_matrix, axis=1)
-                    # Use inverse sum distance so more central samples have higher scores
-                    scores = 1.0 / (1.0 + sum_distances)  # Always positive, more central = higher
-            
-            # Assign scores to all samples in this cluster
-            all_scores[cluster_indices] = scores
-        
-        return all_scores
-
-
+        # Handle pandas input
+        if isinstance(X, (pd.DataFrame, pd.Series)):
+            X_test = X[self.representatives_]
+            X_train = X[~self.representatives_]
+            if y is not None:
+                y_test = y[self.representatives_] if isinstance(y, pd.Series) else y[self.representatives_.values]
+                y_train = y[~self.representatives_] if isinstance(y, pd.Series) else y[~self.representatives_.values]
+                return X_train, X_test, y_train, y_test
+            return X_train, X_test
+        else:
+            X = check_array(X)
+            X_test = X[self.representatives_]
+            X_train = X[~self.representatives_]
+            if y is not None:
+                y_test = y[self.representatives_]
+                y_train = y[~self.representatives_]
+                return X_train, X_test, y_train, y_test
+            return X_train, X_test
 
 # Export main classes and functions
 __all__ = [
     'HierarchicalClustering',
-    'RepresentativeSampler',
+    'KMeansRepresentativeSampler',
 ]
 
