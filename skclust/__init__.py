@@ -9,35 +9,21 @@ advanced tree cutting, visualization, and network analysis capabilities.
 Author: Josh L. Espinoza
 """
 
-__version__ = "2025.8.12"
+__version__ = "2025.9.8"
 __author__ = "Josh L. Espinoza"
 
-import os
 import warnings
+import logging
 from collections import (
     Counter,
     OrderedDict,
-)
-from typing import (
-    Union, 
-    Optional, 
-    List, 
-    Dict, 
-    Any, 
-    Tuple,
 )
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.colors import (
-    rgb2hex, 
-    to_rgb,
-)
-import seaborn as sns
-import networkx as nx
-from scipy import stats
+from matplotlib.colors import rgb2hex
 from scipy.cluster.hierarchy import (
     linkage, 
     dendrogram as scipy_dendrogram, 
@@ -52,26 +38,17 @@ from sklearn.base import (
     ClusterMixin, 
     TransformerMixin,
 )
-from sklearn.decomposition import PCA
-from sklearn.metrics import (
-    silhouette_samples, 
-    silhouette_score,
-)
-
-
 from sklearn.cluster import (
     KMeans, 
-    AgglomerativeClustering,
+    MiniBatchKMeans,
 )
-from sklearn.mixture import GaussianMixture
-from sklearn.metrics import pairwise_distances
-from sklearn.utils.validation import (
-    check_X_y, 
-    check_array,
-)
+from sklearn.metrics import pairwise_distances_argmin_min
+from sklearn.utils import check_array, check_X_y
 from sklearn.utils.multiclass import check_classification_targets
 
+from loguru import logger
 
+# Optional dependencies with fallbacks
 try:
     from fastcluster import linkage as fast_linkage
     FASTCLUSTER_AVAILABLE = True
@@ -99,8 +76,8 @@ try:
 except ImportError:
     DYNAMIC_TREE_CUT_AVAILABLE = False
     warnings.warn("dynamicTreeCut not available, dynamic tree cutting disabled")
-
-
+    
+# Classes
 class HierarchicalClustering(BaseEstimator, ClusterMixin):
     """
     Hierarchical clustering with advanced tree cutting and visualization.
@@ -116,12 +93,10 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         'single', 'centroid', 'median', 'weighted'.
     metric : str, default='euclidean'
         The distance metric to use for computing pairwise distances.
-    min_cluster_size : int, default=20
+    min_cluster_size : int, default=3
         Minimum cluster size for dynamic tree cutting.
-    deep_split : int, default=1
+    deep_split : int, default=2
         Deep split parameter for dynamic tree cutting (0-4).
-    dynamic_cut_method : str, default='hybrid'
-        Method for dynamic tree cutting: 'hybrid' or 'tree'.
     cut_method : str, default='dynamic'
         Tree cutting method: 'dynamic', 'height', or 'maxclust'.
     cut_threshold : float, optional
@@ -130,6 +105,13 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         Name for the clustering instance.
     random_state : int, optional
         Random state for reproducible results.
+    distance_matrix_tol : float, default=1e-10
+        Tolerance for validating distance matrix properties (symmetry, zero diagonal).
+    outlier_cluster : int, default=-1
+        Label used for outlier/noise samples that don't belong to any cluster.
+    cluster_prefix : str, optional
+        If provided, cluster labels will be converted to strings with this prefix
+        (e.g., cluster_prefix="C" -> "C1", "C2", etc.).
         
     Attributes
     ----------
@@ -150,29 +132,61 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def __init__(self, 
                  method='ward',
                  metric='euclidean',
-                 min_cluster_size=20,
-                 deep_split=1,
-                 dynamic_cut_method='hybrid',
+                 min_cluster_size=3,
+                 deep_split=2,
                  cut_method='dynamic',
                  cut_threshold=None,
                  name=None,
-                 random_state=None):
+                 random_state=None,
+                 distance_matrix_tol=1e-10,
+                 outlier_cluster=-1,
+                 cluster_prefix=None):
+        
+        # Validate parameters
+        valid_methods = ['ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted']
+        if method not in valid_methods:
+            raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
+        
+        valid_cut_methods = ['dynamic', 'height', 'maxclust']
+        if cut_method not in valid_cut_methods:
+            raise ValueError(f"cut_method must be one of {valid_cut_methods}, got '{cut_method}'")
+        
+        if cut_method == 'dynamic' and not DYNAMIC_TREE_CUT_AVAILABLE:
+            warnings.warn(
+                "dynamicTreeCut not available but cut_method='dynamic' specified. "
+                "Consider using 'height' or 'maxclust' instead."
+            )
+        
+        if deep_split not in range(5):  # 0-4
+            raise ValueError(f"deep_split must be between 0 and 4, got {deep_split}")
+        
+        if min_cluster_size < 1:
+            raise ValueError(f"min_cluster_size must be >= 1, got {min_cluster_size}")
+        
+        if distance_matrix_tol <= 0:
+            raise ValueError(f"distance_matrix_tol must be positive, got {distance_matrix_tol}")
+        
+        if cluster_prefix is not None and not isinstance(cluster_prefix, str):
+            raise ValueError(f"cluster_prefix must be a string or None, got {type(cluster_prefix)}")
         
         self.method = method
         self.metric = metric
         self.min_cluster_size = min_cluster_size
         self.deep_split = deep_split
-        self.dynamic_cut_method = dynamic_cut_method
         self.cut_method = cut_method
         self.cut_threshold = cut_threshold
         self.name = name
         self.random_state = random_state
+        self.distance_matrix_tol = distance_matrix_tol
+        self.outlier_cluster = outlier_cluster
+        self.cluster_prefix = cluster_prefix
         
         # Initialize attributes
         self.labels_ = None
         self.linkage_matrix_ = None
         self.tree_ = None
         self.dendrogram_ = None
+        self.n_clusters_ = None
         self.tracks_ = OrderedDict()
         self._is_fitted = False
         
@@ -194,15 +208,15 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         """
         X = self._validate_input(X)
         
-        # Store original data and create sample labels first
+        # Store original data and create sample labels ONCE
         self.data_ = X
         if hasattr(X, 'index'):
-            self.sample_labels_ = X.index
+            self.sample_labels_ = list(X.index)
         else:
-            self.sample_labels_ = np.arange(X.shape[0])
+            self.sample_labels_ = list(range(X.shape[0]))
         
         # Compute distance matrix if needed
-        if self._is_distance_matrix(X):
+        if self._is_distance_matrix(X, tol=self.distance_matrix_tol):
             self.distance_matrix_ = X
         else:
             if ENSEMBLE_NETWORKX_AVAILABLE and isinstance(X, Symmetric):
@@ -265,11 +279,44 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         else:
             return np.asarray(X)
             
-    def _is_distance_matrix(self, X):
-        """Check if X is a distance matrix."""
-        if hasattr(X, 'shape'):
-            return X.shape[0] == X.shape[1]
-        return False
+    def _is_distance_matrix(self, X, tol=1e-10):
+        """
+        Check if X is a valid distance matrix.
+        
+        Parameters
+        ----------
+        X : array-like
+            Input matrix to check.
+        tol : float, default=1e-10
+            Tolerance for numerical comparisons.
+            
+        Returns
+        -------
+        bool
+            True if X appears to be a valid distance matrix.
+        """
+        if not hasattr(X, 'shape') or X.shape[0] != X.shape[1]:
+            return False
+        
+        # Additional checks for valid distance matrix
+        if hasattr(X, 'values'):
+            values = X.values
+        else:
+            values = X
+        
+        # Check if symmetric (within tolerance)
+        if not np.allclose(values, values.T, rtol=tol, atol=tol):
+            return False
+        
+        # Check if diagonal is zero (within tolerance)  
+        if not np.allclose(np.diag(values), 0, atol=tol):
+            return False
+        
+        # Check if all values are non-negative (distance matrices should be non-negative)
+        if np.any(values < -tol):
+            return False
+        
+        return True
         
     def _compute_distance_matrix(self, X):
         """Compute pairwise distance matrix."""
@@ -302,40 +349,64 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         # Generate dendrogram
         self.dendrogram_ = scipy_dendrogram(
             self.linkage_matrix_,
-            labels=list(self.sample_labels_),  # Convert to list
+            labels=self.sample_labels_,  # Already a list
             no_plot=True
         )
         
+        # Store the leaf order from dendrogram (this is the proper order for plotting)
+        self.leaves_ = self.dendrogram_["ivl"]
+        
     def _cut_tree(self):
         """Cut tree to obtain clusters."""
-        if self.cut_method == 'dynamic' and DYNAMIC_TREE_CUT_AVAILABLE:
+        if self.cut_method == 'dynamic':
+            if not DYNAMIC_TREE_CUT_AVAILABLE:
+                raise ValueError(
+                    "Dynamic tree cutting requested but dynamicTreeCut not available. "
+                    "Install dynamicTreeCut or use 'height' or 'maxclust' methods."
+                )
             self._cut_tree_dynamic()
         elif self.cut_method == 'height':
             self._cut_tree_height()
         elif self.cut_method == 'maxclust':
             self._cut_tree_maxclust()
         else:
-            # Fallback to height-based cutting
-            warnings.warn(f"Cut method '{self.cut_method}' not available, using height-based cutting")
-            self._cut_tree_height()
-            
+            raise ValueError(
+                f"Unknown cut_method '{self.cut_method}'. "
+                "Must be 'dynamic', 'height', or 'maxclust'."
+            )
+        
         # Set n_clusters_ after cutting
         if self.labels_ is not None:
-            self.n_clusters_ = len(np.unique(self.labels_[self.labels_ > 0]))
+            unique_labels = np.unique(self.labels_)
+            # Remove outlier/noise labels 
+            cluster_labels = unique_labels[unique_labels != self.outlier_cluster]
+            self.n_clusters_ = len(cluster_labels)
+            
+            # Apply cluster prefix if specified
+            if self.cluster_prefix is not None:
+                self.labels_ = self._apply_cluster_prefix(self.labels_)
             
     def _cut_tree_dynamic(self):
         """Perform dynamic tree cutting."""
+        # Prepare parameters, handling None values appropriately
+        params = {
+            'minClusterSize': self.min_cluster_size,
+            'deepSplit': self.deep_split,
+        }
+        
+        # Only add cutHeight if it's specified
+        if self.cut_threshold is not None:
+            params['cutHeight'] = self.cut_threshold
+        
         try:
-            # Convert linkage matrix format for dynamicTreeCut
-            # Note: This is a simplified implementation - you may need to adjust
-            # based on the exact API of your dynamicTreeCut package
+            distance_matrix = (self.distance_matrix_.values 
+                              if hasattr(self.distance_matrix_, 'values') 
+                              else self.distance_matrix_)
             
             results = dynamicTreeCut.cutreeHybrid(
                 self.linkage_matrix_,
-                self.distance_matrix_.values if hasattr(self.distance_matrix_, 'values') else self.distance_matrix_,
-                minClusterSize=self.min_cluster_size,
-                deepSplit=self.deep_split,
-                cutHeight=self.cut_threshold
+                distance_matrix,
+                **params
             )
             
             if isinstance(results, dict) and 'labels' in results:
@@ -344,26 +415,29 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 self.labels_ = results
                 
         except Exception as e:
-            warnings.warn(f"Dynamic tree cutting failed: {e}. Using height-based cutting.")
-            self._cut_tree_height()
+            raise RuntimeError(f"Dynamic tree cutting failed: {e}")
             
     def _cut_tree_height(self):
         """Cut tree at specified height."""
-        if self.cut_threshold is None:
-            # Use 70% of max height as default
+        cut_height = self.cut_threshold
+        if cut_height is None:
+            # Use 70% of max height as default (don't modify self.cut_threshold)
             max_height = np.max(self.linkage_matrix_[:, 2])
-            self.cut_threshold = 0.7 * max_height
+            cut_height = 0.7 * max_height
             
         self.labels_ = fcluster(
             self.linkage_matrix_,
-            self.cut_threshold,
+            cut_height,
             criterion='distance'
         )
         
     def _cut_tree_maxclust(self):
         """Cut tree to get specified number of clusters."""
         if self.cut_threshold is None:
-            self.cut_threshold = 3  # Default number of clusters
+            raise ValueError("cut_threshold must be specified when using cut_method='maxclust'")
+            
+        if not isinstance(self.cut_threshold, int) or self.cut_threshold < 1:
+            raise ValueError("cut_threshold must be a positive integer when using cut_method='maxclust'")
             
         self.labels_ = fcluster(
             self.linkage_matrix_,
@@ -374,12 +448,13 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def _build_tree(self):
         """Build skbio tree from linkage matrix."""
         if not SKBIO_AVAILABLE:
+            self.tree_ = None
             return
             
         try:
             self.tree_ = skbio.TreeNode.from_linkage_matrix(
                 self.linkage_matrix_,
-                list(self.sample_labels_)  # Convert to list to ensure compatibility
+                self.sample_labels_  # Already a list
             )
             if self.name:
                 self.tree_.name = self.name
@@ -400,8 +475,10 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         ----------
         name : str
             Name of the track.
-        data : array-like or dict
-            Track data. Should be same length as samples.
+        data : Mapping or pandas.Series
+            Track data mapping sample names to values. Must be a mapping type
+            (dict, OrderedDict, etc.) with sample names as keys or a pandas Series
+            with sample names as index.
         track_type : str, default='continuous'
             Type of track: 'continuous' or 'categorical'.
         color : str or array-like, optional
@@ -411,14 +488,35 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         """
         self._check_fitted()
         
+        if track_type not in ['continuous', 'categorical']:
+            raise ValueError(f"track_type must be 'continuous' or 'categorical', got '{track_type}'")
+        
+        # Import Mapping here to avoid top-level imports
+        from collections.abc import Mapping
+        
+        # Validate input data type - must be a mapping or pandas Series
+        if not isinstance(data, (Mapping, pd.Series)):
+            raise ValueError(
+                "Track data must be a mapping type (dict, OrderedDict, etc.) with "
+                "sample names as keys or a pandas Series with sample names as index. "
+                f"Got {type(data)} instead."
+            )
+        
         # Convert data to pandas Series
-        if isinstance(data, dict):
+        if isinstance(data, pd.Series):
+            # If it's already a pandas Series, use it as-is
+            pass
+        else:
+            # Convert any mapping type to pandas Series
             data = pd.Series(data)
-        elif not isinstance(data, pd.Series):
-            data = pd.Series(data, index=self.sample_labels_)
             
         # Align with sample labels
         data = data.reindex(self.sample_labels_)
+        
+        # Validate that we have data for all samples
+        missing_samples = set(self.sample_labels_) - set(data.index)
+        if missing_samples:
+            warnings.warn(f"Track '{name}' missing data for samples: {missing_samples}")
         
         self.tracks_[name] = {
             'data': data,
@@ -427,23 +525,178 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             'kwargs': kwargs
         }
         
-    def plot_dendrogram(self, figsize=(12, 6), show_clusters=True, show_tracks=True,
-                       cluster_colors=None, track_height=0.8, **kwargs):
+    def _plot_categorical_track(self, ax, data, colors, show_labels=False, label_text=None):
+        """Plot categorical data as colored rectangles (used for both clusters and categorical tracks)."""
+        # Use the proper leaf order from dendrogram
+        ordered_leaves = self.leaves_
+        
+        # Plot rectangles for each category
+        for i, sample in enumerate(ordered_leaves):
+            if sample in data.index and pd.notna(data[sample]):
+                category = data[sample]
+                color = colors.get(category, 'gray')
+                # Create rectangle for this sample - use dendrogram position
+                rect = patches.Rectangle((i*10 + 5 - 5, 0), 10, 1, 
+                                       facecolor=color, edgecolor='none', alpha=0.8)
+                ax.add_patch(rect)
+        
+        # Add category labels if requested
+        if show_labels and label_text is not None:
+            # Group positions by category
+            category_positions = {}
+            for i, sample in enumerate(ordered_leaves):
+                if sample in data.index and pd.notna(data[sample]):
+                    category = data[sample]
+                    if category not in category_positions:
+                        category_positions[category] = []
+                    category_positions[category].append(i*10 + 5)  # Use dendrogram positions
+            
+            # Place labels at center of each category group
+            for category, positions_list in category_positions.items():
+                if len(positions_list) > 0:
+                    center_pos = np.mean(positions_list)
+                    ax.text(center_pos, 0.5, str(category), 
+                           ha='center', va='center', fontweight='bold',
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
+        
+        # Use the same x-limits as the dendrogram
+        tree_width = len(ordered_leaves) * 10
+        ax.set_xlim(0, tree_width)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        if label_text:
+            ax.set_ylabel(label_text)
+
+    def _plot_tracks(self, axes, track_height):
+        """Plot metadata tracks."""
+        track_names = list(self.tracks_.keys())
+        ordered_leaves = self.leaves_
+        
+        for i, track_name in enumerate(track_names):
+            if i >= len(axes):
+                break
+                
+            ax = axes[i]
+            track_info = self.tracks_[track_name]
+            data = track_info['data']
+            track_type = track_info['type']
+            color = track_info['color']
+            
+            if track_type == 'continuous':
+                # Plot as bar chart using dendrogram positions
+                positions = []
+                values = []
+                colors_list = []
+                
+                for j, sample in enumerate(ordered_leaves):
+                    if sample in data.index and pd.notna(data[sample]):
+                        positions.append(j*10 + 5)  # Match dendrogram positions
+                        values.append(data[sample])
+                        if isinstance(color, dict):
+                            colors_list.append(color.get(sample, 'steelblue'))
+                        elif isinstance(color, pd.Series) and sample in color.index:
+                            colors_list.append(color[sample])
+                        else:
+                            colors_list.append(color if color is not None else 'steelblue')
+                
+                if colors_list:
+                    ax.bar(positions, values, color=colors_list, width=8)
+                else:
+                    ax.bar(positions, values, color='steelblue', width=8)
+                ax.set_ylabel(track_name)
+                
+            elif track_type == 'categorical':
+                # Use the same method as clusters
+                if color is None or isinstance(color, str):
+                    # Generate colors for categories
+                    unique_vals = data.dropna().unique()
+                    if isinstance(color, str):
+                        color_map = {val: color for val in unique_vals}
+                    else:
+                        color_map = dict(zip(unique_vals, 
+                                           plt.cm.Set1(np.linspace(0, 1, len(unique_vals)))))
+                else:
+                    color_map = color
+                    
+                self._plot_categorical_track(ax, data, color_map, label_text=track_name)
+            
+            # Use the same x-limits as the dendrogram
+            tree_width = len(ordered_leaves) * 10
+            ax.set_xlim(0, tree_width)
+            
+    def _apply_cluster_prefix(self, labels):
+        """Apply cluster prefix to labels, converting to strings."""
+        prefixed_labels = np.empty(len(labels), dtype=object)
+        
+        for i, label in enumerate(labels):
+            if label == self.outlier_cluster:
+                # Keep outlier cluster as is (could be string or int)
+                prefixed_labels[i] = label
+            else:
+                # Apply prefix to non-outlier clusters
+                prefixed_labels[i] = f"{self.cluster_prefix}{label}"
+                
+        return prefixed_labels
+        
+    def _generate_cluster_colors(self):
+        """Generate colors for clusters."""
+        if self.n_clusters_ is None:
+            return {}
+            
+        if self.n_clusters_ <= 10:
+            colors = plt.cm.tab10(np.linspace(0, 1, self.n_clusters_))
+        else:
+            colors = plt.cm.tab20(np.linspace(0, 1, min(self.n_clusters_, 20)))
+            
+        # Get actual cluster IDs (exclude outlier cluster)
+        unique_labels = np.unique(self.labels_)
+        if self.cluster_prefix is not None:
+            # Handle string cluster labels
+            cluster_ids = [label for label in unique_labels if label != self.outlier_cluster]
+        else:
+            # Handle numeric cluster labels
+            cluster_ids = unique_labels[unique_labels != self.outlier_cluster]
+        
+        color_dict = {}
+        for i, cluster_id in enumerate(cluster_ids):
+            if i < len(colors):
+                color_dict[cluster_id] = rgb2hex(colors[i])
+            else:
+                # Fallback for too many clusters
+                color_dict[cluster_id] = 'gray'
+                
+        # Add outlier color if outliers exist
+        if self.outlier_cluster in unique_labels:
+            color_dict[self.outlier_cluster] = 'white'
+            
+        return color_dict
+
+    def plot(self, figsize=(13, 5), show_clusters=True, show_tracks=True,
+             cluster_colors=None, track_height=0.8, show_cluster_labels=False, 
+             cluster_label="Clusters", branch_color="black", show_leaf_labels=True, **kwargs):
         """
         Plot dendrogram with optional cluster coloring and tracks.
         
         Parameters
         ----------
-        figsize : tuple, default=(12, 6)
+        figsize : tuple, default=(13, 5)
             Figure size.
         show_clusters : bool, default=True
-            Whether to color dendrogram by clusters.
+            Whether to show cluster assignments as colored rectangles.
         show_tracks : bool, default=True
             Whether to show metadata tracks.
         cluster_colors : dict, optional
             Custom colors for clusters.
         track_height : float, default=0.8
             Height ratio for tracks.
+        show_cluster_labels : bool, default=False
+            Whether to show cluster numbers on the cluster track.
+        cluster_label : str, default="Clusters"
+            Label for the cluster track.
+        branch_color : str, default="black"
+            Color for dendrogram branches.
+        show_leaf_labels : bool, default=True
+            Whether to show sample labels on the x-axis.
         **kwargs
             Additional dendrogram plotting parameters.
         """
@@ -451,327 +704,107 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
         # Calculate subplot ratios
         n_tracks = len(self.tracks_) if show_tracks else 0
-        height_ratios = [4] + [track_height] * n_tracks
+        n_clusters = 1 if show_clusters and self.labels_ is not None else 0
         
-        if n_tracks > 0:
+        # Height ratios: dendrogram gets most space, then clusters, then tracks
+        height_ratios = [4]
+        if show_clusters and self.labels_ is not None:
+            height_ratios.append(track_height)
+        if show_tracks and n_tracks > 0:
+            height_ratios.extend([track_height] * n_tracks)
+        
+        n_subplots = len(height_ratios)
+        
+        if n_subplots > 1:
             fig, axes = plt.subplots(
-                n_tracks + 1, 1,
+                n_subplots, 1,
                 figsize=figsize,
                 height_ratios=height_ratios,
                 sharex=True
             )
-            if n_tracks == 1:
+            if n_subplots == 2:
                 axes = [axes[0], axes[1]]
             ax_dendro = axes[0]
         else:
             fig, ax_dendro = plt.subplots(figsize=figsize)
             axes = [ax_dendro]
             
-        # Plot dendrogram
+        # Plot dendrogram using the pre-computed dendrogram data
         dendro_kwargs = {
             'orientation': 'top',
-            'labels': list(self.sample_labels_),  # Convert to list
+            'color_threshold': 0,  # Disable automatic coloring
+            'above_threshold_color': branch_color,  # All branches same color
             'leaf_rotation': 90,
             'leaf_font_size': 8
         }
         dendro_kwargs.update(kwargs)
         
-        if show_clusters and self.labels_ is not None:
-            # Color dendrogram by clusters
-            if cluster_colors is None:
-                cluster_colors = self._generate_cluster_colors()
-            dendro_kwargs['color_threshold'] = 0
-            dendro_kwargs['above_threshold_color'] = 'gray'
-            
-        scipy_dendrogram(self.linkage_matrix_, ax=ax_dendro, **dendro_kwargs)
+        # Plot using the stored dendrogram data to ensure consistency
+        for xs, ys in zip(self.dendrogram_['icoord'], self.dendrogram_['dcoord']):
+            ax_dendro.plot(xs, ys, color=branch_color, linewidth=1)
+        
+        # Set proper limits and labels
+        tree_width = len(self.leaves_) * 10
+        max_height = np.max(self.dendrogram_['dcoord'])
+        tree_height = max_height + max_height * 0.05
+        
+        ax_dendro.set_xlim(0, tree_width)
+        ax_dendro.set_ylim(0, tree_height)
         
         if self.name:
             ax_dendro.set_title(f'Hierarchical Clustering: {self.name}')
         else:
             ax_dendro.set_title('Hierarchical Clustering')
+        
+        # Handle leaf labels - they should appear on the bottom-most subplot
+        bottom_axis = None
+        if show_leaf_labels:
+            if n_subplots > 1:
+                # Find the bottom-most axis (last one in the list)
+                bottom_axis = axes[-1]
+            else:
+                # Only dendrogram, show labels there
+                bottom_axis = ax_dendro
+            
+        # Remove x-axis labels from dendrogram if we have other plots below
+        if n_subplots > 1:
+            ax_dendro.set_xticklabels([])
+        elif show_leaf_labels:
+            # Show leaf labels on dendrogram if it's the only plot
+            leaf_positions = [i*10 + 5 for i in range(len(self.leaves_))]
+            ax_dendro.set_xticks(leaf_positions)
+            ax_dendro.set_xticklabels(self.leaves_, rotation=90)
+        
+        current_axis_idx = 1
+        
+        # Plot clusters (treat as categorical data)
+        if show_clusters and self.labels_ is not None and n_subplots > 1:
+            if cluster_colors is None:
+                cluster_colors = self._generate_cluster_colors()
+                
+            # Create cluster data as pandas Series using the dendrogram leaf order
+            cluster_data = pd.Series(self.labels_, index=self.sample_labels_)
+            
+            # Plot clusters using the categorical track method
+            ax_clusters = axes[current_axis_idx]
+            self._plot_categorical_track(ax_clusters, cluster_data, cluster_colors, 
+                                       show_labels=show_cluster_labels, label_text=cluster_label)
+            current_axis_idx += 1
             
         # Plot tracks
-        if show_tracks and n_tracks > 0:
-            self._plot_tracks(axes[1:], track_height)
+        if show_tracks and n_tracks > 0 and n_subplots > 1:
+            track_axes = axes[current_axis_idx:current_axis_idx + n_tracks]
+            self._plot_tracks(track_axes, track_height)
+            
+        # Add leaf labels to the bottom-most subplot if requested
+        if show_leaf_labels and bottom_axis is not None and n_subplots > 1:
+            leaf_positions = [i*10 + 5 for i in range(len(self.leaves_))]
+            bottom_axis.set_xticks(leaf_positions)
+            bottom_axis.set_xticklabels(self.leaves_, rotation=90)
             
         plt.tight_layout()
         return fig, axes
         
-    def _generate_cluster_colors(self):
-        """Generate colors for clusters."""
-        n_clusters = self.n_clusters_
-        if n_clusters <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, n_clusters))
-        else:
-            colors = plt.cm.tab20(np.linspace(0, 1, min(n_clusters, 20)))
-            
-        return {i+1: rgb2hex(colors[i]) for i in range(n_clusters)}
-        
-    def _plot_tracks(self, axes, track_height):
-        """Plot metadata tracks."""
-        for i, (track_name, track_info) in enumerate(self.tracks_.items()):
-            ax = axes[i]
-            data = track_info['data']
-            track_type = track_info['type']
-            color = track_info['color']
-            
-            # Get positions for each sample
-            positions = np.arange(len(self.sample_labels_))
-            
-            if track_type == 'continuous':
-                # Plot as bar chart
-                if color is None:
-                    color = 'steelblue'
-                ax.bar(positions, data.values, color=color, width=0.8)
-                ax.set_ylabel(track_name)
-                
-            elif track_type == 'categorical':
-                # Plot as colored rectangles
-                unique_vals = data.dropna().unique()
-                if color is None:
-                    color_map = dict(zip(unique_vals, 
-                                       plt.cm.Set1(np.linspace(0, 1, len(unique_vals)))))
-                else:
-                    color_map = color
-                    
-                for j, val in enumerate(data.values):
-                    if pd.notna(val):
-                        rect_color = color_map.get(val, 'gray')
-                        rect = patches.Rectangle((j-0.4, 0), 0.8, 1, 
-                                               facecolor=rect_color, edgecolor='none')
-                        ax.add_patch(rect)
-                        
-                ax.set_ylim(0, 1)
-                ax.set_ylabel(track_name)
-                ax.set_yticks([])
-                
-            ax.set_xlim(-0.5, len(self.sample_labels_) - 0.5)
-            
-    def eigenprofiles(self, data=None, n_components=1):
-        """
-        Calculate eigenprofiles (first principal components) for each cluster.
-        
-        Parameters
-        ----------
-        data : array-like, optional
-            Data matrix. If None, uses original fitting data.
-        n_components : int, default=1
-            Number of principal components to return.
-            
-        Returns
-        -------
-        eigenprofiles : dict
-            Dictionary mapping cluster labels to eigenprofiles.
-        """
-        self._check_fitted()
-        
-        if data is None:
-            if hasattr(self, 'data_') and not self._is_distance_matrix(self.data_):
-                data = self.data_
-            else:
-                raise ValueError("Original data not available. Please provide data matrix.")
-                
-        if hasattr(data, 'values'):
-            data_values = data.values
-        else:
-            data_values = data
-            
-        eigenprofiles = {}
-        
-        for cluster_id in np.unique(self.labels_):
-            if cluster_id == 0:  # Skip noise/unassigned
-                continue
-                
-            cluster_mask = self.labels_ == cluster_id
-            cluster_data = data_values[cluster_mask]
-            
-            if cluster_data.shape[0] > 1:
-                pca = PCA(n_components=n_components)
-                pca.fit(cluster_data.T)  # Transpose for feature PCA
-                eigenprofiles[cluster_id] = {
-                    'eigenprofile': pca.components_[0],
-                    'explained_variance_ratio': pca.explained_variance_ratio_[0],
-                    'eigenvalue': pca.explained_variance_[0]
-                }
-            else:
-                # Single sample cluster
-                eigenprofiles[cluster_id] = {
-                    'eigenprofile': cluster_data[0],
-                    'explained_variance_ratio': 1.0,
-                    'eigenvalue': np.var(cluster_data[0])
-                }
-                
-        return eigenprofiles
-        
-    def connectivity(self, return_type='summary'):
-        """
-        Calculate network connectivity metrics.
-        
-        Parameters
-        ----------
-        return_type : str, default='summary'
-            Type of connectivity to return: 'summary', 'detailed', or 'matrix'.
-            
-        Returns
-        -------
-        connectivity : dict or DataFrame
-            Connectivity metrics.
-        """
-        self._check_fitted()
-        
-        if not ENSEMBLE_NETWORKX_AVAILABLE:
-            warnings.warn("ensemble_networkx not available. Using simplified connectivity.")
-            return self._simple_connectivity()
-            
-        # Create Symmetric object from distance matrix
-        # Convert distances to similarities (invert)
-        if hasattr(self.distance_matrix_, 'values'):
-            similarity_matrix = 1 / (1 + self.distance_matrix_)
-            np.fill_diagonal(similarity_matrix.values, 1.0)
-        else:
-            similarity_matrix = 1 / (1 + self.distance_matrix_)
-            np.fill_diagonal(similarity_matrix, 1.0)
-        
-        try:
-            sym_obj = Symmetric(similarity_matrix)
-            return sym_obj.connectivity(
-                groups=pd.Series(self.labels_, index=self.sample_labels_),
-                return_type=return_type
-            )
-        except Exception as e:
-            warnings.warn(f"Symmetric connectivity failed: {e}. Using simplified version.")
-            return self._simple_connectivity()
-            
-    def _simple_connectivity(self):
-        """Simple connectivity calculation fallback."""
-        cluster_sizes = pd.Series(self.labels_).value_counts().sort_index()
-        return {
-            'cluster_sizes': cluster_sizes,
-            'total_samples': len(self.labels_),
-            'n_clusters': self.n_clusters_
-        }
-        
-    def silhouette_analysis(self):
-        """
-        Calculate silhouette scores for cluster validation.
-        
-        Returns
-        -------
-        silhouette_scores : dict
-            Dictionary containing overall and per-sample silhouette scores.
-        """
-        self._check_fitted()
-        
-        if self.labels_ is None or len(np.unique(self.labels_)) < 2:
-            return {'overall_score': None, 'sample_scores': None}
-            
-        # Use distance matrix if available
-        if hasattr(self, 'distance_matrix_'):
-            if hasattr(self.distance_matrix_, 'values'):
-                distance_matrix = self.distance_matrix_.values
-            else:
-                distance_matrix = self.distance_matrix_
-        else:
-            distance_matrix = None
-            
-        try:
-            if distance_matrix is not None:
-                overall_score = silhouette_score(
-                    distance_matrix, self.labels_, metric='precomputed'
-                )
-                sample_scores = silhouette_samples(
-                    distance_matrix, self.labels_, metric='precomputed'
-                )
-            else:
-                raise ValueError("No distance matrix available")
-        except:
-            # Fallback to euclidean if precomputed fails
-            if hasattr(self, 'data_') and not self._is_distance_matrix(self.data_):
-                data = self.data_.values if hasattr(self.data_, 'values') else self.data_
-                overall_score = silhouette_score(data, self.labels_)
-                sample_scores = silhouette_samples(data, self.labels_)
-            else:
-                return {'overall_score': None, 'sample_scores': None}
-        
-        return {
-            'overall_score': overall_score,
-            'sample_scores': pd.Series(sample_scores, index=self.sample_labels_)
-        }
-        
-    def to_networkx(self, weight_threshold=None):
-        """
-        Convert clustering result to NetworkX graph.
-        
-        Parameters
-        ----------
-        weight_threshold : float, optional
-            Minimum edge weight to include in graph.
-            
-        Returns
-        -------
-        graph : networkx.Graph
-            NetworkX graph representation.
-        """
-        self._check_fitted()
-        
-        # Create graph from similarity matrix
-        if hasattr(self.distance_matrix_, 'values'):
-            distance_values = self.distance_matrix_.values
-        else:
-            distance_values = self.distance_matrix_
-            
-        similarity_matrix = 1 / (1 + distance_values)
-        
-        G = nx.Graph()
-        
-        # Add nodes with cluster information
-        for i, label in enumerate(self.sample_labels_):
-            G.add_node(label, cluster=self.labels_[i])
-            
-        # Add edges
-        for i in range(len(self.sample_labels_)):
-            for j in range(i+1, len(self.sample_labels_)):
-                if hasattr(similarity_matrix, 'iloc'):
-                    weight = similarity_matrix.iloc[i, j]
-                else:
-                    weight = similarity_matrix[i, j]
-                if weight_threshold is None or weight >= weight_threshold:
-                    G.add_edge(
-                        self.sample_labels_[i],
-                        self.sample_labels_[j],
-                        weight=weight
-                    )
-                    
-        return G
-        
-    def to_newick(self, filepath=None):
-        """
-        Export tree in Newick format.
-        
-        Parameters
-        ----------
-        filepath : str, optional
-            If provided, saves to file. Otherwise returns string.
-            
-        Returns
-        -------
-        newick_str : str
-            Newick format string (if filepath is None).
-        """
-        self._check_fitted()
-        
-        if not SKBIO_AVAILABLE or self.tree_ is None:
-            raise ValueError("Tree not available. Requires skbio and successful tree building.")
-            
-        newick_str = str(self.tree_)
-        
-        if filepath is not None:
-            with open(filepath, 'w') as f:
-                f.write(newick_str)
-            return None
-        else:
-            return newick_str
-            
     def summary(self):
         """
         Print summary of clustering results.
@@ -793,18 +826,22 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
         if self.labels_ is not None:
             cluster_counts = pd.Series(self.labels_).value_counts().sort_index()
-            summary_dict['cluster_sizes'] = cluster_counts.to_dict()
+            # Only include non-outlier cluster labels in summary
+            non_outlier_clusters = cluster_counts[cluster_counts.index != self.outlier_cluster]
+            summary_dict['cluster_sizes'] = non_outlier_clusters.to_dict()
             
-        # Add silhouette score if possible
-        silhouette_results = self.silhouette_analysis()
-        if silhouette_results['overall_score'] is not None:
-            summary_dict['silhouette_score'] = silhouette_results['overall_score']
+            # Add outlier count if present
+            if self.outlier_cluster in cluster_counts.index:
+                summary_dict['n_outliers'] = cluster_counts[self.outlier_cluster]
             
         print("Hierarchical Clustering Summary")
         print("=" * 30)
         for key, value in summary_dict.items():
-            if key != 'cluster_sizes':
+            if key not in ['cluster_sizes', 'n_outliers']:
                 print(f"{key}: {value}")
+                
+        if 'n_outliers' in summary_dict:
+            print(f"n_outliers: {summary_dict['n_outliers']}")
                 
         if 'cluster_sizes' in summary_dict:
             print("\nCluster sizes:")
@@ -813,637 +850,294 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 
         return summary_dict
 
-class RepresentativeSampler(BaseEstimator, TransformerMixin):
+class KMeansRepresentativeSampler(BaseEstimator, TransformerMixin):
     """
-    A scikit-learn compatible class that selects representative samples
-    through clustering, maintaining class proportions when stratified.
+    K-means-based sampler for creating test sets with many clusters (k = 10% of data).
+    Optimized for large datasets where traditional clustering would be too slow.
     
     Parameters
     ----------
-    sampling_size : float or int, default=0.1
-        If float (0 < sampling_size < 1.0): proportion of samples to select
-        If int (sampling_size >= 1): exact number of samples to select
+    sampling_size : float, default=0.1
+        Proportion of data to use as test set (determines k = sampling_size * n_samples)
     stratify : bool, default=True
-        Whether to maintain original class proportions in the clustering
-    clustering_algorithm : str, default='kmeans'
-        Clustering algorithm to use: 'kmeans', 'agglomerative', or 'gmm'
-    distance_matrix : array-like of shape (n_samples, n_samples), default=None
-        Precomputed distance matrix. Only used with agglomerative clustering.
-        If provided, X should be ignored during clustering (but still passed for validation)
-    random_state : int, default=None
-        Random state for reproducible results
-    representative_method : str, default='centroid'
-        Method to select representative sample from each cluster:
-        - 'centroid': Sample closest to cluster centroid
-        - 'medoid': Sample with minimum sum of distances to all other samples in cluster
-    linkage : str, default='ward'
-        Linkage criterion for agglomerative clustering: 'ward', 'complete', 'average', 'single'
-    covariance_type : str, default='full'
-        Covariance type for GMM: 'full', 'tied', 'diag', 'spherical'
+        Whether to maintain class proportions in clustering
+    method : str, default='minibatch'
+        Clustering method: 'minibatch' (fast), 'kmeans' (exact), 'hierarchical' (2-level)
+    batch_size : int, default=1000
+        Batch size for MiniBatchKMeans (only used with method='minibatch')
     coverage_boost : float, default=1.5
-        Multiplier to boost minority class representation. Higher values give more
-        coverage to minority classes. Set to 1.0 for purely proportional sampling.
-    min_samples_per_class : int, default=2
-        Minimum number of representative samples per class, regardless of proportion
-    
-    Attributes
-    ----------
-    n_clusters_ : int
-        Total number of clusters created
-    labels_ : array-like of shape (n_samples,) or pandas Series
-        Cluster labels for each sample. Returns pandas Series if input was pandas.
-    representatives_ : array-like of shape (n_samples,) or pandas Series
-        Boolean mask indicating which samples are representatives. Returns pandas Series if input was pandas.
-    scores_ : array-like of shape (n_samples,) or pandas Series  
-        Representative scores for all samples (higher is better). Returns pandas Series if input was pandas.
-    clusterers_ : dict
-        Dictionary storing fitted clusterers for each class (when stratified) or overall
-    is_pandas_input_ : bool
-        Whether the input was a pandas DataFrame or Series
-    report_ : dict
-        Nested dictionary containing evaluation metrics for imbalance handling
+        Boost factor for minority classes when stratified (>1.0 boosts minorities)
+    min_clusters_per_class : int, default=1
+        Minimum clusters per class regardless of proportion
+    random_state : int, default=None
+        Random state for reproducibility
     """
     
-    def __init__(self, sampling_size=0.1, stratify=True, clustering_algorithm='kmeans',
-                 distance_matrix=None, random_state=None, representative_method='centroid',
-                 linkage='ward', covariance_type='full', coverage_boost=1.5, 
-                 min_samples_per_class=2, max_clusters_per_class=None):
+    def __init__(self, sampling_size=0.1, stratify=True, method='minibatch', 
+                 batch_size=1000, coverage_boost=1.5, min_clusters_per_class=1,
+                 random_state=None):
         self.sampling_size = sampling_size
         self.stratify = stratify
-        self.clustering_algorithm = clustering_algorithm
-        self.distance_matrix = distance_matrix
-        self.random_state = random_state
-        self.representative_method = representative_method
-        self.linkage = linkage
-        self.covariance_type = covariance_type
+        self.method = method
+        self.batch_size = batch_size
         self.coverage_boost = coverage_boost
-        self.min_samples_per_class = min_samples_per_class
-        self.max_clusters_per_class = max_clusters_per_class
-    
-    def _calculate_adaptive_clusters(self, class_counts, k_total):
-        """
-        Calculate number of clusters per class with coverage boost for minority classes.
+        self.min_clusters_per_class = min_clusters_per_class
+        self.random_state = random_state
         
-        Parameters
-        ----------
-        class_counts : dict
-            Dictionary mapping class labels to their counts
-        k_total : int
-            Total number of clusters to distribute
-            
-        Returns
-        -------
-        cluster_allocation : dict
-            Dictionary mapping class labels to number of clusters
-        """
-        total_samples = sum(class_counts.values())
-        max_class_count = max(class_counts.values())
-        cluster_allocation = {}
-        
-        # Calculate base allocation with coverage boost
-        boosted_weights = {}
-        total_boosted_weight = 0
-        
-        for class_label, class_count in class_counts.items():
-            # Calculate imbalance ratio (how underrepresented this class is)
-            imbalance_ratio = max_class_count / class_count
-            
-            # Apply coverage boost - minority classes get more representation
-            boost_factor = imbalance_ratio ** (1 / self.coverage_boost) if self.coverage_boost > 1.0 else 1.0
-            boosted_weight = (class_count / total_samples) * boost_factor
-            
-            boosted_weights[class_label] = boosted_weight
-            total_boosted_weight += boosted_weight
-        
-        # Normalize and allocate clusters
-        allocated_clusters = 0
-        for class_label, class_count in class_counts.items():
-            # Calculate proportional allocation
-            normalized_weight = boosted_weights[class_label] / total_boosted_weight
-            proportional_clusters = max(1, round(k_total * normalized_weight))
-            
-            # Apply minimum constraint
-            final_clusters = max(self.min_samples_per_class, proportional_clusters)
-            
-            # Apply maximum constraint if specified
-            if self.max_clusters_per_class is not None:
-                final_clusters = min(final_clusters, self.max_clusters_per_class)
-            
-            # Cap at class size
-            final_clusters = min(final_clusters, class_count)
-            
-            cluster_allocation[class_label] = final_clusters
-            allocated_clusters += final_clusters
-        
-        # Adjust if we've over-allocated due to minimums
-        if allocated_clusters > k_total:
-            # Proportionally reduce larger allocations first
-            excess = allocated_clusters - k_total
-            sorted_classes = sorted(cluster_allocation.items(), key=lambda x: x[1], reverse=True)
-            
-            for class_label, clusters in sorted_classes:
-                if excess <= 0:
-                    break
-                reduction = min(excess, max(0, clusters - self.min_samples_per_class))
-                cluster_allocation[class_label] -= reduction
-                excess -= reduction
-        
-        return cluster_allocation
-    
-    def _calculate_evaluation_metrics(self, y, representative_indices):
-        """
-        Calculate evaluation metrics for imbalance handling.
-        
-        Parameters
-        ----------
-        y : array-like
-            Original target values
-        representative_indices : array-like
-            Indices of selected representative samples
-            
-        Returns
-        -------
-        report : dict
-            Nested dictionary with evaluation metrics
-        """
-        if y is None:
-            return {}
-        
-        # Get original and representative class distributions
-        original_counts = Counter(y)
-        repr_y = y[representative_indices]
-        repr_counts = Counter(repr_y)
-        
-        total_original = len(y)
-        total_repr = len(representative_indices)
-        
-        # Calculate class-level metrics
-        class_metrics = {}
-        for class_label in original_counts.keys():
-            orig_count = original_counts[class_label]
-            repr_count = repr_counts.get(class_label, 0)
-            
-            orig_prop = orig_count / total_original
-            repr_prop = repr_count / total_repr if total_repr > 0 else 0
-            
-            # Coverage: what percentage of this class is represented
-            coverage = repr_count / orig_count if orig_count > 0 else 0
-            
-            # Proportion change
-            prop_change = (repr_prop - orig_prop) / orig_prop if orig_prop > 0 else 0
-            
-            class_metrics[class_label] = {
-                'original_count': orig_count,
-                'representative_count': repr_count,
-                'original_proportion': orig_prop,
-                'representative_proportion': repr_prop,
-                'coverage_rate': coverage,
-                'proportion_change': prop_change
-            }
-        
-        # Calculate overall metrics
-        # Imbalance Ratio (IR) - ratio of majority to minority class
-        max_count = max(original_counts.values())
-        min_count = min(original_counts.values())
-        original_ir = max_count / min_count if min_count > 0 else float('inf')
-        
-        repr_max_count = max(repr_counts.values()) if repr_counts else 0
-        repr_min_count = min(repr_counts.values()) if repr_counts else 0
-        repr_ir = repr_max_count / repr_min_count if repr_min_count > 0 else float('inf')
-        
-        # Distribution similarity (using Jensen-Shannon divergence)
-        def js_divergence(p, q):
-            """Calculate Jensen-Shannon divergence between two probability distributions."""
-            # Ensure same support
-            all_classes = set(p.keys()) | set(q.keys())
-            p_vec = np.array([p.get(c, 0) for c in all_classes])
-            q_vec = np.array([q.get(c, 0) for c in all_classes])
-            
-            # Normalize
-            p_vec = p_vec / p_vec.sum() if p_vec.sum() > 0 else p_vec
-            q_vec = q_vec / q_vec.sum() if q_vec.sum() > 0 else q_vec
-            
-            # Add small epsilon to avoid log(0)
-            epsilon = 1e-10
-            p_vec = p_vec + epsilon
-            q_vec = q_vec + epsilon
-            
-            # Calculate JS divergence
-            m = 0.5 * (p_vec + q_vec)
-            js = 0.5 * np.sum(p_vec * np.log(p_vec / m)) + 0.5 * np.sum(q_vec * np.log(q_vec / m))
-            return js
-        
-        # Convert counts to proportions for JS divergence
-        orig_props = {k: v/total_original for k, v in original_counts.items()}
-        repr_props = {k: v/total_repr for k, v in repr_counts.items()} if total_repr > 0 else {}
-        
-        js_div = js_divergence(orig_props, repr_props)
-        
-        # Overall sampling rate per class
-        sampling_rates = {}
-        for class_label in original_counts.keys():
-            sampling_rates[class_label] = repr_counts.get(class_label, 0) / original_counts[class_label]
-        
-        overall_metrics = {
-            'total_samples': total_original,
-            'representative_samples': total_repr,
-            'overall_sampling_rate': total_repr / total_original,
-            'original_imbalance_ratio': original_ir,
-            'representative_imbalance_ratio': repr_ir,
-            'imbalance_ratio_change': (repr_ir - original_ir) / original_ir if original_ir != float('inf') else 0,
-            'distribution_similarity_js': js_div,  # Lower is more similar
-            'class_sampling_rates': sampling_rates
-        }
-        
-        # Summary assessment
-        minority_classes = [c for c in original_counts.keys() 
-                          if original_counts[c] == min(original_counts.values())]
-        majority_classes = [c for c in original_counts.keys() 
-                          if original_counts[c] == max(original_counts.values())]
-        
-        avg_minority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
-                                       for c in minority_classes])
-        avg_majority_coverage = np.mean([class_metrics[c]['coverage_rate'] 
-                                       for c in majority_classes])
-        
-        summary = {
-            'minority_classes': minority_classes,
-            'majority_classes': majority_classes,
-            'average_minority_coverage': avg_minority_coverage,
-            'average_majority_coverage': avg_majority_coverage,
-            'coverage_boost_effectiveness': avg_minority_coverage / avg_majority_coverage if avg_majority_coverage > 0 else 0,
-            'recommendation': self._generate_recommendation(overall_metrics, class_metrics)
-        }
-        
-        return {
-            'class_metrics': class_metrics,
-            'overall_metrics': overall_metrics,
-            'summary': summary
-        }
-    
-    def _generate_recommendation(self, overall_metrics, class_metrics):
-        """Generate recommendations based on the metrics."""
-        recommendations = []
-        
-        # Check if distribution changed dramatically
-        if overall_metrics['distribution_similarity_js'] > 0.1:
-            recommendations.append("Distribution significantly altered from original")
-        
-        # Check coverage rates
-        min_coverage = min(metrics['coverage_rate'] for metrics in class_metrics.values())
-        if min_coverage < 0.01:  # Less than 1% coverage
-            recommendations.append("Some classes have very low coverage - consider increasing min_samples_per_class")
-        
-        # Check if imbalance was improved or worsened
-        ir_change = overall_metrics['imbalance_ratio_change']
-        if ir_change > 0.1:
-            recommendations.append("Sampling increased imbalance - consider lowering coverage_boost")
-        elif ir_change < -0.2:
-            recommendations.append("Sampling significantly reduced imbalance - good for minority class representation")
-        
-        if not recommendations:
-            recommendations.append("Sampling appears well-balanced")
-        
-        return recommendations
-
-    def fit(self, X, y=None):
-        """
-        Fit the representative sampler.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Training data
-        y : array-like of shape (n_samples,), default=None
-            Target values. Required when stratify=True
-            
-        Returns
-        -------
-        self : object
-            Returns the instance itself
-        """
-        # Validate inputs
-        if self.stratify and y is None:
-            raise ValueError("y is required when stratify=True")
-            
-        # Handle both float and int sampling_size
-        if isinstance(self.sampling_size, float):
-            if not (0 < self.sampling_size < 1.0):
-                raise ValueError("When sampling_size is float, it must be between 0 and 1.0 (exclusive)")
-        elif isinstance(self.sampling_size, int):
-            if self.sampling_size < 1:
-                raise ValueError("When sampling_size is int, it must be >= 1")
-        else:
-            raise ValueError("sampling_size must be float or int")
-            
-        if self.clustering_algorithm not in ['kmeans', 'agglomerative', 'gmm']:
-            raise ValueError("clustering_algorithm must be 'kmeans', 'agglomerative', or 'gmm'")
-            
-        if self.representative_method not in ['centroid', 'medoid']:
-            raise ValueError("representative_method must be 'centroid' or 'medoid'")
-        
-        # Validate coverage_boost
+        # Validate parameters
+        if self.method not in ['minibatch', 'kmeans', 'hierarchical']:
+            raise ValueError("method must be one of: 'minibatch', 'kmeans', 'hierarchical'")
+        if self.sampling_size <= 0 or self.sampling_size >= 1:
+            raise ValueError("sampling_size must be between 0 and 1")
         if self.coverage_boost <= 0:
             raise ValueError("coverage_boost must be positive")
-            
-        if self.min_samples_per_class < 1:
-            raise ValueError("min_samples_per_class must be >= 1")
+        if self.min_clusters_per_class < 1:
+            raise ValueError("min_clusters_per_class must be at least 1")
+    
+    def fit(self, X, y=None):
+        """
+        Fit the test sampler to create clusters and identify representatives.
+        """
+        # Input validation
+        if self.stratify and y is None:
+            raise ValueError("y is required when stratify=True")
         
-        # Validate distance matrix if provided
-        if self.distance_matrix is not None:
-            if self.clustering_algorithm != 'agglomerative':
-                raise ValueError("distance_matrix can only be used with agglomerative clustering")
-            self.distance_matrix = check_array(self.distance_matrix)
-            if self.distance_matrix.shape[0] != self.distance_matrix.shape[1]:
-                raise ValueError("distance_matrix must be square")
-        
-        # Store original index information for pandas support
+        # Handle pandas input
         self.is_pandas_input_ = False
         original_index = None
         
         if isinstance(X, pd.DataFrame):
             self.is_pandas_input_ = True
             original_index = X.index.copy()
-            X = X.values
+            X_array = X.values
         elif isinstance(X, pd.Series):
             self.is_pandas_input_ = True
             original_index = X.index.copy()
-            X = X.values.reshape(-1, 1)
+            X_array = X.values.reshape(-1, 1)
         else:
-            X = check_array(X)
-            original_index = np.arange(len(X))
+            X_array = check_array(X)
+            original_index = np.arange(len(X_array))
         
-        # Handle pandas Series for y
-        original_y = y
         if isinstance(y, pd.Series):
-            y = y.values
-        
-        # Validate distance matrix dimensions match X after pandas conversion
-        if self.distance_matrix is not None and self.distance_matrix.shape[0] != X.shape[0]:
-            raise ValueError("distance_matrix dimensions must match number of samples in X")
-        
-        if self.stratify:
-            X, y = check_X_y(X, y)
-            check_classification_targets(y)
-        
-        n_samples = X.shape[0]
-        
-        # Calculate k_total based on sampling_size type
-        if isinstance(self.sampling_size, float):
-            k_total = max(1, int(n_samples * self.sampling_size))
-        else:  # int
-            k_total = min(self.sampling_size, n_samples)  # Cap at n_samples
-        
-        representative_indices = []
-        representative_scores = []
-        cluster_labels = np.full(n_samples, -1, dtype=int)
-        self.clusterers_ = {}
-        cluster_counter = 0
-        
-        if self.stratify:
-            # Calculate class proportions and number of clusters per class using adaptive method
-            class_counts = Counter(y)
-            cluster_allocation = self._calculate_adaptive_clusters(class_counts, k_total)
-            
-            for class_label, k_class in cluster_allocation.items():
-                # Get samples for this class
-                class_mask = (y == class_label)
-                X_class = X[class_mask]
-                class_indices = np.where(class_mask)[0]
-                
-                # Get distance matrix subset if provided
-                distance_matrix_class = None
-                if self.distance_matrix is not None:
-                    distance_matrix_class = self.distance_matrix[np.ix_(class_mask, class_mask)]
-                
-                if len(X_class) < k_class:
-                    warnings.warn(f"Class {class_label} has fewer samples ({len(X_class)}) "
-                                f"than requested clusters ({k_class}). Using all samples.")
-                    k_class = len(X_class)
-                
-                # Cluster within this class
-                if k_class == 1 or len(X_class) == 1:
-                    # If only one cluster or one sample, select the sample closest to mean
-                    if len(X_class) == 1:
-                        repr_idx = 0
-                        score = 0.0
-                    else:
-                        centroid = np.mean(X_class, axis=0)
-                        distances = np.linalg.norm(X_class - centroid, axis=1)
-                        repr_idx = np.argmin(distances)
-                        score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
-                    
-                    representative_indices.append(class_indices[repr_idx])
-                    representative_scores.append(score)
-                    cluster_labels[class_indices] = cluster_counter
-                    cluster_counter += 1
-                else:
-                    # Perform clustering within class
-                    clusterer = self._create_clusterer(k_class)
-                    class_cluster_labels = self._fit_predict_clusterer(clusterer, X_class, distance_matrix_class)
-                    
-                    # Store clusterer
-                    self.clusterers_[class_label] = clusterer
-                    
-                    # Find representative for each cluster
-                    for cluster_id in range(k_class):
-                        cluster_mask = (class_cluster_labels == cluster_id)
-                        cluster_samples = X_class[cluster_mask]
-                        cluster_indices = class_indices[cluster_mask]
-                        
-                        if len(cluster_samples) == 0:
-                            continue
-                            
-                        # Get distance matrix subset for this cluster if available
-                        distance_matrix_cluster = None
-                        if distance_matrix_class is not None:
-                            cluster_mask_indices = np.where(cluster_mask)[0]
-                            distance_matrix_cluster = distance_matrix_class[np.ix_(cluster_mask_indices, cluster_mask_indices)]
-                        
-                        repr_idx, score = self._find_representative(cluster_samples, distance_matrix_cluster)
-                        
-                        representative_indices.append(cluster_indices[repr_idx])
-                        representative_scores.append(score)
-                        
-                        # Update cluster labels
-                        cluster_labels[cluster_indices] = cluster_counter
-                        cluster_counter += 1
+            y_array = y.values
         else:
-            # No stratification - cluster all data together
-            if k_total >= n_samples:
-                warnings.warn(f"Requested {k_total} clusters but only {n_samples} samples available. "
-                            f"Using {n_samples} clusters (all samples).")
-                k_total = n_samples
-            
-            if k_total == 1:
-                # Single cluster - find sample closest to overall centroid
-                centroid = np.mean(X, axis=0)
-                distances = np.linalg.norm(X - centroid, axis=1)
-                repr_idx = np.argmin(distances)
-                score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
-                
-                representative_indices.append(repr_idx)
-                representative_scores.append(score)
-                cluster_labels[:] = 0
-            else:
-                # Multiple clusters
-                clusterer = self._create_clusterer(k_total)
-                cluster_labels = self._fit_predict_clusterer(clusterer, X, self.distance_matrix)
-                
-                # Store clusterer
-                self.clusterers_['overall'] = clusterer
-                
-                # Find representative for each cluster
-                for cluster_id in range(k_total):
-                    cluster_mask = (cluster_labels == cluster_id)
-                    cluster_samples = X[cluster_mask]
-                    cluster_indices = np.where(cluster_mask)[0]
-                    
-                    if len(cluster_samples) == 0:
-                        continue
-                    
-                    # Get distance matrix subset for this cluster if available
-                    distance_matrix_cluster = None
-                    if self.distance_matrix is not None:
-                        distance_matrix_cluster = self.distance_matrix[np.ix_(cluster_mask, cluster_mask)]
-                    
-                    repr_idx, score = self._find_representative(cluster_samples, distance_matrix_cluster)
-                    
-                    representative_indices.append(cluster_indices[repr_idx])
-                    representative_scores.append(score)
+            y_array = y
         
-        # Convert to numpy arrays
-        representative_indices = np.array(representative_indices)
-        representative_scores = np.array(representative_scores)
-        self.n_clusters_ = len(representative_indices)
+        if self.stratify:
+            X_array, y_array = check_X_y(X_array, y_array)
+            check_classification_targets(y_array)
         
-        # Calculate evaluation metrics
-        self.report_ = self._calculate_evaluation_metrics(original_y, representative_indices)
+        n_samples = X_array.shape[0]
+        k_total = max(1, int(n_samples * self.sampling_size))
         
-        # Calculate scores for all samples (distance to cluster centroid or medoid score)
-        all_scores = self._calculate_all_scores(X, cluster_labels, representative_indices)
+        logger.info(f"Creating {k_total} clusters for test set from {n_samples} samples...")
         
-        # Create sklearn-style attributes
+        if self.stratify:
+            representatives = self._stratified_clustering(X_array, y_array, k_total)
+        else:
+            representatives = self._global_clustering(X_array, k_total)
+        
+        # Ensure we don't have duplicates and sort
+        representatives = np.unique(representatives)
+        
+        # Create boolean mask for representatives
+        self.n_clusters_ = len(representatives)
+        representatives_mask = np.zeros(n_samples, dtype=bool)
+        representatives_mask[representatives] = True
+        
         if self.is_pandas_input_:
-            # Return pandas objects with original indices
-            self.labels_ = pd.Series(cluster_labels, index=original_index, name='cluster')
-            
-            # Create boolean mask for representatives
-            representatives_mask = np.zeros(n_samples, dtype=bool)
-            representatives_mask[representative_indices] = True
-            self.representatives_ = pd.Series(representatives_mask, index=original_index, name='is_representative')
-            
-            self.scores_ = pd.Series(all_scores, index=original_index, name='score')
+            self.representatives_ = pd.Series(representatives_mask, index=original_index, 
+                                            name='is_representative')
+            self.representative_indices_ = pd.Index(original_index[representatives], 
+                                                  name='representative_indices')
         else:
-            # Return numpy arrays
-            self.labels_ = cluster_labels
-            
-            # Create boolean mask for representatives
-            representatives_mask = np.zeros(n_samples, dtype=bool)
-            representatives_mask[representative_indices] = True
             self.representatives_ = representatives_mask
-            
-            self.scores_ = all_scores
+            self.representative_indices_ = representatives
         
+        logger.info(f"Selected {self.n_clusters_} representatives as test set")
         return self
     
-    def _create_clusterer(self, n_clusters):
-        """Create a clusterer based on the specified algorithm."""
-        if self.clustering_algorithm == 'kmeans':
-            return KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init=10)
-        elif self.clustering_algorithm == 'agglomerative':
-            if self.distance_matrix is not None:
-                return AgglomerativeClustering(
-                    n_clusters=n_clusters, 
-                    metric='precomputed', 
-                    linkage=self.linkage
-                )
-            else:
-                return AgglomerativeClustering(
-                    n_clusters=n_clusters, 
-                    linkage=self.linkage
-                )
-        elif self.clustering_algorithm == 'gmm':
-            return GaussianMixture(
-                n_components=n_clusters, 
+    def _global_clustering(self, X, k_total):
+        """Non-stratified clustering for the entire dataset."""
+        logger.info(f"Performing global clustering with k={k_total}...")
+        
+        if self.method == 'hierarchical':
+            return self._hierarchical_clustering(X, k_total)
+        
+        # Use appropriate clustering method
+        clusterer = self._get_clusterer(k_total, X.shape[0], X.shape[1])  # Added X.shape[1]
+        labels = clusterer.fit_predict(X)
+        centroids = clusterer.cluster_centers_
+        
+        # Find representatives (closest to centroids) - vectorized approach
+        representatives = self._find_representatives_vectorized(X, labels, centroids, k_total)
+        
+        return representatives
+    
+    def _get_clusterer(self, n_clusters, n_samples, n_features):
+        """Get appropriate clusterer based on method and data size."""
+        if self.method == 'minibatch':
+            return MiniBatchKMeans(
+                n_clusters=n_clusters,
+                batch_size=min(self.batch_size, n_samples),
                 random_state=self.random_state,
-                covariance_type=self.covariance_type
+                n_init=3,
+                reassignment_ratio=0.01  # Faster convergence
+            )
+        else:  # kmeans
+            return KMeans(
+                n_clusters=n_clusters,
+                n_init=1 if n_samples > 10000 else 10,  # Fewer inits for large data
+                random_state=self.random_state,
+                algorithm='elkan' if n_features and n_features > 10 else 'lloyd'  # Fixed: use n_features parameter
             )
     
-    def _fit_predict_clusterer(self, clusterer, X, distance_matrix=None):
-        """Fit and predict with the clusterer, handling different algorithm types."""
-        if self.clustering_algorithm == 'agglomerative' and distance_matrix is not None:
-            # Use precomputed distance matrix
-            return clusterer.fit_predict(distance_matrix)
-        elif self.clustering_algorithm == 'gmm':
-            # GMM uses fit then predict
-            clusterer.fit(X)
-            return clusterer.predict(X)
-        else:
-            # Standard fit_predict
-            return clusterer.fit_predict(X)
-    
-    def _find_representative(self, cluster_samples, distance_matrix_cluster=None):
-        """
-        Find the most representative sample in a cluster.
+    def _find_representatives_vectorized(self, X, labels, centroids, n_clusters):
+        """Efficiently find representatives using vectorized operations."""
+        representatives = []
         
-        Parameters
-        ----------
-        cluster_samples : array-like of shape (n_cluster_samples, n_features)
-            Samples in the cluster
-        distance_matrix_cluster : array-like of shape (n_cluster_samples, n_cluster_samples), default=None
-            Precomputed distance matrix for the cluster samples
+        for cluster_id in range(n_clusters):
+            cluster_mask = (labels == cluster_id)
+            if not np.any(cluster_mask):
+                continue
+                
+            cluster_indices = np.where(cluster_mask)[0]
+            cluster_samples = X[cluster_mask]
             
-        Returns
-        -------
-        repr_idx : int
-            Index of the representative sample within the cluster
-        score : float
-            Representative score (higher is better)
-        """
-        if len(cluster_samples) == 1:
-            return 0, 1.0
-        
-        if self.representative_method == 'centroid':
-            # Find sample closest to cluster centroid
-            centroid = np.mean(cluster_samples, axis=0)
-            distances = np.linalg.norm(cluster_samples - centroid, axis=1)
-            repr_idx = np.argmin(distances)
-            score = 1.0 / (1.0 + distances[repr_idx])  # Positive score
-            
-        elif self.representative_method == 'medoid':
-            # Find sample with minimum sum of distances to all others (medoid)
-            if distance_matrix_cluster is not None:
-                # Use precomputed distance matrix
-                distances_matrix = distance_matrix_cluster
+            if len(cluster_samples) == 1:
+                representatives.append(cluster_indices[0])
             else:
-                # Compute distance matrix
-                distances_matrix = pairwise_distances(cluster_samples)
-            
-            sum_distances = np.sum(distances_matrix, axis=1)
-            repr_idx = np.argmin(sum_distances)
-            score = 1.0 / (1.0 + sum_distances[repr_idx])  # Positive score
+                # Vectorized distance calculation
+                centroid = centroids[cluster_id].reshape(1, -1)
+                closest_idx, _ = pairwise_distances_argmin_min(centroid, cluster_samples)
+                representatives.append(cluster_indices[closest_idx[0]])
         
-        return repr_idx, score
+        return np.array(representatives)
+    
+    def _stratified_clustering(self, X, y, k_total):
+        """Stratified clustering maintaining class proportions."""
+        class_counts = Counter(y)
+        total_samples = len(y)
+        representatives = []
+        
+        logger.info(f"Stratified clustering across {len(class_counts)} classes...")
+        
+        # Calculate cluster allocation per class
+        cluster_allocation = self._calculate_cluster_allocation(class_counts, k_total, total_samples)
+        
+        for class_label, k_class in cluster_allocation.items():
+            if k_class == 0:
+                continue
+                
+            logger.info(f"  Class {class_label}: {k_class} clusters from {class_counts[class_label]} samples")
+            
+            class_mask = (y == class_label)
+            X_class = X[class_mask]
+            class_indices = np.where(class_mask)[0]
+            
+            if len(X_class) <= k_class:
+                # Too few samples for clustering - take all
+                representatives.extend(class_indices)
+            elif k_class == 1:
+                # Single cluster - select centroid
+                centroid = np.mean(X_class, axis=0).reshape(1, -1)
+                closest_idx, _ = pairwise_distances_argmin_min(centroid, X_class)
+                representatives.append(class_indices[closest_idx[0]])
+            else:
+                # Cluster within class
+                class_representatives = self._cluster_class(X_class, class_indices, k_class)
+                representatives.extend(class_representatives)
+        
+        return np.array(representatives)
+    
+    def _cluster_class(self, X_class, class_indices, k_class):
+        """Cluster samples within a single class."""
+        clusterer = self._get_clusterer(k_class, len(X_class), X_class.shape[1])  # Added X_class.shape[1]
+        labels = clusterer.fit_predict(X_class)
+        
+        representatives = []
+        for cluster_id in range(k_class):
+            cluster_mask = (labels == cluster_id)
+            if not np.any(cluster_mask):
+                continue
+                
+            cluster_samples = X_class[cluster_mask]
+            cluster_class_indices = class_indices[cluster_mask]
+            
+            if len(cluster_samples) == 1:
+                representatives.append(cluster_class_indices[0])
+            else:
+                # Find representative (closest to centroid) - vectorized
+                centroid = clusterer.cluster_centers_[cluster_id].reshape(1, -1)
+                closest_idx, _ = pairwise_distances_argmin_min(centroid, cluster_samples)
+                representatives.append(cluster_class_indices[closest_idx[0]])
+        
+        return representatives
+    
+    def _calculate_cluster_allocation(self, class_counts, k_total, total_samples):
+        """Calculate how many clusters each class should get."""
+        max_class_count = max(class_counts.values())
+        cluster_allocation = {}
+        
+        # Calculate boosted weights with numerical stability
+        boosted_weights = {}
+        total_boosted_weight = 0
+        
+        for class_label, class_count in class_counts.items():
+            # Base proportion
+            base_proportion = class_count / total_samples
+            
+            # Apply coverage boost for minority classes
+            if self.coverage_boost != 1.0:
+                imbalance_ratio = max_class_count / class_count
+                # Use log scaling for numerical stability
+                boost_factor = np.exp(np.log(imbalance_ratio) / self.coverage_boost)
+                boosted_weight = base_proportion * boost_factor
+            else:
+                boosted_weight = base_proportion
+            
+            boosted_weights[class_label] = boosted_weight
+            total_boosted_weight += boosted_weight
+        
+        # Allocate clusters with constraints
+        allocated_total = 0
+        for class_label, class_count in class_counts.items():
+            # Proportional allocation
+            normalized_weight = boosted_weights[class_label] / total_boosted_weight
+            proportional_clusters = max(1, round(k_total * normalized_weight))
+            
+            # Apply constraints
+            final_clusters = max(self.min_clusters_per_class, proportional_clusters)
+            final_clusters = min(final_clusters, class_count)  # Can't exceed sample count
+            
+            cluster_allocation[class_label] = final_clusters
+            allocated_total += final_clusters
+        
+        # Adjust if over-allocated (redistribute excess)
+        if allocated_total > k_total:
+            excess = allocated_total - k_total
+            # Sort by cluster allocation (descending) to reduce from largest first
+            sorted_classes = sorted(
+                cluster_allocation.items(), 
+                key=lambda x: x[1], 
+                reverse=True
+            )
+            
+            for class_label, clusters in sorted_classes:
+                if excess <= 0:
+                    break
+                max_reduction = max(0, clusters - self.min_clusters_per_class)
+                reduction = min(excess, max_reduction)
+                cluster_allocation[class_label] -= reduction
+                excess -= reduction
+        
+        return cluster_allocation
     
     def transform(self, X):
-        """
-        Return the representative samples.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features) or pandas DataFrame
-            Input data (should be same as fit data)
-            
-        Returns
-        -------
-        X_representative : array-like or pandas DataFrame
-            Representative samples
-        """
+        """Return the representative samples (test set)."""
         if not hasattr(self, 'representatives_'):
-            raise ValueError("This RepresentativeSampler instance is not fitted yet.")
+            raise ValueError("This KMeansRepresentativeSampler instance is not fitted yet.")
         
-        # Handle pandas input
         if isinstance(X, (pd.DataFrame, pd.Series)):
             return X[self.representatives_]
         else:
@@ -1451,82 +1145,52 @@ class RepresentativeSampler(BaseEstimator, TransformerMixin):
             return X[self.representatives_]
     
     def fit_transform(self, X, y=None):
-        """
-        Fit the sampler and return representative samples.
-        
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features) or pandas DataFrame
-            Input data
-        y : array-like of shape (n_samples,), default=None
-            Target values
-            
-        Returns
-        -------
-        X_representative : array-like or pandas DataFrame
-            Representative samples
-        """
+        """Fit the sampler and return the test set."""
         return self.fit(X, y).transform(X)
     
-    def _calculate_all_scores(self, X, cluster_labels, representative_indices):
+    def get_train_test_split(self, X, y=None):
         """
-        Calculate scores for all samples based on their relationship to cluster representatives.
+        Get train/test split with representatives as test set.
         
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Input data
-        cluster_labels : array-like of shape (n_samples,)
-            Cluster labels for each sample
-        representative_indices : array-like
-            Indices of representative samples
-            
         Returns
         -------
-        all_scores : array-like of shape (n_samples,)
-            Scores for all samples
+        X_train, X_test, y_train, y_test : arrays
+            Train/test split where test set contains the cluster representatives
         """
-        n_samples = X.shape[0]
-        all_scores = np.zeros(n_samples)
+        if not hasattr(self, 'representatives_'):
+            raise ValueError("This KMeansRepresentativeSampler instance is not fitted yet.")
         
-        # For each cluster, calculate scores for all samples in that cluster
-        unique_clusters = np.unique(cluster_labels)
+        # Boolean indexing works consistently for pandas and numpy
+        mask = self.representatives_
         
-        for cluster_id in unique_clusters:
-            cluster_mask = (cluster_labels == cluster_id)
-            cluster_samples = X[cluster_mask]
-            cluster_indices = np.where(cluster_mask)[0]
-            
-            if len(cluster_samples) == 0:
-                continue
-            
-            if self.representative_method == 'centroid':
-                # Score based on inverse distance to cluster centroid (higher = closer)
-                centroid = np.mean(cluster_samples, axis=0)
-                distances = np.linalg.norm(cluster_samples - centroid, axis=1)
-                # Use inverse distance so closer samples have higher scores
-                scores = 1.0 / (1.0 + distances)  # Always positive, closer = higher
-                
-            elif self.representative_method == 'medoid':
-                # Score based on inverse sum of distances (higher = more central)
-                if len(cluster_samples) == 1:
-                    scores = np.array([1.0])
-                else:
-                    distances_matrix = pairwise_distances(cluster_samples)
-                    sum_distances = np.sum(distances_matrix, axis=1)
-                    # Use inverse sum distance so more central samples have higher scores
-                    scores = 1.0 / (1.0 + sum_distances)  # Always positive, more central = higher
-            
-            # Assign scores to all samples in this cluster
-            all_scores[cluster_indices] = scores
+        if hasattr(X, 'index'):  # pandas
+            X_test = X[mask]
+            X_train = X[~mask]
+        else:  # numpy
+            X = check_array(X)
+            X_test = X[mask]
+            X_train = X[~mask]
         
-        return all_scores
-
-
+        if y is not None:
+            if hasattr(y, 'index'):  # pandas Series
+                y_test = y[mask]
+                y_train = y[~mask]
+            else:  # numpy
+                y_test = y[mask]
+                y_train = y[~mask]
+            return X_train, X_test, y_train, y_test
+        
+        return X_train, X_test
+    
+    def get_feature_names_out(self, input_features=None):
+        """Get output feature names for transformation."""
+        if input_features is None:
+            return None
+        return input_features
 
 # Export main classes and functions
 __all__ = [
     'HierarchicalClustering',
-    'RepresentativeSampler',
+    'KMeansRepresentativeSampler',
 ]
 
