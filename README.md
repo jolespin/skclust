@@ -275,9 +275,7 @@ The original implementation provided the foundation for the hierarchical cluster
 
 ##  Support
 
-- **Documentation**: [Link to docs]
 - **Issues**: [GitHub Issues](https://github.com/your-username/hierarchical-clustering/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/hierarchical-clustering/discussions)
 
 ##  Citation
 
