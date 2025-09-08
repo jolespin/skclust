@@ -13,15 +13,8 @@ except FileNotFoundError:
     long_description = "A comprehensive clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities."
 
 # Extract version from skclust/__init__.py
-version = None
-with open(os.path.join(script_directory, "skclust", "__init__.py")) as f:
-    for line in f:
-        if line.strip().startswith("__version__"):
-            version = line.split("=")[-1].strip().strip('"').strip("'")
-            break
+exec(open('skclust/__init__.py').read())
 
-if version is None:
-    raise RuntimeError("Unable to find __version__ in skclust/__init__.py")
 
 # Parse requirements.txt
 install_requires = []
@@ -33,7 +26,7 @@ with open(os.path.join(script_directory, "requirements.txt")) as f:
 
 setup(
     name="skclust",
-    version=version,
+    version=__version__,
     author="Josh L. Espinoza",
     author_email="jol.espinoz@gmail.com",
     description="A comprehensive clustering toolkit with advanced tree cutting and visualization",
@@ -45,7 +38,7 @@ setup(
         "Source": "https://github.com/jolespin/skclust",
     },
     license="MIT",
-    packages=find_packages(),  # finds skclust automatically
+    packages=find_packages(),
     include_package_data=True,
     install_requires=install_requires,
     extras_require={

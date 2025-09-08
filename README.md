@@ -16,415 +16,243 @@ A comprehensive clustering toolkit with advanced tree cutting, visualization, an
 - **Advanced tree cutting** with dynamic, height-based, and max-cluster methods
 - **Rich visualizations** with dendrograms and metadata tracks
 - **Network analysis** with connectivity metrics and NetworkX integration
-- **Cluster validation** using silhouette analysis
-- **Eigenprofile calculation** for cluster characterization
 - **Tree export** in Newick format for phylogenetic analysis
 - **Distance matrix support** for precomputed distances
 - **Metadata tracks** for biological and experimental annotations
 
-##  Installation
-
-### Basic Installation
+## Installation
 
 ```bash
 pip install skclust
 ```
 
-### Development Installation
+## Quick Start
 
-```bash
-git clone https://github.com/jolespin/skclust.git
-cd skclust
-pip install -e .[all]
-```
-
-### Installation Options
-
-```bash
-# Basic functionality only
-pip install skclust
-
-# With fast clustering (fastcluster)
-pip install skclust[fast]
-
-# With tree operations (scikit-bio)
-pip install skclust[tree]
-
-# With all optional features
-pip install skclust[all]
-
-# Development installation
-pip install skclust[dev]
-```
-
-##  Dependencies
-
-### Core Dependencies (Required)
-- `numpy >= 1.19.0`
-- `pandas >= 1.3.0`
-- `scipy >= 1.7.0`
-- `scikit-learn >= 1.0.0`
-- `matplotlib >= 3.3.0`
-- `seaborn >= 0.11.0`
-- `networkx >= 2.6.0`
-
-### Optional Dependencies (Enhanced Features)
-- `fastcluster >= 1.2.0` - Faster linkage computations
-- `scikit-bio >= 0.5.6` - Tree operations and Newick export
-- `dynamicTreeCut >= 0.1.0` - Dynamic tree cutting algorithms
-- `ensemble-networkx >= 0.1.0` - Enhanced network analysis
-
-##  Quick Start
+### Hierarchical Clustering
 
 ```python
-from skclust import HierarchicalClustering
 import pandas as pd
 import numpy as np
+from sklearn.datasets import make_blobs
+from skclust import HierarchicalClustering
 
 # Generate sample data
-data = np.random.randn(100, 10)
-df = pd.DataFrame(data, index=[f"Sample_{i}" for i in range(100)])
+X, y = make_blobs(n_samples=100, centers=4, random_state=42)
+X_df = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
 
-# Create and fit clusterer
-clusterer = HierarchicalClustering(
-    method='ward',
-    cut_method='dynamic',
-    min_cluster_size=10
-)
-
-# Fit and get cluster labels
-labels = clusterer.fit_transform(df)
-
-# Plot dendrogram
-fig, ax = clusterer.plot_dendrogram(figsize=(12, 6))
-
-# Get summary
-summary = clusterer.summary()
-print(f"Found {clusterer.n_clusters_} clusters")
-```
-
-##  Detailed Usage Examples
-
-### 1. Basic Clustering with Different Methods
-
-```python
-from skclust import HierarchicalClustering
-import pandas as pd
-
-# Ward clustering with dynamic cutting
-clusterer = HierarchicalClustering(
+# Perform hierarchical clustering
+hc = HierarchicalClustering(
     method='ward',
     cut_method='dynamic',
     min_cluster_size=5
 )
-labels = clusterer.fit_transform(data)
 
-# Complete linkage with height-based cutting
-clusterer = HierarchicalClustering(
-    method='complete',
-    cut_method='height',
-    cut_threshold=10.0
-)
-labels = clusterer.fit_transform(data)
+# Fit and get cluster labels
+labels = hc.fit_transform(X_df)
+print(f"Found {hc.n_clusters_} clusters")
 
-# Average linkage with fixed number of clusters
-clusterer = HierarchicalClustering(
-    method='average',
-    cut_method='maxclust',
-    cut_threshold=4
-)
-labels = clusterer.fit_transform(data)
+# Plot dendrogram with clusters
+fig, axes = hc.plot(figsize=(12, 6), show_clusters=True)
 ```
 
-### 2. Working with Distance Matrices
+### Representative Sampling
+
+```python
+from skclust import KMeansRepresentativeSampler
+
+# Create representative test set (10% of data)
+sampler = KMeansRepresentativeSampler(
+    sampling_size=0.1,
+    stratify=True,  # Maintain class proportions
+    method='minibatch'
+)
+
+# Get train/test split
+X_train, X_test, y_train, y_test = sampler.fit(X_df, y).get_train_test_split(X_df, y)
+
+print(f"Train set: {len(X_train)} samples")
+print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X_df)*100:.1f}%)")
+```
+
+## Advanced Usage
+
+### Adding Metadata Tracks
+
+```python
+# Add continuous metadata track
+sample_scores = pd.Series(np.random.randn(100), index=X_df.index)
+hc.add_track('Quality Score', sample_scores, track_type='continuous')
+
+# Add categorical metadata track
+sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X_df.index[:100])
+hc.add_track('Group', sample_groups, track_type='categorical')
+
+# Plot with metadata tracks
+fig, axes = hc.plot(show_tracks=True, figsize=(12, 8))
+```
+
+### Custom Tree Cutting
+
+```python
+# Cut by height
+hc_height = HierarchicalClustering(
+    method='ward',
+    cut_method='height',
+    cut_threshold=50.0
+)
+labels_height = hc_height.fit_transform(X_df)
+
+# Cut by number of clusters
+hc_maxclust = HierarchicalClustering(
+    method='complete',
+    cut_method='maxclust',
+    cut_threshold=5  # Force exactly 5 clusters
+)
+labels_maxclust = hc_maxclust.fit_transform(X_df)
+```
+
+### Distance Matrix Input
 
 ```python
 from scipy.spatial.distance import pdist, squareform
 
 # Compute custom distance matrix
-distances = pdist(data.values, metric='correlation')
-distance_matrix = pd.DataFrame(
-    squareform(distances),
-    index=data.index,
-    columns=data.index
-)
+distances = pdist(X_df, metric='cosine')
+distance_matrix = pd.DataFrame(squareform(distances), 
+                              index=X_df.index, 
+                              columns=X_df.index)
 
 # Cluster using precomputed distances
-clusterer = HierarchicalClustering(method='complete')
-labels = clusterer.fit_transform(distance_matrix)
+hc_custom = HierarchicalClustering(method='average')
+labels_custom = hc_custom.fit_transform(distance_matrix)
 ```
 
-### 3. Adding Metadata Tracks
+### Stratified Representative Sampling
 
 ```python
-# Add continuous metadata (e.g., age, expression levels)
-age_data = np.random.normal(45, 15, len(data))
-clusterer.add_track('Age', age_data, track_type='continuous', color='steelblue')
-
-# Add categorical metadata (e.g., treatment groups)
-treatment = ['Control'] * 30 + ['Treatment_A'] * 35 + ['Treatment_B'] * 35
-clusterer.add_track(
-    'Treatment', 
-    treatment, 
-    track_type='categorical',
-    color={'Control': 'gray', 'Treatment_A': 'red', 'Treatment_B': 'blue'}
+# Enhanced stratified sampling with minority class boosting
+sampler_enhanced = KMeansRepresentativeSampler(
+    sampling_size=0.15,
+    stratify=True,
+    coverage_boost=2.0,  # Boost minority classes
+    min_clusters_per_class=3,  # Ensure minimum representation
+    method='kmeans'
 )
 
-# Plot dendrogram with metadata tracks
-fig, axes = clusterer.plot_dendrogram(
-    figsize=(14, 10),
-    show_tracks=True,
-    track_height=1.0
-)
+X_train, X_test, y_train, y_test = sampler_enhanced.fit(X_df, y).get_train_test_split(X_df, y)
+
+# Check class balance preservation
+print("Original class distribution:")
+print(pd.Series(y).value_counts().sort_index())
+print("\nTest set class distribution:")
+print(pd.Series(y_test).value_counts().sort_index())
 ```
 
-### 4. Cluster Analysis and Validation
+## API Reference
+
+### HierarchicalClustering
+
+**Parameters:**
+- `method`: Linkage method ('ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted')
+- `metric`: Distance metric for computing pairwise distances
+- `cut_method`: Tree cutting method ('dynamic', 'height', 'maxclust')
+- `min_cluster_size`: Minimum cluster size for dynamic cutting
+- `deep_split`: Deep split parameter for dynamic cutting (0-4)
+- `cut_threshold`: Threshold for height/maxclust cutting
+- `cluster_prefix`: String prefix for cluster labels (e.g., "C" → "C1", "C2")
+
+**Key Methods:**
+- `fit(X)`: Fit hierarchical clustering to data
+- `transform()`: Return cluster labels
+- `add_track(name, data, track_type)`: Add metadata track for visualization
+- `plot()`: Generate dendrogram with optional tracks and clusters
+- `summary()`: Print clustering summary statistics
+
+### KMeansRepresentativeSampler
+
+**Parameters:**
+- `sampling_size`: Proportion of data for test set (0.0-1.0)
+- `stratify`: Whether to maintain class proportions
+- `method`: Clustering method ('minibatch', 'kmeans')
+- `coverage_boost`: Boost factor for minority classes (>1.0)
+- `min_clusters_per_class`: Minimum clusters per class
+- `batch_size`: Batch size for MiniBatchKMeans
+
+**Key Methods:**
+- `fit(X, y)`: Fit sampler and identify representatives
+- `transform(X)`: Return representative samples
+- `get_train_test_split(X, y)`: Get train/test split
+
+## Examples with Real Data
+
+### Iris Dataset
 
 ```python
-# Calculate eigenprofiles (principal components for each cluster)
-eigenprofiles = clusterer.eigenprofiles(data)
-for cluster_id, profile in eigenprofiles.items():
-    print(f"Cluster {cluster_id}: "
-          f"Explained variance = {profile['explained_variance_ratio']:.3f}")
+from sklearn.datasets import load_iris
 
-# Perform silhouette analysis
-silhouette_results = clusterer.silhouette_analysis()
-print(f"Overall silhouette score: {silhouette_results['overall_score']:.3f}")
+# Load iris dataset
+iris = load_iris()
+X_iris = pd.DataFrame(iris.data, columns=iris.feature_names)
+y_iris = pd.Series(iris.target, name='species')
 
-# Calculate connectivity metrics
-connectivity = clusterer.connectivity()
-print("Connectivity analysis:", connectivity)
-```
-
-### 5. Network Analysis
-
-```python
-# Convert to NetworkX graph
-graph = clusterer.to_networkx(weight_threshold=0.3)
-print(f"Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
-
-# Visualize network (for small datasets)
-import networkx as nx
-import matplotlib.pyplot as plt
-
-pos = nx.spring_layout(graph)
-nx.draw(graph, pos, node_color=clusterer.labels_, 
-        node_size=50, cmap='viridis', alpha=0.7)
-plt.title('Sample Network (colored by cluster)')
-plt.show()
-```
-
-### 6. Tree Export and Phylogenetic Analysis
-
-```python
-# Export tree in Newick format (requires scikit-bio)
-try:
-    newick_string = clusterer.to_newick()
-    print("Newick tree:", newick_string[:100], "...")
-    
-    # Save to file
-    clusterer.to_newick('my_tree.newick')
-except ValueError as e:
-    print("Tree export not available:", e)
-```
-
-### 7. Convenience Function
-
-```python
-from skclust import hierarchical_clustering
-
-# Quick clustering with default parameters
-clusterer = hierarchical_clustering(
-    data, 
-    method='ward', 
-    min_cluster_size=10
-)
-print(f"Quick clustering: {clusterer.n_clusters_} clusters")
-```
-
-##  Biological Data Example
-
-```python
-import pandas as pd
-import numpy as np
-from skclust import HierarchicalClustering
-
-# Simulate gene expression data
-np.random.seed(42)
-n_samples, n_genes = 80, 1000
-expression_data = np.random.randn(n_samples, n_genes)
-
-# Add structure: 3 patient groups with different expression patterns
-expression_data[:25, :100] += 2.0   # Group 1: high expression in genes 1-100
-expression_data[25:50, 100:200] += 2.0  # Group 2: high expression in genes 101-200
-expression_data[50:, 200:300] += 2.0     # Group 3: high expression in genes 201-300
-
-# Create DataFrame with sample names
-sample_names = [f"Patient_{i:02d}" for i in range(n_samples)]
-gene_names = [f"Gene_{i:04d}" for i in range(n_genes)]
-df_expression = pd.DataFrame(expression_data, 
-                           index=sample_names, 
-                           columns=gene_names)
-
-# Perform hierarchical clustering
-clusterer = HierarchicalClustering(
+# Hierarchical clustering
+hc_iris = HierarchicalClustering(
     method='ward',
     cut_method='dynamic',
-    min_cluster_size=8,
-    name='Gene_Expression_Clustering'
+    min_cluster_size=10,
+    cluster_prefix='Cluster_'
 )
 
-labels = clusterer.fit_transform(df_expression)
+clusters = hc_iris.fit_transform(X_iris)
 
-# Add clinical metadata
-age = np.random.normal(55, 12, n_samples)
-gender = np.random.choice(['Male', 'Female'], n_samples)
-stage = ['Stage_I'] * 20 + ['Stage_II'] * 30 + ['Stage_III'] * 30
+# Add species information as track
+species_names = pd.Series([iris.target_names[i] for i in y_iris], index=X_iris.index)
+hc_iris.add_track('True Species', species_names, track_type='categorical')
 
-clusterer.add_track('Age', age, track_type='continuous')
-clusterer.add_track('Gender', gender, track_type='categorical')
-clusterer.add_track('Disease_Stage', stage, track_type='categorical')
-
-# Visualize results
-fig, axes = clusterer.plot_dendrogram(figsize=(15, 10), show_tracks=True)
-
-# Analyze cluster characteristics
-eigenprofiles = clusterer.eigenprofiles(df_expression)
-silhouette_results = clusterer.silhouette_analysis()
-
-print(f"Identified {clusterer.n_clusters_} patient clusters")
-print(f"Silhouette score: {silhouette_results['overall_score']:.3f}")
-
-# Print cluster summary
-clusterer.summary()
+# Plot results
+fig, axes = hc_iris.plot(show_clusters=True, show_tracks=True, figsize=(15, 8))
 ```
 
-##  Advanced Configuration
-
-### Custom Linkage Methods
+### Creating Balanced Test Sets
 
 ```python
-# Supported linkage methods
-methods = ['ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted']
-
-for method in methods:
-    clusterer = HierarchicalClustering(method=method)
-    labels = clusterer.fit_transform(data)
-    print(f"{method}: {clusterer.n_clusters_} clusters")
-```
-
-### Distance Metrics
-
-```python
-# Supported distance metrics (for raw data)
-metrics = ['euclidean', 'manhattan', 'cosine', 'correlation']
-
-for metric in metrics:
-    clusterer = HierarchicalClustering(metric=metric)
-    labels = clusterer.fit_transform(data)
-    print(f"{metric}: {clusterer.n_clusters_} clusters")
-```
-
-### Dynamic Tree Cutting Parameters
-
-```python
-# Fine-tune dynamic tree cutting
-clusterer = HierarchicalClustering(
-    cut_method='dynamic',
-    min_cluster_size=10,        # Minimum samples per cluster
-    deep_split=2,               # Sensitivity (0-4, higher = more clusters)
-    dynamic_cut_method='hybrid' # 'hybrid' or 'tree'
+# Create representative test set maintaining species balance
+sampler_iris = KMeansRepresentativeSampler(
+    sampling_size=0.2,  # 20% test set
+    stratify=True,
+    coverage_boost=1.0,  # Equal representation
+    method='kmeans',
+    random_state=42
 )
+
+X_train, X_test, y_train, y_test = sampler_iris.fit(X_iris, y_iris).get_train_test_split(X_iris, y_iris)
+
+print(f"Train set: {len(X_train)} samples")
+print(f"Test set: {len(X_test)} samples")
+print(f"Representative indices: {sampler_iris.representative_indices_[:10].tolist()}")
 ```
 
-##  Performance Tips
+## Dependencies
 
-1. **Use fastcluster**: Install `fastcluster` for significantly faster linkage computation
-2. **Distance matrices**: Precompute distance matrices for repeated analysis
-3. **Data preprocessing**: Standardize/normalize data before clustering
-4. **Memory management**: For large datasets (>1000 samples), consider subsampling
+### Required
+- numpy
+- pandas
+- scikit-learn
+- scipy
+- matplotlib
+- seaborn
+- networkx
+- loguru
 
-```python
-# Example: Preprocessing pipeline
-from sklearn.preprocessing import StandardScaler
+### Optional (for enhanced functionality)
+- dynamicTreeCut (dynamic tree cutting)
+- skbio (tree representations)
+- fastcluster (faster linkage computation)
+- ensemble_networkx (network analysis)
 
-# Standardize features
-scaler = StandardScaler()
-data_scaled = scaler.fit_transform(data)
-df_scaled = pd.DataFrame(data_scaled, index=data.index, columns=data.columns)
+## Author
 
-# Cluster scaled data
-clusterer = HierarchicalClustering(method='ward')
-labels = clusterer.fit_transform(df_scaled)
-```
-
-##  Troubleshooting
-
-### Common Issues
-
-1. **ImportError for optional dependencies**:
-   ```bash
-   pip install hierarchical-clustering[all]
-   ```
-
-2. **Memory issues with large datasets**:
-   - Use data subsampling or dimensionality reduction
-   - Consider approximate methods for >5000 samples
-
-3. **Dynamic tree cutting not working**:
-   - Install `dynamicTreeCut` package
-   - Falls back to height-based cutting automatically
-
-4. **Tree export failing**:
-   - Install `scikit-bio` package
-   - Check that clustering was successful
-
-### Performance Benchmarks
-
-| Dataset Size | Method | Time (seconds) | Memory (GB) |
-|-------------|--------|----------------|-------------|
-| 100 samples | Ward   | 0.01          | < 0.1       |
-| 500 samples | Ward   | 0.1           | 0.2         |
-| 1000 samples| Ward   | 0.5           | 0.8         |
-| 2000 samples| Ward   | 2.0           | 3.2         |
-
-##  API Reference
-
-### HierarchicalClustering Class
-
-#### Parameters
-- `method` (str): Linkage method ('ward', 'complete', 'average', 'single')
-- `metric` (str): Distance metric ('euclidean', 'manhattan', 'cosine', etc.)
-- `cut_method` (str): Tree cutting method ('dynamic', 'height', 'maxclust')
-- `min_cluster_size` (int): Minimum cluster size for dynamic cutting
-- `cut_threshold` (float): Threshold for height/maxclust cutting
-- `name` (str): Optional name for the clustering instance
-
-#### Methods
-- `fit(X)`: Fit clustering to data
-- `transform()`: Return cluster labels
-- `fit_transform(X)`: Fit and return labels
-- `add_track(name, data, track_type)`: Add metadata track
-- `plot_dendrogram(**kwargs)`: Plot dendrogram with optional tracks
-- `eigenprofiles(data)`: Calculate cluster eigenprofiles
-- `silhouette_analysis()`: Perform silhouette analysis
-- `connectivity()`: Calculate network connectivity
-- `to_networkx()`: Convert to NetworkX graph
-- `to_newick()`: Export tree in Newick format
-- `summary()`: Print clustering summary
-
-#### Attributes (after fitting)
-- `labels_`: Cluster labels for each sample
-- `n_clusters_`: Number of clusters found
-- `linkage_matrix_`: Hierarchical linkage matrix
-- `distance_matrix_`: Distance matrix used
-- `tree_`: Tree object (if available)
-- `tracks_`: Dictionary of metadata tracks
-
-##  Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
+Josh L. Espinoza
 
 ##  License
 
