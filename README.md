@@ -38,7 +38,7 @@ from skclust import HierarchicalClustering
 
 # Generate sample data
 X, y = make_blobs(n_samples=100, centers=4, random_state=42)
-X_df = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
+X = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
 
 # Perform hierarchical clustering
 hc = HierarchicalClustering(
@@ -48,7 +48,7 @@ hc = HierarchicalClustering(
 )
 
 # Fit and get cluster labels
-labels = hc.fit_transform(X_df)
+labels = hc.fit_transform(X)
 print(f"Found {hc.n_clusters_} clusters")
 
 # Plot dendrogram with clusters
@@ -68,10 +68,10 @@ sampler = KMeansRepresentativeSampler(
 )
 
 # Get train/test split
-X_train, X_test, y_train, y_test = sampler.fit(X_df, y).get_train_test_split(X_df, y)
+X_train, X_test, y_train, y_test = sampler.fit(X, y).get_train_test_split(X, y)
 
 print(f"Train set: {len(X_train)} samples")
-print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X_df)*100:.1f}%)")
+print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
 ```
 
 ## Advanced Usage
@@ -80,11 +80,11 @@ print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X_df)*100:.1f}%)")
 
 ```python
 # Add continuous metadata track
-sample_scores = pd.Series(np.random.randn(100), index=X_df.index)
+sample_scores = pd.Series(np.random.randn(100), index=X.index)
 hc.add_track('Quality Score', sample_scores, track_type='continuous')
 
 # Add categorical metadata track
-sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X_df.index[:100])
+sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X.index[:100])
 hc.add_track('Group', sample_groups, track_type='categorical')
 
 # Plot with metadata tracks
@@ -100,7 +100,7 @@ hc_height = HierarchicalClustering(
     cut_method='height',
     cut_threshold=50.0
 )
-labels_height = hc_height.fit_transform(X_df)
+labels_height = hc_height.fit_transform(X)
 
 # Cut by number of clusters
 hc_maxclust = HierarchicalClustering(
@@ -108,7 +108,7 @@ hc_maxclust = HierarchicalClustering(
     cut_method='maxclust',
     cut_threshold=5  # Force exactly 5 clusters
 )
-labels_maxclust = hc_maxclust.fit_transform(X_df)
+labels_maxclust = hc_maxclust.fit_transform(X)
 ```
 
 ### Distance Matrix Input
@@ -117,10 +117,10 @@ labels_maxclust = hc_maxclust.fit_transform(X_df)
 from scipy.spatial.distance import pdist, squareform
 
 # Compute custom distance matrix
-distances = pdist(X_df, metric='cosine')
+distances = pdist(X, metric='cosine')
 distance_matrix = pd.DataFrame(squareform(distances), 
-                              index=X_df.index, 
-                              columns=X_df.index)
+                              index=X.index, 
+                              columns=X.index)
 
 # Cluster using precomputed distances
 hc_custom = HierarchicalClustering(method='average')
@@ -139,7 +139,7 @@ sampler_enhanced = KMeansRepresentativeSampler(
     method='kmeans'
 )
 
-X_train, X_test, y_train, y_test = sampler_enhanced.fit(X_df, y).get_train_test_split(X_df, y)
+X_train, X_test, y_train, y_test = sampler_enhanced.fit(X, y).get_train_test_split(X, y)
 
 # Check class balance preservation
 print("Original class distribution:")
