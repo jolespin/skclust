@@ -13,8 +13,13 @@ except FileNotFoundError:
     long_description = "A comprehensive clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities."
 
 # Extract version from skclust/__init__.py
-exec(open('skclust/__init__.py').read())
-
+with open(os.path.join(script_directory, "skclust", "__init__.py")) as f:
+    for line in f:
+        if line.startswith("__version__"):
+            __version__ = line.split("=")[1].strip().strip('"').strip("'")
+            break
+    else:
+        raise RuntimeError("Unable to find version string.")
 
 # Parse requirements.txt
 install_requires = []
