@@ -21,3 +21,6 @@ loguru
 
 # For enhanced network analysis (if ensemble-networkx is available)
 # ensemble-networkx>=0.1.0
+
+# For KNN
+# faiss-cpu
