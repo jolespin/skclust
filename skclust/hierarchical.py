@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# skclust/hierarchical.py
+
 import warnings
 import logging
 from collections import (
@@ -45,12 +48,13 @@ except ImportError:
     SKBIO_AVAILABLE = False
     warnings.warn("skbio not available, tree functionality will be limited")
 
-try:
-    from ensemble_networkx import Symmetric
-    ENSEMBLE_NETWORKX_AVAILABLE = True
-except ImportError:
-    ENSEMBLE_NETWORKX_AVAILABLE = False
-    warnings.warn("ensemble_networkx not available, Symmetric object support disabled")
+# Removing Symmetric import to avoid circular dependency
+# try:
+#     from ensemble_networkx import Symmetric
+#     ENSEMBLE_NETWORKX_AVAILABLE = True
+# except ImportError:
+#     ENSEMBLE_NETWORKX_AVAILABLE = False
+#     warnings.warn("ensemble_networkx not available, Symmetric object support disabled")
 
 try:
     import dynamicTreeCut
@@ -201,7 +205,8 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         if self._is_distance_matrix(X, tol=self.distance_matrix_tol):
             self.distance_matrix_ = X
         else:
-            if ENSEMBLE_NETWORKX_AVAILABLE and isinstance(X, Symmetric):
+            is_symmetric_object = X.__class__.__name__ == "Symmetric"
+            if is_symmetric_object:
                 self.distance_matrix_ = X.to_pandas_dataframe()
             else:
                 self.distance_matrix_ = self._compute_distance_matrix(X)
