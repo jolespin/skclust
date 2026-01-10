@@ -10,9 +10,6 @@ from collections import (
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.colors import rgb2hex
 from scipy.cluster.hierarchy import (
     linkage, 
     dendrogram as scipy_dendrogram, 
@@ -33,35 +30,7 @@ from sklearn.utils.multiclass import check_classification_targets
 
 from loguru import logger
 
-# Optional dependencies with fallbacks
-try:
-    from fastcluster import linkage as fast_linkage
-    FASTCLUSTER_AVAILABLE = True
-except ImportError:
-    FASTCLUSTER_AVAILABLE = False
-    warnings.warn("fastcluster not available, using scipy.cluster.hierarchy.linkage")
-
-try:
-    import skbio
-    SKBIO_AVAILABLE = True
-except ImportError:
-    SKBIO_AVAILABLE = False
-    warnings.warn("skbio not available, tree functionality will be limited")
-
-# Removing Symmetric import to avoid circular dependency
-# try:
-#     from ensemble_networkx import Symmetric
-#     ENSEMBLE_NETWORKX_AVAILABLE = True
-# except ImportError:
-#     ENSEMBLE_NETWORKX_AVAILABLE = False
-#     warnings.warn("ensemble_networkx not available, Symmetric object support disabled")
-
-try:
-    import dynamicTreeCut
-    DYNAMIC_TREE_CUT_AVAILABLE = True
-except ImportError:
-    DYNAMIC_TREE_CUT_AVAILABLE = False
-    warnings.warn("dynamicTreeCut not available, dynamic tree cutting disabled")
+# Optional dependencies are loaded lazily in methods to avoid import-time warnings
     
 # Classes
 class HierarchicalClustering(BaseEstimator, ClusterMixin):
@@ -137,12 +106,6 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         if cut_method not in valid_cut_methods:
             raise ValueError(f"cut_method must be one of {valid_cut_methods}, got '{cut_method}'")
         
-        if cut_method == 'dynamic' and not DYNAMIC_TREE_CUT_AVAILABLE:
-            warnings.warn(
-                "dynamicTreeCut not available but cut_method='dynamic' specified. "
-                "Consider using 'height' or 'maxclust' instead."
-            )
-        
         if deep_split not in range(5):  # 0-4
             raise ValueError(f"deep_split must be between 0 and 4, got {deep_split}")
         
@@ -217,9 +180,8 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         # Cut tree to get clusters
         self._cut_tree()
         
-        # Build tree representation
-        if SKBIO_AVAILABLE:
-            self._build_tree()
+        # Build tree representation (will silently skip if skbio not available)
+        self._build_tree()
             
         self._is_fitted = True
         return self
@@ -327,10 +289,11 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         else:
             dist_condensed = squareform(self.distance_matrix_)
             
-        # Perform linkage
-        if FASTCLUSTER_AVAILABLE:
+        # Perform linkage - try to use fastcluster if available
+        try:
+            from fastcluster import linkage as fast_linkage
             self.linkage_matrix_ = fast_linkage(dist_condensed, method=self.method)
-        else:
+        except ImportError:
             self.linkage_matrix_ = linkage(dist_condensed, method=self.method)
             
         # Generate dendrogram
@@ -346,11 +309,6 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def _cut_tree(self):
         """Cut tree to obtain clusters."""
         if self.cut_method == 'dynamic':
-            if not DYNAMIC_TREE_CUT_AVAILABLE:
-                raise ValueError(
-                    "Dynamic tree cutting requested but dynamicTreeCut not available. "
-                    "Install dynamicTreeCut or use 'height' or 'maxclust' methods."
-                )
             self._cut_tree_dynamic()
         elif self.cut_method == 'height':
             self._cut_tree_height()
@@ -375,6 +333,14 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             
     def _cut_tree_dynamic(self):
         """Perform dynamic tree cutting."""
+        try:
+            import dynamicTreeCut
+        except ImportError:
+            raise ImportError(
+                "Dynamic tree cutting requires dynamicTreeCut. "
+                "Install it with: pip install dynamicTreeCut"
+            )
+        
         # Prepare parameters, handling None values appropriately
         params = {
             'minClusterSize': self.min_cluster_size,
@@ -434,7 +400,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
     def _build_tree(self):
         """Build skbio tree from linkage matrix."""
-        if not SKBIO_AVAILABLE:
+        try:
+            import skbio
+        except ImportError:
             self.tree_ = None
             return
             
@@ -453,6 +421,18 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         """Check if the model has been fitted."""
         if not self._is_fitted:
             raise ValueError("This HierarchicalClustering instance is not fitted yet.")
+        
+    def _check_plotting_available(self):
+        """Check if plotting dependencies are available."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as patches
+            from matplotlib.colors import rgb2hex
+        except ImportError:
+            raise ImportError(
+                "Plotting functionality requires matplotlib. "
+                "Install it with: pip install matplotlib"
+            )
         
     def add_track(self, name, data, track_type='continuous', color=None, **kwargs):
         """
@@ -514,6 +494,8 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
     def _plot_categorical_track(self, ax, data, colors, show_labels=False, label_text=None):
         """Plot categorical data as colored rectangles (used for both clusters and categorical tracks)."""
+        import matplotlib.patches as patches
+        
         # Use the proper leaf order from dendrogram
         ordered_leaves = self.leaves_
         
@@ -556,6 +538,8 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
 
     def _plot_tracks(self, axes, track_height):
         """Plot metadata tracks."""
+        import matplotlib.pyplot as plt
+        
         track_names = list(self.tracks_.keys())
         ordered_leaves = self.leaves_
         
@@ -627,6 +611,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
     def _generate_cluster_colors(self):
         """Generate colors for clusters."""
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import rgb2hex
+        
         if self.n_clusters_ is None:
             return {}
             
@@ -686,8 +673,17 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             Whether to show sample labels on the x-axis.
         **kwargs
             Additional dendrogram plotting parameters.
+            
+        Raises
+        ------
+        ImportError
+            If matplotlib is not installed.
         """
         self._check_fitted()
+        self._check_plotting_available()
+        
+        import matplotlib.pyplot as plt
+        import numpy as np
         
         # Calculate subplot ratios
         n_tracks = len(self.tracks_) if show_tracks else 0
@@ -841,4 +837,3 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
 __all__ = [
     'HierarchicalClustering',
 ]
-

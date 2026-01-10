@@ -6,12 +6,12 @@ import pandas as pd
 import igraph as ig
 from itertools import combinations
 from typing import Optional
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
 from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm
 
 
-def compute_membership_cooccurrence(
+def cluster_membership_cooccurrence(
     df: pd.DataFrame,
     edge_type: str = "Edge",
     iteration_type: str = "Iteration"
@@ -57,7 +57,7 @@ def compute_membership_cooccurrence(
     >>> df.index.name = 'Node'
     >>> 
     >>> # Compute co-occurrence
-    >>> cooccur = compute_membership_cooccurrence(df)
+    >>> cooccur = cluster_membership_cooccurrence(df)
     >>> 
     >>> # Nodes A and B are always together
     >>> print(cooccur.loc[frozenset(['A', 'B'])])
@@ -138,12 +138,13 @@ def _leiden_worker(args):
     return node_to_partition
 
 
-class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
+class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
     """
     Sklearn-compatible transformer for consensus Leiden clustering.
     
     Runs multiple iterations of Leiden with different random seeds in parallel,
     then returns only edges with consistent cluster membership across all iterations.
+    Final cluster labels are determined by connected components in the consensus graph.
     
     Parameters
     ----------
@@ -169,6 +170,8 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
         - <1.0: Larger, fewer clusters
     n_iterations : int, default=-1
         Number of iterations for Leiden convergence (-1 for auto convergence)
+    cluster_prefix : str, default="leiden_"
+        Prefix for cluster labels (e.g., "leiden_1", "leiden_2", ...)
     n_jobs : int, default=1
         Number of parallel processes. 
         - 1: Sequential execution (no multiprocessing)
@@ -191,10 +194,14 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
         Edge pairs with 100% consistent cluster membership
     consensus_ratio_ : pd.Series
         Proportion of iterations each edge had consistent membership
+    labels_ : pd.Series
+        Cluster labels for each node (dtype: str with cluster_prefix)
     graph_ : ig.Graph
         Original input graph (stored for reference)
     consensus_graph_ : ig.Graph
-        Subgraph containing only consensus edges
+        Subgraph containing only consensus edges (100% co-occurrence)
+    n_clusters_ : int
+        Number of clusters found
         
     Notes
     -----
@@ -205,6 +212,8 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
     The leidenalg library is thread-safe but multiprocessing provides better
     performance since each process runs independently without GIL contention.
     
+    This class inherits from ClusterMixin, providing the fit_predict() method.
+    
     Examples
     --------
     >>> import igraph as ig
@@ -213,29 +222,21 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
     >>> graph = ig.Graph.Famous('Zachary')
     >>> graph.vs['name'] = [f'node_{i}' for i in range(graph.vcount())]
     >>> 
-    >>> # Fit transformer with default RBConfigurationVertexPartition
+    >>> # Fit and get cluster labels
     >>> leiden = ConsensusLeidenClustering(n_iter=100, n_jobs=-1, random_state=42)
-    >>> leiden.fit(graph)
+    >>> labels = leiden.fit_transform(graph)
+    >>> print(labels.head())
+    >>> # Node
+    >>> # node_0    leiden_1
+    >>> # node_1    leiden_1
+    >>> # node_2    leiden_1
     >>> 
-    >>> # Get consensus graph
-    >>> consensus_graph = leiden.transform(graph)
+    >>> # Access consensus graph
+    >>> consensus_graph = leiden.consensus_graph_
+    >>> print(f"Consensus edges: {consensus_graph.ecount()}")
     >>> 
-    >>> # Find finer-grained clusters
-    >>> leiden = ConsensusLeidenClustering(
-    ...     n_iter=100,
-    ...     resolution_parameter=1.5,
-    ...     n_jobs=-1
-    ... )
-    >>> consensus_graph = leiden.fit_transform(graph)
-    >>> 
-    >>> # Use classic modularity
-    >>> from leidenalg import ModularityVertexPartition
-    >>> leiden = ConsensusLeidenClustering(
-    ...     n_iter=100,
-    ...     partition_type=ModularityVertexPartition,
-    ...     n_jobs=-1
-    ... )
-    >>> consensus_graph = leiden.fit_transform(graph)
+    >>> # Use fit_predict (from ClusterMixin)
+    >>> labels = leiden.fit_predict(graph)
     """
     
     def __init__(
@@ -246,6 +247,7 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
         partition_type=None,
         resolution_parameter: float = 1.0,
         n_iterations: int = -1,
+        cluster_prefix: str = "leiden_",
         n_jobs: int = 1,
         verbose: bool = True,
         leiden_kws: Optional[dict] = None,
@@ -256,6 +258,7 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
         self.partition_type = partition_type
         self.resolution_parameter = resolution_parameter
         self.n_iterations = n_iterations
+        self.cluster_prefix = cluster_prefix
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.leiden_kws = leiden_kws or {}
@@ -355,7 +358,7 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
         self.partitions_.columns.name = "Iteration"
         
         # Compute membership co-occurrence matrix
-        self.membership_matrix_ = compute_membership_cooccurrence(self.partitions_)
+        self.membership_matrix_ = cluster_membership_cooccurrence(self.partitions_)
         
         # Compute consensus metrics
         self.consensus_ratio_ = self.membership_matrix_.mean(axis=1)
@@ -363,26 +366,7 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
             self.consensus_ratio_[self.consensus_ratio_ == 1.0].index
         )
         
-        return self
-    
-    def transform(self, X) -> ig.Graph:
-        """
-        Return subgraph with only consensus edges (100% consistent membership).
-        
-        Parameters
-        ----------
-        X : ig.Graph
-            Input graph (should be same as fit input)
-            
-        Returns
-        -------
-        ig.Graph
-            Subgraph containing only edges with consistent cluster membership
-        """
-        if not hasattr(self, 'consensus_edges_'):
-            raise RuntimeError("Must call fit() before transform()")
-        
-        # Find edges to keep
+        # Create consensus graph (edges with 100% co-occurrence)
         edges_to_keep = []
         for edge in X.es:
             source_name = X.vs[edge.source]['name']
@@ -392,12 +376,59 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
             if edge_set in self.consensus_edges_:
                 edges_to_keep.append(edge.index)
         
-        # Create subgraph
         self.consensus_graph_ = X.subgraph_edges(edges_to_keep, delete_vertices=False)
         
-        return self.consensus_graph_
+        # Generate cluster labels from connected components
+        components = self.consensus_graph_.connected_components()
+        
+        # Build cluster labels, sorted by cluster size (largest first)
+        node_to_cluster = {}
+        cluster_sizes = []
+        
+        for component in components:
+            nodes_in_component = [self.consensus_graph_.vs[idx]['name'] for idx in component]
+            cluster_sizes.append((len(nodes_in_component), nodes_in_component))
+        
+        # Sort by size (descending)
+        cluster_sizes.sort(key=lambda x: x[0], reverse=True)
+        
+        # Assign labels
+        for i, (size, nodes) in enumerate(cluster_sizes, start=1):
+            cluster_label = f"{self.cluster_prefix}{i}"
+            for node in nodes:
+                node_to_cluster[node] = cluster_label
+        
+        # Create series with all nodes from original graph
+        all_nodes = [v['name'] for v in X.vs]
+        self.labels_ = pd.Series(node_to_cluster, name="Cluster")
+        self.labels_ = self.labels_.reindex(all_nodes)  # Ensures all nodes are included
+        self.labels_.index.name = "Node"
+        self.n_clusters_ = len(cluster_sizes)
+        
+        return self
     
-    def fit_transform(self, X, y=None) -> ig.Graph:
+    def transform(self, X) -> pd.Series:
+        """
+        Return cluster labels based on connected components in consensus graph.
+        
+        Parameters
+        ----------
+        X : ig.Graph
+            Input graph (should be same as fit input)
+            
+        Returns
+        -------
+        pd.Series
+            Cluster labels for each node, indexed by node name.
+            Labels are formatted as "{cluster_prefix}{i}" where i is the
+            cluster number (sorted by size, largest first).
+        """
+        if not hasattr(self, 'labels_'):
+            raise RuntimeError("Must call fit() before transform()")
+        
+        return self.labels_
+    
+    def fit_transform(self, X, y=None) -> pd.Series:
         """
         Fit and transform in one step.
         
@@ -410,8 +441,8 @@ class ConsensusLeidenClustering(BaseEstimator, TransformerMixin):
             
         Returns
         -------
-        ig.Graph
-            Consensus subgraph
+        pd.Series
+            Cluster labels
         """
         return self.fit(X, y).transform(X)
     
