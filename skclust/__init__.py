@@ -13,3 +13,4 @@ __author__ = "Josh L. Espinoza"
 
 from . import hierarchical
 from . import kneighbors
+from . import graph

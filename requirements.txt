@@ -6,8 +6,8 @@ scikit-learn>=1.0.0
 python-igraph
 loguru
 
-# Optional dependencies - uncomment as needed
-
+# Optional dependencies
+# =====================
 # For faster linkage computations
 # fastcluster>=1.2.0
 
@@ -19,3 +19,6 @@ loguru
 
 # For KNN
 # faiss-cpu
+
+# For Leiden clustering
+# leidenalg
