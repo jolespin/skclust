@@ -51,7 +51,7 @@ from skclust.hierarchical import HierarchicalClustering
 
 # Generate sample data
 X, y = make_blobs(n_samples=100, centers=4, random_state=42)
-X = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
+X_df = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
 
 # Perform hierarchical clustering with dynamic tree cutting
 hc = HierarchicalClustering(
@@ -62,7 +62,7 @@ hc = HierarchicalClustering(
 )
 
 # Fit and get cluster labels
-labels = hc.fit_transform(X)
+labels = hc.fit_transform(X_df)
 print(f"Found {hc.n_clusters_} clusters")
 
 # Plot dendrogram with clusters
@@ -89,11 +89,9 @@ leiden = ConsensusLeidenClustering(
     random_state=42
 )
 
-# Get train/test split
-X_train, X_test, y_train, y_test = sampler.fit(X, y).get_train_test_split(X, y)
-
-print(f"Train set: {len(X_train)} samples")
-print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
+labels = leiden.fit_transform(graph)
+print(f"Found {leiden.n_clusters_} clusters")
+print(f"Consensus edges: {leiden.consensus_graph_.ecount()}")
 ```
 
 **Output:** Returns pandas Series with cluster labels indexed by node names. The `consensus_graph_` contains only edges where nodes consistently clustered together across all iterations.
@@ -101,13 +99,16 @@ print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
 ### K-Nearest Neighbors with Cosine Similarity
 
 ```python
-# Add continuous metadata track
-sample_scores = pd.Series(np.random.randn(100), index=X.index)
-hc.add_track('Quality Score', sample_scores, track_type='continuous')
+import numpy as np
+from skclust.kneighbors import KNeighborsCosineSimilarity
 
-# Add categorical metadata track
-sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X.index[:100])
-hc.add_track('Group', sample_groups, track_type='categorical')
+# L2-normalized embeddings (required for cosine similarity)
+embeddings = np.random.randn(1000, 128).astype(np.float32)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+# Exact search
+knn = KNeighborsCosineSimilarity(n_neighbors=10, mode='exact')
+similarities, indices = knn.fit_transform(embeddings)
 
 # Convert to igraph for network analysis
 graph = knn.to_igraph(include_self=False)
@@ -115,33 +116,19 @@ graph = knn.to_igraph(include_self=False)
 
 **Output:** `similarities` is shape (n_samples, k) with cosine similarity values (higher = more similar). `indices` contains the neighbor indices for each sample.
 
-```python
-# Cut by height
-hc_height = HierarchicalClustering(
-    method='ward',
-    cut_method='height',
-    cut_threshold=50.0
-)
-labels_height = hc_height.fit_transform(X)
+## Module Overview
 
-# Cut by number of clusters
-hc_maxclust = HierarchicalClustering(
-    method='complete',
-    cut_method='maxclust',
-    cut_threshold=5  # Force exactly 5 clusters
-)
-labels_maxclust = hc_maxclust.fit_transform(X)
-```
+### skclust.hierarchical
 
 **HierarchicalClustering**
 
 Hierarchical clustering with multiple linkage methods and tree cutting strategies.
 
-# Compute custom distance matrix
-distances = pdist(X, metric='cosine')
-distance_matrix = pd.DataFrame(squareform(distances), 
-                              index=X.index, 
-                              columns=X.index)
+**Key Parameters:**
+- `method`: Linkage method ('ward', 'complete', 'average', 'single')
+- `cut_method`: Tree cutting strategy ('dynamic', 'height', 'maxclust')
+- `min_cluster_size`: Minimum cluster size for dynamic cutting
+- `cluster_prefix`: String prefix for cluster labels (e.g., "C" produces "C1", "C2")
 
 **Key Methods:**
 - `fit(X)`: Fit clustering to data (accepts arrays or DataFrames)
@@ -158,7 +145,7 @@ distance_matrix = pd.DataFrame(squareform(distances),
 
 ### skclust.graph
 
-X_train, X_test, y_train, y_test = sampler_enhanced.fit(X, y).get_train_test_split(X, y)
+**ConsensusLeidenClustering**
 
 Runs Leiden clustering multiple times with different random seeds and returns only consensus edges.
 
@@ -314,7 +301,7 @@ Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
 The hierarchical clustering implementation is based on the [Soothsayer](https://github.com/jolespin/soothsayer) framework:
 
-- **Issues**: [GitHub Issues](https://github.com/your-username/hierarchical-clustering/issues)
+**Espinoza JL, Dupont CL, O'Rourke A, Beyhan S, Morales P, et al. (2021) Predicting antimicrobial mechanism-of-action from transcriptomes: A generalizable explainable artificial intelligence approach. PLOS Computational Biology 17(3): e1008857.** [https://doi.org/10.1371/journal.pcbi.1008857](https://doi.org/10.1371/journal.pcbi.1008857)
 
 ## Citation
 
