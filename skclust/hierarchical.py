@@ -833,7 +833,7 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 
         return summary_dict
 
-# Export main classes and functions
-__all__ = [
-    'HierarchicalClustering',
-]
+# # Export main classes and functions
+# __all__ = [
+#     'HierarchicalClustering',
+# ]

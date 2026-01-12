@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# skclust/__init__.py
+
 """
 skclust: A comprehensive hierarchical clustering toolkit
 ========================================================================

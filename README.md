@@ -1,5 +1,6 @@
 # skclust
-A comprehensive clustering toolkit with advanced tree cutting, visualization, and network analysis capabilities.
+
+A comprehensive clustering toolkit with hierarchical clustering, k-nearest neighbors, and consensus network analysis.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -7,23 +8,35 @@ A comprehensive clustering toolkit with advanced tree cutting, visualization, an
 ![Beta](https://img.shields.io/badge/status-beta-orange)
 ![Not Production Ready](https://img.shields.io/badge/production-not%20ready-red)
 
-**Warning: This is a beta release and has not been thoroughly tested.**
-
-##  Features
+## Features
 
 - **Scikit-learn compatible** API for seamless integration
-- **Multiple linkage methods** (Ward, Complete, Average, Single, etc.)
-- **Advanced tree cutting** with dynamic, height-based, and max-cluster methods
+- **Hierarchical clustering** with multiple linkage methods and tree cutting strategies
+- **K-nearest neighbors** with cosine similarity using FAISS or sklearn backends
+- **Consensus Leiden clustering** with parallel execution and edge co-occurrence analysis
 - **Rich visualizations** with dendrograms and metadata tracks
-- **Network analysis** with connectivity metrics and NetworkX integration
-- **Tree export** in Newick format for phylogenetic analysis
-- **Distance matrix support** for precomputed distances
-- **Metadata tracks** for biological and experimental annotations
+- **Distance matrix utilities** for kNN graph construction and conversion
 
 ## Installation
 
 ```bash
 pip install skclust
+```
+
+### Optional Dependencies
+
+```bash
+# For enhanced hierarchical clustering
+pip install dynamicTreeCut fastcluster skbio
+
+# For visualization
+pip install matplotlib seaborn
+
+# For Leiden clustering
+pip install leidenalg igraph
+
+# For fast k-NN with large datasets 
+pip install faiss-cpu  # or faiss-gpu (Python < 3.13)
 ```
 
 ## Quick Start
@@ -34,17 +47,18 @@ pip install skclust
 import pandas as pd
 import numpy as np
 from sklearn.datasets import make_blobs
-from skclust import HierarchicalClustering
+from skclust.hierarchical import HierarchicalClustering
 
 # Generate sample data
 X, y = make_blobs(n_samples=100, centers=4, random_state=42)
 X = pd.DataFrame(X, columns=['feature_1', 'feature_2'])
 
-# Perform hierarchical clustering
+# Perform hierarchical clustering with dynamic tree cutting
 hc = HierarchicalClustering(
     method='ward',
     cut_method='dynamic',
-    min_cluster_size=5
+    min_cluster_size=5,
+    cluster_prefix='C'
 )
 
 # Fit and get cluster labels
@@ -55,16 +69,24 @@ print(f"Found {hc.n_clusters_} clusters")
 fig, axes = hc.plot(figsize=(12, 6), show_clusters=True)
 ```
 
-### Representative Sampling
+**Output:** Cluster labels as numpy array (e.g., `['C1', 'C1', 'C2', ...]`) with `hc.n_clusters_` indicating the number of clusters found.
+
+### Consensus Leiden Clustering
 
 ```python
-from skclust import KMeansRepresentativeSampler
+import igraph as ig
+from skclust.graph import ConsensusLeidenClustering
 
-# Create representative test set (10% of data)
-sampler = KMeansRepresentativeSampler(
-    sampling_size=0.1,
-    stratify=True,  # Maintain class proportions
-    method='minibatch'
+# Create graph
+graph = ig.Graph.Famous('Zachary')
+graph.vs['name'] = [f'node_{i}' for i in range(graph.vcount())]
+
+# Run consensus clustering with 100 iterations in parallel
+leiden = ConsensusLeidenClustering(
+    n_iter=100,
+    resolution_parameter=1.0,
+    n_jobs=-1,
+    random_state=42
 )
 
 # Get train/test split
@@ -74,9 +96,9 @@ print(f"Train set: {len(X_train)} samples")
 print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
 ```
 
-## Advanced Usage
+**Output:** Returns pandas Series with cluster labels indexed by node names. The `consensus_graph_` contains only edges where nodes consistently clustered together across all iterations.
 
-### Adding Metadata Tracks
+### K-Nearest Neighbors with Cosine Similarity
 
 ```python
 # Add continuous metadata track
@@ -87,11 +109,11 @@ hc.add_track('Quality Score', sample_scores, track_type='continuous')
 sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X.index[:100])
 hc.add_track('Group', sample_groups, track_type='categorical')
 
-# Plot with metadata tracks
-fig, axes = hc.plot(show_tracks=True, figsize=(12, 8))
+# Convert to igraph for network analysis
+graph = knn.to_igraph(include_self=False)
 ```
 
-### Custom Tree Cutting
+**Output:** `similarities` is shape (n_samples, k) with cosine similarity values (higher = more similar). `indices` contains the neighbor indices for each sample.
 
 ```python
 # Cut by height
@@ -111,10 +133,9 @@ hc_maxclust = HierarchicalClustering(
 labels_maxclust = hc_maxclust.fit_transform(X)
 ```
 
-### Distance Matrix Input
+**HierarchicalClustering**
 
-```python
-from scipy.spatial.distance import pdist, squareform
+Hierarchical clustering with multiple linkage methods and tree cutting strategies.
 
 # Compute custom distance matrix
 distances = pdist(X, metric='cosine')
@@ -122,166 +143,183 @@ distance_matrix = pd.DataFrame(squareform(distances),
                               index=X.index, 
                               columns=X.index)
 
-# Cluster using precomputed distances
-hc_custom = HierarchicalClustering(method='average')
-labels_custom = hc_custom.fit_transform(distance_matrix)
-```
+**Key Methods:**
+- `fit(X)`: Fit clustering to data (accepts arrays or DataFrames)
+- `transform()`: Return cluster labels
+- `add_track(name, data, track_type)`: Add metadata for visualization
+- `plot()`: Generate dendrogram with optional tracks and cluster colors
+- `summary()`: Print clustering statistics
 
-### Stratified Representative Sampling
+**Attributes:**
+- `labels_`: Cluster assignments for each sample
+- `n_clusters_`: Number of clusters found
+- `linkage_matrix_`: Scipy linkage matrix
+- `dendrogram_`: Dendrogram data structure
 
-```python
-# Enhanced stratified sampling with minority class boosting
-sampler_enhanced = KMeansRepresentativeSampler(
-    sampling_size=0.15,
-    stratify=True,
-    coverage_boost=2.0,  # Boost minority classes
-    min_clusters_per_class=3,  # Ensure minimum representation
-    method='kmeans'
-)
+### skclust.graph
 
 X_train, X_test, y_train, y_test = sampler_enhanced.fit(X, y).get_train_test_split(X, y)
 
-# Check class balance preservation
-print("Original class distribution:")
-print(pd.Series(y).value_counts().sort_index())
-print("\nTest set class distribution:")
-print(pd.Series(y_test).value_counts().sort_index())
-```
+Runs Leiden clustering multiple times with different random seeds and returns only consensus edges.
 
-## API Reference
-
-### HierarchicalClustering
-
-**Parameters:**
-- `method`: Linkage method ('ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted')
-- `metric`: Distance metric for computing pairwise distances
-- `cut_method`: Tree cutting method ('dynamic', 'height', 'maxclust')
-- `min_cluster_size`: Minimum cluster size for dynamic cutting
-- `deep_split`: Deep split parameter for dynamic cutting (0-4)
-- `cut_threshold`: Threshold for height/maxclust cutting
-- `cluster_prefix`: String prefix for cluster labels (e.g., "C" → "C1", "C2")
+**Key Parameters:**
+- `n_iter`: Number of Leiden iterations (default: 100)
+- `resolution_parameter`: Controls cluster size (1.0 = modularity, >1.0 = smaller clusters)
+- `n_jobs`: Number of parallel processes (-1 = use all CPUs)
+- `cluster_prefix`: String prefix for cluster labels
 
 **Key Methods:**
-- `fit(X)`: Fit hierarchical clustering to data
-- `transform()`: Return cluster labels
-- `add_track(name, data, track_type)`: Add metadata track for visualization
-- `plot()`: Generate dendrogram with optional tracks and clusters
-- `summary()`: Print clustering summary statistics
+- `fit(graph)`: Fit on igraph.Graph with named vertices
+- `transform(graph)`: Return cluster labels as pandas Series
 
-### KMeansRepresentativeSampler
+**Attributes:**
+- `labels_`: Final cluster labels from connected components
+- `partitions_`: Node assignments for each iteration (DataFrame)
+- `membership_matrix_`: Boolean edge co-occurrence matrix
+- `consensus_ratio_`: Proportion of iterations each edge had consistent membership
+- `consensus_edges_`: Edges with 100% co-occurrence
+- `consensus_graph_`: Subgraph containing only consensus edges
+
+**cluster_membership_cooccurrence(df)**
+
+Compute edge-wise cluster co-occurrence across iterations.
 
 **Parameters:**
-- `sampling_size`: Proportion of data for test set (0.0-1.0)
-- `stratify`: Whether to maintain class proportions
-- `method`: Clustering method ('minibatch', 'kmeans')
-- `coverage_boost`: Boost factor for minority classes (>1.0)
-- `min_clusters_per_class`: Minimum clusters per class
-- `batch_size`: Batch size for MiniBatchKMeans
+- `df`: DataFrame where rows are nodes and columns are iterations
+
+**Returns:** Boolean DataFrame showing whether each node pair shared cluster membership in each iteration.
+
+### skclust.kneighbors
+
+**KNeighborsCosineSimilarity**
+
+K-nearest neighbors using cosine similarity with FAISS or sklearn backend.
+
+**Key Parameters:**
+- `n_neighbors`: Number of neighbors to find
+- `mode`: Search strategy ('exact', 'ivf', 'pq')
+- `backend`: Library to use ('auto', 'faiss', 'sklearn')
 
 **Key Methods:**
-- `fit(X, y)`: Fit sampler and identify representatives
-- `transform(X)`: Return representative samples
-- `get_train_test_split(X, y)`: Get train/test split
+- `fit(X)`: Fit on L2-normalized embeddings
+- `transform(X)`: Return (similarities, indices) for query vectors
+- `to_igraph()`: Convert to directed igraph
 
-## Examples with Real Data
+**Attributes:**
+- `similarities_`: Cosine similarities to k nearest neighbors
+- `indices_`: Indices of k nearest neighbors
 
-### Iris Dataset
+**Utility Functions:**
+
+- `kneighbors_graph_from_transformer()`: Build kNN graph from any KNeighborsTransformer
+- `brute_force_kneighbors_graph_from_rectangular_distance()`: Build kNN graph from distance matrix
+- `pairwise_distances_kneighbors()`: Compute full or sparse pairwise distances
+- `convert_distance_matrix_to_kneighbors_matrix()`: Convert dense distance matrix to sparse kNN matrix
+- `kneighbors_to_igraph()`: Convert kNN results to igraph
+
+## Advanced Usage
+
+### Adding Metadata Tracks to Dendrograms
 
 ```python
-from sklearn.datasets import load_iris
+# Add continuous metadata
+sample_scores = pd.Series(np.random.randn(100), index=X_df.index)
+hc.add_track('Quality Score', sample_scores, track_type='continuous')
 
-# Load iris dataset
-iris = load_iris()
-X_iris = pd.DataFrame(iris.data, columns=iris.feature_names)
-y_iris = pd.Series(iris.target, name='species')
+# Add categorical metadata
+sample_groups = pd.Series(['A', 'B', 'C'] * 34, index=X_df.index[:100])
+hc.add_track('Group', sample_groups, track_type='categorical')
 
-# Hierarchical clustering
-hc_iris = HierarchicalClustering(
+# Plot with all tracks
+fig, axes = hc.plot(show_tracks=True, figsize=(12, 10))
+```
+
+**Output:** Multi-panel plot with dendrogram on top, followed by cluster assignments and metadata tracks below, all aligned to the same sample order.
+
+### Custom Tree Cutting
+
+```python
+# Cut by height threshold
+hc_height = HierarchicalClustering(
     method='ward',
-    cut_method='dynamic',
-    min_cluster_size=10,
-    cluster_prefix='Cluster_'
+    cut_method='height',
+    cut_threshold=50.0
 )
+labels = hc_height.fit_transform(X_df)
 
-clusters = hc_iris.fit_transform(X_iris)
-
-# Add species information as track
-species_names = pd.Series([iris.target_names[i] for i in y_iris], index=X_iris.index)
-hc_iris.add_track('True Species', species_names, track_type='categorical')
-
-# Plot results
-fig, axes = hc_iris.plot(show_clusters=True, show_tracks=True, figsize=(15, 8))
+# Force specific number of clusters
+hc_maxclust = HierarchicalClustering(
+    method='complete',
+    cut_method='maxclust',
+    cut_threshold=5
+)
+labels = hc_maxclust.fit_transform(X_df)
 ```
 
-### Creating Balanced Test Sets
+**Output:** `cut_method='height'` cuts tree at specified distance threshold. `cut_method='maxclust'` produces exactly the specified number of clusters.
+
+### Using Distance Matrices
 
 ```python
-# Create representative test set maintaining species balance
-sampler_iris = KMeansRepresentativeSampler(
-    sampling_size=0.2,  # 20% test set
-    stratify=True,
-    coverage_boost=1.0,  # Equal representation
-    method='kmeans',
-    random_state=42
+from scipy.spatial.distance import pdist, squareform
+
+# Compute custom distance matrix
+distances = pdist(X_df, metric='cosine')
+distance_matrix = pd.DataFrame(
+    squareform(distances),
+    index=X_df.index,
+    columns=X_df.index
 )
 
-X_train, X_test, y_train, y_test = sampler_iris.fit(X_iris, y_iris).get_train_test_split(X_iris, y_iris)
-
-print(f"Train set: {len(X_train)} samples")
-print(f"Test set: {len(X_test)} samples")
-print(f"Representative indices: {sampler_iris.representative_indices_[:10].tolist()}")
+# Cluster using precomputed distances
+hc = HierarchicalClustering(method='average')
+labels = hc.fit_transform(distance_matrix)
 ```
 
-## Dependencies
+**Output:** Works identically to feature-based clustering but uses pre-computed distances. Useful for custom metrics.
 
-### Required
-- numpy
-- pandas
-- scikit-learn
-- scipy
-- matplotlib
-- seaborn
-- networkx
-- loguru
+### Approximate k-NN with FAISS
 
-### Optional (for enhanced functionality)
-- dynamicTreeCut (dynamic tree cutting)
-- skbio (tree representations)
-- fastcluster (faster linkage computation)
-- ensemble_networkx (network analysis)
+```python
+# For large datasets, use approximate search
+knn_ivf = KNeighborsCosineSimilarity(
+    n_neighbors=50,
+    mode='ivf',
+    n_voronoi_cells='auto',
+    n_probes=4
+)
+similarities, indices = knn_ivf.fit_transform(embeddings)
+
+# Product quantization for memory efficiency
+knn_pq = KNeighborsCosineSimilarity(
+    n_neighbors=50,
+    mode='pq',
+    n_subvectors=16,
+    n_bits=8
+)
+similarities, indices = knn_pq.fit_transform(embeddings)
+```
+
+**Output:** Faster but approximate nearest neighbor search. IVF uses inverted file index, PQ uses compressed representations. Trade accuracy for speed on large datasets.
 
 ## Author
 
 Josh L. Espinoza
 
-##  License
+## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
-##  Original Implementation
+## Original Implementation
 
-This package is based on the hierarchical clustering implementation originally developed in the [Soothsayer](https://github.com/jolespin/soothsayer) framework:
-
-**Espinoza JL, Dupont CL, O'Rourke A, Beyhan S, Morales P, et al. (2021) Predicting antimicrobial mechanism-of-action from transcriptomes: A generalizable explainable artificial intelligence approach. PLOS Computational Biology 17(3): e1008857.** [https://doi.org/10.1371/journal.pcbi.1008857](https://doi.org/10.1371/journal.pcbi.1008857)
-
-The original implementation provided the foundation for the hierarchical clustering algorithms, metadata track visualization, and eigenprofile analysis features in this package.
-
-##  Acknowledgments
-
-- Built on top of scipy, scikit-learn, and networkx
-- Original implementation developed in the [Soothsayer framework](https://github.com/jolespin/soothsayer)
-- Inspired by WGCNA and other biological clustering tools
-- Dynamic tree cutting algorithms from the dynamicTreeCut package
-
-##  Support
+The hierarchical clustering implementation is based on the [Soothsayer](https://github.com/jolespin/soothsayer) framework:
 
 - **Issues**: [GitHub Issues](https://github.com/your-username/hierarchical-clustering/issues)
 
-##  Citation
+## Citation
 
 If you use this package in your research, please cite:
 
-**Original Soothsayer implementation:**
 ```bibtex
 @article{espinoza2021predicting,
   title={Predicting antimicrobial mechanism-of-action from transcriptomes: A generalizable explainable artificial intelligence approach},
@@ -296,4 +334,3 @@ If you use this package in your research, please cite:
   url={https://doi.org/10.1371/journal.pcbi.1008857}
 }
 ```
-
