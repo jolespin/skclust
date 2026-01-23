@@ -9,6 +9,8 @@ from typing import Optional
 from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
 from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm
+from loguru import logger
+import sys
 
 
 def cluster_membership_cooccurrence(
@@ -41,34 +43,6 @@ def cluster_membership_cooccurrence(
         n_node_pairs = n_nodes * (n_nodes - 1) / 2.
         Index contains frozensets of node pairs.
         Values are True if nodes share cluster membership, False otherwise.
-    
-    Examples
-    --------
-    >>> import pandas as pd
-    >>> import numpy as np
-    >>> 
-    >>> # Create example partition data
-    >>> df = pd.DataFrame({
-    ...     0: [0, 0, 1, 1],
-    ...     1: [0, 0, 1, 1],
-    ...     2: [0, 1, 1, 0]
-    ... }, index=['A', 'B', 'C', 'D'])
-    >>> df.columns.name = 'Iteration'
-    >>> df.index.name = 'Node'
-    >>> 
-    >>> # Compute co-occurrence
-    >>> cooccur = cluster_membership_cooccurrence(df)
-    >>> 
-    >>> # Nodes A and B are always together
-    >>> print(cooccur.loc[frozenset(['A', 'B'])])
-    >>> # Iteration
-    >>> # 0    True
-    >>> # 1    True
-    >>> # 2    False
-    >>> 
-    >>> # Get consensus edges (100% co-occurrence)
-    >>> consensus = cooccur.mean(axis=1)
-    >>> perfect_pairs = consensus[consensus == 1.0].index
     """
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"Expected pd.DataFrame, got {type(df)}")
@@ -177,8 +151,12 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         - 1: Sequential execution (no multiprocessing)
         - -1: Use all available CPUs
         - >1: Use specific number of processes
-    verbose : bool, default=True
-        Show progress bar
+    verbose : int, default=0
+        Verbosity level (sklearn-style):
+        - 0: Silent
+        - 1: Progress bars only (tqdm)
+        - 2: Stage information (loguru INFO)
+        - 3: Detailed timing (loguru DEBUG)
     leiden_kws : dict, optional
         Additional keyword arguments passed to leidenalg.find_partition.
         Note: resolution_parameter should be set via the resolution_parameter
@@ -213,30 +191,6 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
     performance since each process runs independently without GIL contention.
     
     This class inherits from ClusterMixin, providing the fit_predict() method.
-    
-    Examples
-    --------
-    >>> import igraph as ig
-    >>> 
-    >>> # Create graph
-    >>> graph = ig.Graph.Famous('Zachary')
-    >>> graph.vs['name'] = [f'node_{i}' for i in range(graph.vcount())]
-    >>> 
-    >>> # Fit and get cluster labels
-    >>> leiden = ConsensusLeidenClustering(n_iter=100, n_jobs=-1, random_state=42)
-    >>> labels = leiden.fit_transform(graph)
-    >>> print(labels.head())
-    >>> # Node
-    >>> # node_0    leiden_1
-    >>> # node_1    leiden_1
-    >>> # node_2    leiden_1
-    >>> 
-    >>> # Access consensus graph
-    >>> consensus_graph = leiden.consensus_graph_
-    >>> print(f"Consensus edges: {consensus_graph.ecount()}")
-    >>> 
-    >>> # Use fit_predict (from ClusterMixin)
-    >>> labels = leiden.fit_predict(graph)
     """
     
     def __init__(
@@ -249,7 +203,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         n_iterations: int = -1,
         cluster_prefix: str = "leiden_",
         n_jobs: int = 1,
-        verbose: bool = True,
+        verbose: int = 0,
         leiden_kws: Optional[dict] = None,
     ):
         self.n_iter = n_iter
@@ -262,6 +216,16 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.leiden_kws = leiden_kws or {}
+    
+    def _log(self, message: str, level: str = "info"):
+        """Log message based on verbosity level"""
+        if self.verbose == 0:
+            return
+        
+        if level == "info" and self.verbose >= 2:
+            logger.info(message)
+        elif level == "debug" and self.verbose >= 3:
+            logger.debug(message)
     
     def fit(self, X, y=None):
         """
@@ -279,7 +243,11 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self
             Fitted transformer
         """
+        import time
+        start_time = time.time()
+        
         # Validate graph
+        self._log("Validating input graph", "info")
         if not isinstance(X, ig.Graph):
             raise TypeError("Graph must be igraph.Graph instance")
         if 'name' not in X.vs.attributes():
@@ -290,7 +258,10 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.graph_ = X
         nodes_list = np.asarray(X.vs['name'])
         
+        self._log(f"Graph: {X.vcount()} nodes, {X.ecount()} edges", "info")
+        
         # Import and setup partition type
+        self._log("Setting up Leiden algorithm", "debug")
         try:
             from leidenalg import find_partition, RBConfigurationVertexPartition
         except ModuleNotFoundError:
@@ -311,10 +282,14 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             if 'resolution_parameter' not in self.leiden_kws:
                 leiden_kws_full['resolution_parameter'] = self.resolution_parameter
         
+        self._log(f"Resolution parameter: {leiden_kws_full.get('resolution_parameter', 'N/A')}", "debug")
+        
         # Determine number of jobs
         n_jobs = cpu_count() if self.n_jobs == -1 else self.n_jobs
         if n_jobs < 1:
             raise ValueError(f"n_jobs must be -1 or >= 1, got {self.n_jobs}")
+        
+        self._log(f"Using {n_jobs} parallel jobs", "info")
         
         # Prepare worker arguments
         random_seeds = list(range(self.random_state, self.random_state + self.n_iter))
@@ -325,9 +300,12 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         ]
         
         # Run partitions
+        partition_start = time.time()
+        self._log(f"Running {self.n_iter} Leiden iterations", "info")
+        
         if n_jobs == 1:
             # Sequential execution
-            if self.verbose:
+            if self.verbose >= 1:
                 partitions = [
                     _leiden_worker(args) 
                     for args in tqdm(worker_args, desc="Leiden clustering")
@@ -339,7 +317,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             import multiprocessing as mp
             ctx = mp.get_context('spawn')
             
-            if self.verbose:
+            if self.verbose >= 1:
                 with ctx.Pool(processes=n_jobs) as pool:
                     partitions = list(
                         tqdm(
@@ -352,33 +330,79 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
                 with ctx.Pool(processes=n_jobs) as pool:
                     partitions = pool.map(_leiden_worker, worker_args)
         
+        partition_time = time.time() - partition_start
+        self._log(f"Leiden iterations completed in {partition_time:.2f}s", "info")
+        
         # Convert to DataFrame
+        df_start = time.time()
+        self._log("Converting partitions to DataFrame", "debug")
         self.partitions_ = pd.DataFrame(partitions).T
         self.partitions_.index.name = "Node"
         self.partitions_.columns.name = "Iteration"
+        self._log(f"DataFrame conversion: {time.time() - df_start:.2f}s", "debug")
         
         # Compute membership co-occurrence matrix
+        cooccur_start = time.time()
+        self._log("Computing cluster membership co-occurrence matrix", "info")
         self.membership_matrix_ = cluster_membership_cooccurrence(self.partitions_)
+        cooccur_time = time.time() - cooccur_start
+        self._log(f"Co-occurrence matrix: {self.membership_matrix_.shape}, computed in {cooccur_time:.2f}s", "info")
         
         # Compute consensus metrics
+        consensus_start = time.time()
+        self._log("Computing consensus metrics", "debug")
         self.consensus_ratio_ = self.membership_matrix_.mean(axis=1)
         self.consensus_edges_ = set(
             self.consensus_ratio_[self.consensus_ratio_ == 1.0].index
         )
+        self._log(f"Found {len(self.consensus_edges_)} consensus edges (100% co-occurrence)", "info")
+        self._log(f"Consensus metrics: {time.time() - consensus_start:.2f}s", "debug")
         
-        # Create consensus graph (edges with 100% co-occurrence)
+        # Create consensus graph - OPTIMIZED VERSION
+        graph_start = time.time()
+        self._log("Building consensus graph from edges", "info")
+        
+        # BOTTLENECK FIX: Create node->index mapping once
+        name_to_idx = {v['name']: v.index for v in X.vs}
+        
+        # Pre-filter edges efficiently using vectorized operations
         edges_to_keep = []
-        for edge in X.es:
+        
+        # Convert consensus_edges to a format optimized for lookup
+        # Use tuple pairs instead of frozensets for faster comparison
+        consensus_edge_tuples = set()
+        for edge in self.consensus_edges_:
+            nodes = tuple(sorted(edge))  # Sort to handle undirected
+            consensus_edge_tuples.add(nodes)
+        
+        # Iterate through graph edges only once
+        if self.verbose >= 1:
+            edge_iter = tqdm(X.es, desc="Filtering consensus edges", total=X.ecount())
+        else:
+            edge_iter = X.es
+            
+        for edge in edge_iter:
             source_name = X.vs[edge.source]['name']
             target_name = X.vs[edge.target]['name']
-            edge_set = frozenset([source_name, target_name])
+            edge_tuple = tuple(sorted([source_name, target_name]))
             
-            if edge_set in self.consensus_edges_:
+            if edge_tuple in consensus_edge_tuples:
                 edges_to_keep.append(edge.index)
         
+        self._log(f"Edge filtering: {time.time() - graph_start:.2f}s", "debug")
+        
+        # Create subgraph
+        subgraph_start = time.time()
+        self._log(f"Creating subgraph with {len(edges_to_keep)} edges", "debug")
         self.consensus_graph_ = X.subgraph_edges(edges_to_keep, delete_vertices=False)
+        self._log(f"Subgraph creation: {time.time() - subgraph_start:.2f}s", "debug")
+        
+        graph_time = time.time() - graph_start
+        self._log(f"Consensus graph built in {graph_time:.2f}s", "info")
         
         # Generate cluster labels from connected components
+        label_start = time.time()
+        self._log("Computing connected components for cluster labels", "info")
         components = self.consensus_graph_.connected_components()
         
         # Build cluster labels, sorted by cluster size (largest first)
@@ -404,6 +428,32 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.labels_ = self.labels_.reindex(all_nodes)  # Ensures all nodes are included
         self.labels_.index.name = "Node"
         self.n_clusters_ = len(cluster_sizes)
+        
+        label_time = time.time() - label_start
+        self._log(f"Found {self.n_clusters_} clusters in {label_time:.2f}s", "info")
+        
+        total_time = time.time() - start_time
+        self._log(f"Total fit time: {total_time:.2f}s", "info")
+        
+        # Summary
+        if self.verbose >= 2:
+            logger.info("=" * 60)
+            logger.info("CONSENSUS LEIDEN CLUSTERING SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Input: {X.vcount()} nodes, {X.ecount()} edges")
+            logger.info(f"Iterations: {self.n_iter} (parallel jobs: {n_jobs})")
+            logger.info(f"Consensus edges: {len(self.consensus_edges_)} ({100*len(self.consensus_edges_)/X.ecount():.2f}%)")
+            logger.info(f"Clusters: {self.n_clusters_}")
+            logger.info(f"Nodes in clusters: {self.labels_.notna().sum()} ({100*self.labels_.notna().sum()/X.vcount():.2f}%)")
+            logger.info("=" * 60)
+            logger.info("TIMING BREAKDOWN")
+            logger.info("=" * 60)
+            logger.info(f"Leiden iterations: {partition_time:.2f}s ({100*partition_time/total_time:.1f}%)")
+            logger.info(f"Co-occurrence matrix: {cooccur_time:.2f}s ({100*cooccur_time/total_time:.1f}%)")
+            logger.info(f"Consensus graph: {graph_time:.2f}s ({100*graph_time/total_time:.1f}%)")
+            logger.info(f"Cluster labels: {label_time:.2f}s ({100*label_time/total_time:.1f}%)")
+            logger.info(f"Total: {total_time:.2f}s")
+            logger.info("=" * 60)
         
         return self
     

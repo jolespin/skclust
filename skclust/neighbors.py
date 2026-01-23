@@ -595,6 +595,9 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         -------
         self : object
         """
+        if isinstance(X, pd.DataFrame):
+            self.index_labels_ = X.index
+
         X = check_array(X, dtype=np.float32, ensure_2d=True)
         
         self.n_samples_fit_ = X.shape[0]
@@ -707,7 +710,7 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         """Fit and transform in one step."""
         return self.fit(X, y).transform(X)
     
-    def to_igraph(self, index=None, include_self=False):
+    def to_igraph(self, index="auto", include_self=False):
         """
         Convert fitted k-NN results to igraph.
         
@@ -724,7 +727,11 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
             Directed graph with edges weighted by cosine similarity
         """
         check_is_fitted(self, ['similarities_', 'indices_'])
-        
+        if index == "auto":
+            if hasattr(self,"index_labels_"):
+                index = self.index_labels_
+            else:
+                index = None
         return kneighbors_to_igraph(
             self.similarities_,
             self.indices_,
