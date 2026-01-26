@@ -15,22 +15,22 @@ import sys
 
 def cluster_membership_cooccurrence(
     df: pd.DataFrame,
+    edge_list: Optional[list] = None,  # NEW: Only compute for these edges
     edge_type: str = "Edge",
     iteration_type: str = "Iteration"
 ) -> pd.DataFrame:
     """
     Compute pairwise cluster membership co-occurrence across iterations.
     
-    For each pair of nodes, determines whether they belong to the same cluster
-    in each iteration. Returns a boolean DataFrame where True indicates the
-    node pair shares cluster membership in that iteration.
+    OPTIMIZED: If edge_list provided, only computes for actual graph edges
+    instead of all possible node pairs.
     
     Parameters
     ----------
     df : pd.DataFrame
         DataFrame where rows are nodes and columns are iterations.
-        Values are cluster/partition assignments.
-        Index name will be preserved or set to 'Node' if None.
+    edge_list : list of frozenset, optional
+        Only compute co-occurrence for these edges. If None, computes for all pairs.
     edge_type : str, default="Edge"
         Name for the index of the output DataFrame (node pairs)
     iteration_type : str, default="Iteration"
@@ -39,10 +39,7 @@ def cluster_membership_cooccurrence(
     Returns
     -------
     pd.DataFrame
-        Boolean DataFrame with shape (n_node_pairs, n_iterations) where
-        n_node_pairs = n_nodes * (n_nodes - 1) / 2.
-        Index contains frozensets of node pairs.
-        Values are True if nodes share cluster membership, False otherwise.
+        Boolean DataFrame with co-occurrence for each edge/pair.
     """
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"Expected pd.DataFrame, got {type(df)}")
@@ -50,35 +47,67 @@ def cluster_membership_cooccurrence(
     if df.empty:
         raise ValueError("Input DataFrame is empty")
     
-    # Extract arrays and metadata
     X = df.values
     nodes = df.index.values
     iterations = df.columns
     n_nodes = len(nodes)
     n_iterations = len(iterations)
     
-    # Pre-allocate boolean array for results
-    n_pairs = (n_nodes * (n_nodes - 1)) // 2
-    result = np.empty((n_pairs, n_iterations), dtype=bool)
+    # Create node name to index mapping
+    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
     
-    # Generate all node pairs once (upper triangle, no diagonal)
-    pairs = np.array(list(combinations(range(n_nodes), 2)), dtype=np.int32)
+    if edge_list is not None:
+        # OPTIMIZED PATH: Only compute for specified edges
+        n_pairs = len(edge_list)
+        result = np.empty((n_pairs, n_iterations), dtype=bool)
+        
+        # Convert edges to index pairs
+        edge_idx_pairs = []
+        valid_edges = []
+        
+        for edge in edge_list:
+            edge_nodes = list(edge)
+            if len(edge_nodes) != 2:
+                continue  # Skip self-loops
+            
+            node_a, node_b = edge_nodes
+            if node_a in node_to_idx and node_b in node_to_idx:
+                idx_a = node_to_idx[node_a]
+                idx_b = node_to_idx[node_b]
+                edge_idx_pairs.append((idx_a, idx_b))
+                valid_edges.append(edge)
+        
+        edge_idx_pairs = np.array(edge_idx_pairs, dtype=np.int32)
+        
+        # Vectorized comparison for only these edges
+        for i in range(n_iterations):
+            col = X[:, i]
+            result[:len(valid_edges), i] = col[edge_idx_pairs[:, 0]] == col[edge_idx_pairs[:, 1]]
+        
+        return pd.DataFrame(
+            data=result[:len(valid_edges)],
+            index=pd.Index(valid_edges, name=edge_type),
+            columns=pd.Index(iterations, name=iteration_type),
+        )
     
-    # Vectorized comparison across all iterations
-    # For each iteration, check if pair[0] cluster == pair[1] cluster
-    for i in range(n_iterations):
-        col = X[:, i]
-        result[:, i] = col[pairs[:, 0]] == col[pairs[:, 1]]
-    
-    # Create edge labels as frozensets for hashable, undirected pairs
-    edge_labels = [frozenset([nodes[i], nodes[j]]) for i, j in pairs]
-    
-    # Construct output DataFrame
-    return pd.DataFrame(
-        data=result,
-        index=pd.Index(edge_labels, name=edge_type),
-        columns=pd.Index(iterations, name=iteration_type),
-    )
+    else:
+        # ORIGINAL PATH: Compute for all possible pairs
+        n_pairs = (n_nodes * (n_nodes - 1)) // 2
+        result = np.empty((n_pairs, n_iterations), dtype=bool)
+        
+        pairs = np.array(list(combinations(range(n_nodes), 2)), dtype=np.int32)
+        
+        for i in range(n_iterations):
+            col = X[:, i]
+            result[:, i] = col[pairs[:, 0]] == col[pairs[:, 1]]
+        
+        edge_labels = [frozenset([nodes[i], nodes[j]]) for i, j in pairs]
+        
+        return pd.DataFrame(
+            data=result,
+            index=pd.Index(edge_labels, name=edge_type),
+            columns=pd.Index(iterations, name=iteration_type),
+        )
 
 
 def _leiden_worker(args):
@@ -344,7 +373,16 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         # Compute membership co-occurrence matrix
         cooccur_start = time.time()
         self._log("Computing cluster membership co-occurrence matrix", "info")
-        self.membership_matrix_ = cluster_membership_cooccurrence(self.partitions_)
+
+        # OPTIMIZATION: Only compute for edges that actually exist in graph
+        edge_list = [frozenset([X.vs[e.source]['name'], X.vs[e.target]['name']]) 
+                    for e in X.es]
+
+        self.membership_matrix_ = cluster_membership_cooccurrence(
+            self.partitions_,
+            edge_list=edge_list  # NEW: Only compute for actual edges
+        )
+
         cooccur_time = time.time() - cooccur_start
         self._log(f"Co-occurrence matrix: {self.membership_matrix_.shape}, computed in {cooccur_time:.2f}s", "info")
         
