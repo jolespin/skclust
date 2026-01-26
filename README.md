@@ -100,7 +100,7 @@ print(f"Consensus edges: {leiden.consensus_graph_.ecount()}")
 
 ```python
 import numpy as np
-from skclust.kneighbors import KNeighborsCosineSimilarity
+from skclust.neighbors import KNeighborsCosineSimilarity
 
 # L2-normalized embeddings (required for cosine similarity)
 embeddings = np.random.randn(1000, 128).astype(np.float32)
@@ -176,7 +176,7 @@ Compute edge-wise cluster co-occurrence across iterations.
 
 **Returns:** Boolean DataFrame showing whether each node pair shared cluster membership in each iteration.
 
-### skclust.kneighbors
+### skclust.neighbors
 
 **KNeighborsCosineSimilarity**
 
