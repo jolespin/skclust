@@ -1,4 +1,5 @@
 # Change Log
+* [2026.2.1] - Fixed `if index == "auto"` issue when providing `pd.Index`
 * [2025.1.24] - **Major performance optimization** for `ConsensusLeidenClustering`: Co-occurrence matrix now only computed for edges that exist in graph instead of all possible node pairs (55-45,000x speedup for sparse graphs)
 * [2025.1.24] - **Breaking change**: `verbose` parameter in `ConsensusLeidenClustering` changed from `bool` to `int` (0-3) for sklearn-style verbosity levels with `loguru` logging (backward compatible: `verbose=False` → 0, `verbose=True` → 1)
 * [2025.1.24] - Added `edge_list` parameter to `cluster_membership_cooccurrence()` to compute co-occurrence only for specified edges
