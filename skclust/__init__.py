@@ -11,9 +11,10 @@ advanced tree cutting, visualization, and network analysis capabilities.
 Author: Josh L. Espinoza
 """
 
-__version__ = "2026.1.24"
+__version__ = "2026.2.4"
 __author__ = "Josh L. Espinoza"
 
 from . import hierarchical
 from . import neighbors
 from . import graph
+from . import metrics
