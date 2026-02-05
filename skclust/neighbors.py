@@ -727,6 +727,8 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
             Directed graph with edges weighted by cosine similarity
         """
         check_is_fitted(self, ['similarities_', 'indices_'])
+        if isinstance(index, pd.Index):
+            index = list(index)
         if index == "auto":
             if hasattr(self,"index_labels_"):
                 index = self.index_labels_

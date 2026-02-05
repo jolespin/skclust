@@ -1,4 +1,10 @@
 # Change Log
+* [2026.2.4] - Added `metrics` submodule with `cv_score`, `eta_squared_score`, `entropy_score`, `cramers_v_score`, `distinctiveness_score`
+* [2026.2.1] - New function: leiden_stability(consensus_ratio) - Computes comprehensive stability metrics from Leiden consensus clustering (n_edges, mean/median/std consensus, percentile thresholds at 100%/90%/80%/70%/60%, percentage below 50%, quartiles)
+* [2026.2.1] - New attribute: stability_report_ automatically computed during ConsensusLeidenClustering.fit() - Single-row DataFrame with 14 stability metrics for easy analysis and comparison
+* [2026.2.1] - New method: get_consensus_graph(threshold) - Extract consensus graph at any threshold (0.0-1.0) without refitting, enables post-hoc threshold exploration
+* [2026.2.1] - New method: get_labels(threshold) - Extract cluster labels at any threshold (0.0-1.0) without refitting, computed from connected components in consensus graph
+* [2026.2.1] - Fixed `if index == "auto"` issue when providing `pd.Index`
 * [2025.1.24] - **Major performance optimization** for `ConsensusLeidenClustering`: Co-occurrence matrix now only computed for edges that exist in graph instead of all possible node pairs (55-45,000x speedup for sparse graphs)
 * [2025.1.24] - **Breaking change**: `verbose` parameter in `ConsensusLeidenClustering` changed from `bool` to `int` (0-3) for sklearn-style verbosity levels with `loguru` logging (backward compatible: `verbose=False` → 0, `verbose=True` → 1)
 * [2025.1.24] - Added `edge_list` parameter to `cluster_membership_cooccurrence()` to compute co-occurrence only for specified edges

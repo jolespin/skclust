@@ -13,6 +13,54 @@ from loguru import logger
 import sys
 
 
+def leiden_stability(consensus_ratio: pd.Series) -> pd.DataFrame:
+    """
+    Compute consensus stability metrics from edge consensus ratios.
+    
+    Parameters
+    ----------
+    consensus_ratio : pd.Series
+        Consensus ratio for each edge (fraction of iterations with co-clustering)
+    
+    Returns
+    -------
+    pd.DataFrame
+        Single-row dataframe with stability metrics:
+        - n_edges: Total number of edges
+        - mean_consensus: Mean consensus ratio
+        - median_consensus: Median consensus ratio
+        - std_consensus: Standard deviation of consensus ratio
+        - min_consensus: Minimum consensus ratio
+        - max_consensus: Maximum consensus ratio
+        - pct_100: Percentage of edges with 100% consensus
+        - pct_90plus: Percentage of edges with ≥90% consensus
+        - pct_80plus: Percentage of edges with ≥80% consensus
+        - pct_70plus: Percentage of edges with ≥70% consensus
+        - pct_60plus: Percentage of edges with ≥60% consensus
+        - pct_below_50: Percentage of edges with <50% consensus
+        - q25: 25th percentile of consensus ratio
+        - q75: 75th percentile of consensus ratio
+    """
+    values = consensus_ratio.values
+    
+    return pd.DataFrame([{
+        'n_edges': len(values),
+        'mean_consensus': values.mean(),
+        'median_consensus': np.median(values),
+        'std_consensus': values.std(),
+        'min_consensus': values.min(),
+        'max_consensus': values.max(),
+        'pct_100': (values == 1.0).mean() * 100,
+        'pct_90plus': (values >= 0.9).mean() * 100,
+        'pct_80plus': (values >= 0.8).mean() * 100,
+        'pct_70plus': (values >= 0.7).mean() * 100,
+        'pct_60plus': (values >= 0.6).mean() * 100,
+        'pct_below_50': (values < 0.5).mean() * 100,
+        'q25': np.percentile(values, 25),
+        'q75': np.percentile(values, 75),
+    }])
+
+
 def cluster_membership_cooccurrence(
     df: pd.DataFrame,
     edge_list: Optional[list] = None,  # NEW: Only compute for these edges
@@ -201,6 +249,8 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         Edge pairs with 100% consistent cluster membership
     consensus_ratio_ : pd.Series
         Proportion of iterations each edge had consistent membership
+    stability_report_ : pd.DataFrame
+        Single-row dataframe with consensus stability metrics (percentiles, thresholds, etc.)
     labels_ : pd.Series
         Cluster labels for each node (dtype: str with cluster_prefix)
     graph_ : ig.Graph
@@ -393,6 +443,10 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.consensus_edges_ = set(
             self.consensus_ratio_[self.consensus_ratio_ == 1.0].index
         )
+        
+        # Compute stability report
+        self.stability_report_ = leiden_stability(self.consensus_ratio_)
+        
         self._log(f"Found {len(self.consensus_edges_)} consensus edges (100% co-occurrence)", "info")
         self._log(f"Consensus metrics: {time.time() - consensus_start:.2f}s", "debug")
         
@@ -473,7 +527,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         total_time = time.time() - start_time
         self._log(f"Total fit time: {total_time:.2f}s", "info")
         
-        # Summary
+        # Summary with stability report
         if self.verbose >= 2:
             logger.info("=" * 60)
             logger.info("CONSENSUS LEIDEN CLUSTERING SUMMARY")
@@ -483,6 +537,14 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             logger.info(f"Consensus edges: {len(self.consensus_edges_)} ({100*len(self.consensus_edges_)/X.ecount():.2f}%)")
             logger.info(f"Clusters: {self.n_clusters_}")
             logger.info(f"Nodes in clusters: {self.labels_.notna().sum()} ({100*self.labels_.notna().sum()/X.vcount():.2f}%)")
+            logger.info("=" * 60)
+            logger.info("STABILITY REPORT")
+            logger.info("=" * 60)
+            rep = self.stability_report_.iloc[0]
+            logger.info(f"Consensus ratio: median={rep['median_consensus']:.3f}, mean={rep['mean_consensus']:.3f}")
+            logger.info(f"100% consensus: {rep['pct_100']:.1f}% of edges")
+            logger.info(f"≥80% consensus: {rep['pct_80plus']:.1f}% of edges")
+            logger.info(f"<50% consensus: {rep['pct_below_50']:.1f}% of edges")
             logger.info("=" * 60)
             logger.info("TIMING BREAKDOWN")
             logger.info("=" * 60)
@@ -533,6 +595,123 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             Cluster labels
         """
         return self.fit(X, y).transform(X)
+    
+    def get_consensus_graph(self, threshold: float = 1.0) -> ig.Graph:
+        """
+        Extract consensus graph at specified threshold.
+        
+        Allows exploration of different consensus thresholds without refitting.
+        The consensus_ratio_ computed during fit() is reused.
+        
+        Parameters
+        ----------
+        threshold : float, default=1.0
+            Minimum consensus ratio (0.0-1.0) for edges to include.
+            - 1.0: Only edges with 100% consensus (most conservative)
+            - 0.9: Edges with ≥90% consensus
+            - 0.8: Edges with ≥80% consensus
+            
+        Returns
+        -------
+        ig.Graph
+            Subgraph containing only edges meeting the threshold
+            
+        Examples
+        --------
+        >>> leiden = ConsensusLeidenClustering(n_iter=10)
+        >>> leiden.fit(graph)
+        >>> 
+        >>> # Explore different thresholds without refitting
+        >>> graph_100 = leiden.get_consensus_graph(threshold=1.0)
+        >>> graph_80 = leiden.get_consensus_graph(threshold=0.8)
+        """
+        if not hasattr(self, 'consensus_ratio_'):
+            raise RuntimeError("Must call fit() before get_consensus_graph()")
+        
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"threshold must be between 0.0 and 1.0, got {threshold}")
+        
+        # Get edges meeting threshold
+        consensus_edges = set(
+            self.consensus_ratio_[self.consensus_ratio_ >= threshold].index
+        )
+        
+        # Convert to edge tuples for lookup
+        consensus_edge_tuples = set()
+        for edge in consensus_edges:
+            nodes = tuple(sorted(edge))
+            consensus_edge_tuples.add(nodes)
+        
+        # Filter graph edges
+        edges_to_keep = []
+        for edge in self.graph_.es:
+            source_name = self.graph_.vs[edge.source]['name']
+            target_name = self.graph_.vs[edge.target]['name']
+            edge_tuple = tuple(sorted([source_name, target_name]))
+            
+            if edge_tuple in consensus_edge_tuples:
+                edges_to_keep.append(edge.index)
+        
+        # Create subgraph
+        return self.graph_.subgraph_edges(edges_to_keep, delete_vertices=False)
+    
+    def get_labels(self, threshold: float = 1.0) -> pd.Series:
+        """
+        Extract cluster labels at specified consensus threshold.
+        
+        Allows exploration of different consensus thresholds without refitting.
+        Labels are determined by connected components in the consensus graph.
+        
+        Parameters
+        ----------
+        threshold : float, default=1.0
+            Minimum consensus ratio (0.0-1.0) for edges to include.
+            
+        Returns
+        -------
+        pd.Series
+            Cluster labels indexed by node name.
+            Labels are formatted as "{cluster_prefix}{i}" where i is the
+            cluster number (sorted by size, largest first).
+            
+        Examples
+        --------
+        >>> leiden = ConsensusLeidenClustering(n_iter=10)
+        >>> leiden.fit(graph)
+        >>> 
+        >>> # Compare labels at different thresholds
+        >>> labels_100 = leiden.get_labels(threshold=1.0)
+        >>> labels_90 = leiden.get_labels(threshold=0.9)
+        >>> labels_80 = leiden.get_labels(threshold=0.8)
+        """
+        consensus_graph = self.get_consensus_graph(threshold=threshold)
+        
+        # Compute connected components
+        components = consensus_graph.connected_components()
+        
+        # Build cluster labels, sorted by size
+        node_to_cluster = {}
+        cluster_sizes = []
+        
+        for component in components:
+            nodes_in_component = [consensus_graph.vs[idx]['name'] for idx in component]
+            cluster_sizes.append((len(nodes_in_component), nodes_in_component))
+        
+        cluster_sizes.sort(key=lambda x: x[0], reverse=True)
+        
+        # Assign labels
+        for i, (size, nodes) in enumerate(cluster_sizes, start=1):
+            cluster_label = f"{self.cluster_prefix}{i}"
+            for node in nodes:
+                node_to_cluster[node] = cluster_label
+        
+        # Create series with all nodes from original graph
+        all_nodes = [v['name'] for v in self.graph_.vs]
+        labels = pd.Series(node_to_cluster, name="Cluster")
+        labels = labels.reindex(all_nodes)
+        labels.index.name = "Node"
+        
+        return labels
     
     def get_feature_names_out(self, input_features=None):
         """Return edge names for sklearn compatibility"""
