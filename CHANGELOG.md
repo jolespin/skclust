@@ -1,4 +1,6 @@
 # Change Log
+* [2026.2.23] - Added `CosineSimilarityClassifier` and reimplemented to `KNeighborsSimilarity` so the overlapping methods are shared
+* [2026.2.23] - Cleaned up `metrics` and removed `distinctiveness_score`
 * [2026.2.4] - Added `metrics` submodule with `cv_score`, `eta_squared_score`, `entropy_score`, `cramers_v_score`, `distinctiveness_score`
 * [2026.2.1] - New function: leiden_stability(consensus_ratio) - Computes comprehensive stability metrics from Leiden consensus clustering (n_edges, mean/median/std consensus, percentile thresholds at 100%/90%/80%/70%/60%, percentage below 50%, quartiles)
 * [2026.2.1] - New attribute: stability_report_ automatically computed during ConsensusLeidenClustering.fit() - Single-row DataFrame with 14 stability metrics for easy analysis and comparison

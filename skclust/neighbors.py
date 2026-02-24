@@ -3,17 +3,20 @@
 
 from __future__ import annotations
 import warnings
+from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Union
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sps
-from sklearn.base import clone, BaseEstimator, TransformerMixin
+from sklearn.base import clone, BaseEstimator, TransformerMixin, ClassifierMixin
 from sklearn.neighbors import KNeighborsTransformer
 from scipy.spatial.distance import squareform
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_is_fitted, check_array
+from tqdm import tqdm
 
 def kneighbors_graph_from_transformer(
     X, 
@@ -509,48 +512,214 @@ def kneighbors_to_igraph(D, I, index=None, include_self=False):
     graph = ig.Graph.TupleList(edges, weights=True, directed=True)
     return graph
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Private utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _to_numpy_with_index(X):
+    """
+    Convert X to float32 numpy array and extract row index if available.
+
+    Returns
+    -------
+    X_arr : np.ndarray, dtype float32
+    row_index : pd.Index or None
+    """
+    if isinstance(X, pd.DataFrame):
+        return X.values.astype(np.float32), X.index
+    if isinstance(X, pd.Series):
+        return X.values.astype(np.float32).reshape(1, -1), pd.Index([X.name])
+    return np.asarray(X, dtype=np.float32), None
+
+
+def _determine_backend(backend):
+    """
+    Resolve backend preference to 'faiss' or 'sklearn'.
+
+    Parameters
+    ----------
+    backend : {'auto', 'faiss', 'sklearn'}
+
+    Returns
+    -------
+    str : 'faiss' or 'sklearn'
+    """
+    if backend == "sklearn":
+        return "sklearn"
+    if backend == "faiss":
+        try:
+            import faiss  # noqa: F401
+            return "faiss"
+        except ImportError:
+            raise ImportError("FAISS not available. Install with: pip install faiss-cpu")
+    # auto
+    try:
+        import faiss  # noqa: F401
+        return "faiss"
+    except ImportError:
+        warnings.warn("FAISS not available, falling back to sklearn.", UserWarning)
+        return "sklearn"
+
+
+def _build_faiss_index(X, mode="exact", n_voronoi_cells="auto", n_probes=1,
+                       n_subvectors=None, n_bits=8):
+    """
+    Build and return a fitted FAISS index for inner product (cosine on L2-normed data).
+
+    Parameters
+    ----------
+    X : np.ndarray, float32, L2-normalized
+    mode : {'exact', 'ivf', 'pq'}
+    n_voronoi_cells : int or 'auto'
+    n_probes : int
+    n_subvectors : int or None
+    n_bits : int
+
+    Returns
+    -------
+    faiss.Index
+    """
+    import faiss
+
+    n_samples, d = X.shape
+
+    if mode == "exact":
+        index = faiss.IndexFlatIP(d)
+        index.add(X)
+
+    elif mode == "ivf":
+        nlist = int(np.sqrt(n_samples)) if n_voronoi_cells == "auto" else n_voronoi_cells
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFFlat(quantizer, d, nlist)
+        index.train(X)
+        index.add(X)
+        index.nprobe = n_probes
+
+    elif mode == "pq":
+        if n_subvectors is None:
+            m = d // 16
+            while d % m != 0 and m > 1:
+                m -= 1
+            if m == 1:
+                raise ValueError(
+                    f"Cannot determine n_subvectors for dimension {d}. "
+                    f"Specify n_subvectors that divides {d} evenly."
+                )
+        else:
+            m = n_subvectors
+            if d % m != 0:
+                raise ValueError(f"n_subvectors ({m}) must divide dimension ({d}) evenly.")
+        index = faiss.IndexPQ(d, m, n_bits)
+        index.train(X)
+        index.add(X)
+
+    else:
+        raise ValueError(f"mode must be 'exact', 'ivf', or 'pq', got '{mode}'")
+
+    return index
+
+
+def _search_index(index, X_query, k, backend, X_fit=None):
+    """
+    Run nearest-neighbor search against a fitted index.
+
+    Parameters
+    ----------
+    index : faiss.Index or None
+        FAISS index (None if sklearn backend).
+    X_query : np.ndarray, float32
+    k : int
+    backend : str, 'faiss' or 'sklearn'
+    X_fit : np.ndarray or None
+        Required when backend='sklearn'.
+
+    Returns
+    -------
+    similarities : np.ndarray, shape (n_query, k)
+    indices : np.ndarray, shape (n_query, k)
+    """
+    if backend == "faiss":
+        return index.search(X_query, k)
+
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=k, metric="cosine")
+    nn.fit(X_fit)
+    distances, indices = nn.kneighbors(X_query)
+    return 1 - distances, indices  # convert distance → similarity
+
+
+def _compute_pairwise_similarities_chunked(X, chunk_size=10000, show_progress=True):
+    """
+    Compute upper-triangular pairwise cosine similarities in memory-efficient chunks.
+    
+    Returns flattened array of all unique pairwise similarities (excluding self).
+    """
+    n = X.shape[0]
+    n_pairs = n * (n - 1) // 2
+    
+    if n_pairs == 0:
+        return np.array([], dtype=np.float32)
+    
+    similarities = []
+    
+    iterator = range(0, n, chunk_size)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Computing pairwise similarities", leave=False)
+    
+    for i in iterator:
+        i_end = min(i + chunk_size, n)
+        chunk = X[i:i_end]
+        
+        # Compute similarities to all samples from i onwards
+        sims_block = chunk @ X[i:].T  # shape: (chunk_size, n - i)
+        
+        # Extract upper triangular for each row in chunk
+        for local_row, global_row in enumerate(range(i, i_end)):
+            start_col = local_row + 1
+            row_sims = sims_block[local_row, start_col:]
+            similarities.append(row_sims)
+    
+    return np.concatenate(similarities).astype(np.float32)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KNeighborsCosineSimilarity
+# ══════════════════════════════════════════════════════════════════════════════
+
 class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
     """
     K-Nearest Neighbors using cosine similarity.
-    
+
     Parameters
     ----------
     n_neighbors : int
-        Number of neighbors to find
+        Number of neighbors to find.
     mode : {'exact', 'ivf', 'pq'}, default='exact'
-        Search strategy:
-        - 'exact': Brute force exact search
-        - 'ivf': Inverted file index (approximate)
-        - 'pq': Product quantization (compressed, approximate)
+        Search strategy.
     backend : {'auto', 'faiss', 'sklearn'}, default='auto'
-        Which library to use. 'auto' tries FAISS, falls back to sklearn
+        Which library to use. 'auto' prefers FAISS, falls back to sklearn.
     n_voronoi_cells : int or 'auto', default='auto'
-        Number of IVF cells. If 'auto', uses sqrt(n_samples)
+        Number of IVF cells. If 'auto', uses sqrt(n_samples).
     n_probes : int, default=1
-        Number of cells to search in IVF (FAISS default is 1)
+        Number of cells to search in IVF.
     n_subvectors : int or None, default=None
-        Number of sub-vectors for PQ. If None, uses d//16
+        Number of sub-vectors for PQ. If None, uses d//16.
     n_bits : int, default=8
-        Bits per sub-vector for PQ
-    
+        Bits per sub-vector for PQ.
+
     Attributes
     ----------
     backend_ : str
-        Actual backend used ('faiss' or 'sklearn')
-    index_ : faiss index or None
-        Fitted FAISS index (None if using sklearn)
+    index_ : faiss.Index or None
     similarities_ : np.ndarray, shape (n_samples_fit, n_neighbors)
-        Cosine similarities to k nearest neighbors (higher = more similar)
     indices_ : np.ndarray, shape (n_samples_fit, n_neighbors)
-        Indices of k nearest neighbors
     """
-    
+
     def __init__(
         self,
         n_neighbors,
-        mode='exact',
-        backend='auto',
-        n_voronoi_cells='auto',
+        mode="exact",
+        backend="auto",
+        n_voronoi_cells="auto",
         n_probes=1,
         n_subvectors=None,
         n_bits=8,
@@ -562,181 +731,520 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         self.n_probes = n_probes
         self.n_subvectors = n_subvectors
         self.n_bits = n_bits
-    
-    def _determine_backend(self):
-        """Determine which backend to use."""
-        if self.backend == 'sklearn':
-            return 'sklearn'
-        elif self.backend == 'faiss':
-            try:
-                import faiss
-                return 'faiss'
-            except ImportError:
-                raise ImportError("FAISS not available")
-        else:  # auto
-            try:
-                import faiss
-                return 'faiss'
-            except ImportError:
-                warnings.warn("FAISS not available, falling back to sklearn", UserWarning)
-                return 'sklearn'
-    
+
     def fit(self, X, y=None):
         """
         Fit the k-NN model.
-        
+
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
-            Training data (must be L2-normalized for cosine similarity)
+            L2-normalized training data.
         y : Ignored
-        
-        Returns
-        -------
-        self : object
         """
-        if isinstance(X, pd.DataFrame):
-            self.index_labels_ = X.index
+        X_arr, row_index = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
 
-        X = check_array(X, dtype=np.float32, ensure_2d=True)
-        
-        self.n_samples_fit_ = X.shape[0]
-        self.n_features_in_ = X.shape[1]
-        self.backend_ = self._determine_backend()
-        
-        if self.backend_ == 'faiss':
-            self._fit_faiss(X)
-        else:
-            self._fit_sklearn(X)
-        
-        # Store the training data neighbors
-        self.similarities_, self.indices_ = self.transform(X)
-        
-        return self
-    
-    def _fit_faiss(self, X):
-        """Fit using FAISS backend."""
-        import faiss
-        
-        d = self.n_features_in_
-        
-        if self.mode == 'exact':
-            self.index_ = faiss.IndexFlatIP(d)
-            self.index_.add(X)
-        
-        elif self.mode == 'ivf':
-            # Determine n_voronoi_cells
-            if self.n_voronoi_cells == 'auto':
-                nlist = int(np.sqrt(self.n_samples_fit_))
-            else:
-                nlist = self.n_voronoi_cells
-            
-            quantizer = faiss.IndexFlatIP(d)
-            self.index_ = faiss.IndexIVFFlat(quantizer, d, nlist)
-            self.index_.train(X)
-            self.index_.add(X)
-            self.index_.nprobe = self.n_probes
-        
-        elif self.mode == 'pq':
-            # Determine n_subvectors
-            if self.n_subvectors is None:
-                m = d // 16
-                while d % m != 0 and m > 1:
-                    m -= 1
-                if m == 1:
-                    raise ValueError(
-                        f"Cannot determine n_subvectors for dimension {d}. "
-                        f"Please specify n_subvectors that divides {d} evenly."
-                    )
-            else:
-                m = self.n_subvectors
-                if d % m != 0:
-                    raise ValueError(f"n_subvectors ({m}) must divide dimension ({d}) evenly")
-            
-            self.index_ = faiss.IndexPQ(d, m, self.n_bits)
-            self.index_.train(X)
-            self.index_.add(X)
-        
-        else:
-            raise ValueError(f"mode must be 'exact', 'ivf', or 'pq', got '{self.mode}'")
-    
-    def _fit_sklearn(self, X):
-        """Fit using sklearn backend."""
-        if self.mode != 'exact':
-            warnings.warn(
-                f"sklearn backend only supports exact search, ignoring mode='{self.mode}'",
-                UserWarning
+        if row_index is not None:
+            self.index_labels_ = row_index
+
+        self.n_samples_fit_ = X_arr.shape[0]
+        self.n_features_in_ = X_arr.shape[1]
+        self.backend_ = _determine_backend(self.backend)
+
+        if self.backend_ == "faiss":
+            self.index_ = _build_faiss_index(
+                X_arr,
+                mode=self.mode,
+                n_voronoi_cells=self.n_voronoi_cells,
+                n_probes=self.n_probes,
+                n_subvectors=self.n_subvectors,
+                n_bits=self.n_bits,
             )
-        self.X_fit_ = X
-        self.index_ = None
-    
+            self.X_fit_ = None
+        else:
+            if self.mode != "exact":
+                warnings.warn(
+                    f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.",
+                    UserWarning,
+                )
+            self.X_fit_ = X_arr
+            self.index_ = None
+
+        self.similarities_, self.indices_ = self.transform(X_arr)
+        return self
+
     def transform(self, X):
         """
         Find k-nearest neighbors.
-        
+
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
-            Query vectors (must be L2-normalized)
-        
+            L2-normalized query vectors.
+
         Returns
         -------
         similarities : np.ndarray, shape (n_samples, n_neighbors)
-            Cosine similarities to k nearest neighbors (higher = more similar)
         indices : np.ndarray, shape (n_samples, n_neighbors)
-            Indices of k nearest neighbors
         """
         check_is_fitted(self)
-        X = check_array(X, dtype=np.float32, ensure_2d=True)
-        
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"X has {X.shape[1]} features, expected {self.n_features_in_}")
-        
+        X_arr, _ = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+        if X_arr.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {X_arr.shape[1]} features, expected {self.n_features_in_}.")
         if self.n_neighbors > self.n_samples_fit_:
-            raise ValueError(f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})")
-        
-        if self.backend_ == 'faiss':
-            similarities, indices = self.index_.search(X, self.n_neighbors)
-        else:
-            from sklearn.neighbors import NearestNeighbors
-            nn = NearestNeighbors(n_neighbors=self.n_neighbors, metric='cosine')
-            nn.fit(self.X_fit_)
-            distances, indices = nn.kneighbors(X)
-            similarities = 1 - distances  # Convert distance to similarity
-        
-        return similarities, indices
-    
+            raise ValueError(
+                f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})."
+            )
+
+        return _search_index(
+            self.index_, X_arr, self.n_neighbors, self.backend_,
+            X_fit=self.X_fit_,
+        )
+
     def fit_transform(self, X, y=None):
-        """Fit and transform in one step."""
-        return self.fit(X, y).transform(X)
-    
+        """Fit and return neighbors for training data."""
+        self.fit(X, y)
+        return self.similarities_, self.indices_
+
     def to_igraph(self, index="auto", include_self=False):
         """
         Convert fitted k-NN results to igraph.
-        
+
         Parameters
         ----------
-        index : array-like or None, default=None
-            Node labels. If None, uses integers 0 to n-1
+        index : array-like or 'auto'
+            Node labels. 'auto' uses DataFrame index if available, else integers.
         include_self : bool, default=False
-            Whether to include self-loops
-        
+
         Returns
         -------
         ig.Graph
-            Directed graph with edges weighted by cosine similarity
         """
-        check_is_fitted(self, ['similarities_', 'indices_'])
-        if isinstance(index, pd.Index):
-            index = list(index)
+        check_is_fitted(self, ["similarities_", "indices_"])
+
         if index == "auto":
-            if hasattr(self,"index_labels_"):
-                index = self.index_labels_
-            else:
-                index = None
+            index = getattr(self, "index_labels_", None)
+        elif isinstance(index, pd.Index):
+            index = list(index)
+
         return kneighbors_to_igraph(
             self.similarities_,
             self.indices_,
             index=index,
-            include_self=include_self
+            include_self=include_self,
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CosineSimilarityClassifier
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Cosine similarity-based nearest neighbor classifier with per-class thresholds.
+
+    Uses confidence intervals on within- and between-class cosine similarities
+    to derive per-class thresholds for assignment. Points below threshold
+    are assigned label -1 (unknown).
+
+    Parameters
+    ----------
+    confidence_interval : float
+        CI percentage (e.g., 95 → uses p2.5/p97.5). Default is 95.
+    backend : {'auto', 'faiss', 'sklearn'}
+        Search backend. Default is 'auto' (prefers FAISS).
+    max_samples_per_class : int or None
+        Maximum samples per class for within-class similarity estimation.
+        None uses all samples. Default is None.
+    max_samples_between_classes : int or None
+        Maximum between-class pairs to keep per class (most similar ones).
+        None keeps all pairs. Default is None.
+    chunk_size : int
+        Chunk size for pairwise similarity computation. Default is 10000.
+    show_progress : bool
+        Whether to show tqdm progress bars. Default is True.
+
+    Attributes
+    ----------
+    classes_ : np.ndarray
+        Unique class labels.
+    class_to_indices_ : dict
+        Mapping from class label to array of training indices.
+    index_labels_ : pd.Index or None
+        Row labels from training DataFrame (if provided).
+    within_class_similarities_ : dict
+        Mapping from class label to array of within-class similarities.
+    between_class_similarities_ : dict
+        Mapping from class label to array of between-class similarities.
+    within_ci_ : dict
+        Mapping from class label to (lower, upper) CI bounds.
+    between_ci_ : dict
+        Mapping from class label to (lower, upper) CI bounds.
+    cutoffs_ : dict
+        Mapping from class label to similarity cutoff threshold.
+    n_neighbors_query_ : int
+        Auto-computed number of neighbors for between-class queries.
+    """
+
+    def __init__(
+        self,
+        confidence_interval=95,
+        backend="auto",
+        max_samples_per_class=None,
+        max_samples_between_classes=None,
+        chunk_size=10000,
+        show_progress=True,
+    ):
+        self.confidence_interval = confidence_interval
+        self.backend = backend
+        self.max_samples_per_class = max_samples_per_class
+        self.max_samples_between_classes = max_samples_between_classes
+        self.chunk_size = chunk_size
+        self.show_progress = show_progress
+
+    def fit(self, X, y):
+        """
+        Compute per-class within- and between-class similarity distributions.
+
+        Parameters
+        ----------
+        X : np.ndarray or pd.DataFrame
+            L2-normalized embeddings, shape (n_samples, n_features).
+        y : np.ndarray or pd.Series
+            Class labels.
+
+        Returns
+        -------
+        self
+        """
+        X_arr, row_index = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+        y_arr = np.asarray(y)
+
+        self.classes_ = np.unique(y_arr)
+        self.X_fit_ = X_arr
+        self.y_fit_ = y_arr
+        self.n_features_in_ = X_arr.shape[1]
+        self.backend_ = _determine_backend(self.backend)
+        
+        # Store training index labels for search() output
+        self.index_labels_ = row_index
+
+        # Build index (always exact for classifier)
+        if self.backend_ == "faiss":
+            self.index_ = _build_faiss_index(X_arr, mode="exact")
+        else:
+            self.index_ = None
+
+        # Build class-to-indices mapping
+        self.class_to_indices_ = {}
+        for cls in self.classes_:
+            self.class_to_indices_[cls] = np.where(y_arr == cls)[0]
+
+        # Auto-compute n_neighbors for between-class queries
+        # Must exceed largest class size to guarantee cross-class neighbors
+        max_class_size = max(len(indices) for indices in self.class_to_indices_.values())
+        self.n_neighbors_query_ = min(max_class_size + 100, len(X_arr))
+
+        # Compute per-class distributions
+        self.within_class_similarities_ = {}
+        self.between_class_similarities_ = {}
+        self.within_ci_ = {}
+        self.between_ci_ = {}
+        self.cutoffs_ = {}
+
+        lower_pct = (100 - self.confidence_interval) / 2
+        upper_pct = 100 - lower_pct
+
+        class_iterator = self.classes_
+        if self.show_progress:
+            class_iterator = tqdm(self.classes_, desc="Processing classes")
+
+        for cls in class_iterator:
+            indices = self.class_to_indices_[cls]
+            n_class = len(indices)
+
+            # Warn if class is very large and no sampling
+            if self.max_samples_per_class is None and n_class > 5000:
+                n_pairs = n_class * (n_class - 1) // 2
+                warnings.warn(
+                    f"Class '{cls}' has {n_class} samples ({n_pairs:,} pairs). "
+                    f"Consider setting max_samples_per_class to reduce memory usage.",
+                    UserWarning,
+                )
+
+            # Sample if needed
+            if self.max_samples_per_class is not None and n_class > self.max_samples_per_class:
+                rng = np.random.default_rng(42)
+                sample_indices = rng.choice(indices, self.max_samples_per_class, replace=False)
+            else:
+                sample_indices = indices
+
+            X_class = X_arr[sample_indices]
+
+            # Within-class similarities (chunked pairwise)
+            within_sims = _compute_pairwise_similarities_chunked(
+                X_class,
+                chunk_size=self.chunk_size,
+                show_progress=False,
+            )
+            self.within_class_similarities_[cls] = within_sims
+
+            # Between-class similarities (query-based, most similar non-class neighbors)
+            between_sims = self._compute_between_class_similarities(
+                X_class, cls, X_arr, y_arr
+            )
+            self.between_class_similarities_[cls] = between_sims
+
+            # Compute CIs
+            if len(within_sims) > 0:
+                self.within_ci_[cls] = (
+                    np.percentile(within_sims, lower_pct),
+                    np.percentile(within_sims, upper_pct),
+                )
+            else:
+                self.within_ci_[cls] = (0.0, 1.0)
+                warnings.warn(
+                    f"Class '{cls}' has insufficient samples for within-class CI.",
+                    UserWarning,
+                )
+
+            if len(between_sims) > 0:
+                self.between_ci_[cls] = (
+                    np.percentile(between_sims, lower_pct),
+                    np.percentile(between_sims, upper_pct),
+                )
+            else:
+                self.between_ci_[cls] = (0.0, 0.0)
+
+            # Cutoff: lower bound of within-class CI
+            self.cutoffs_[cls] = self.within_ci_[cls][0]
+
+            # Warn if distributions overlap
+            if self.within_ci_[cls][0] < self.between_ci_[cls][1]:
+                warnings.warn(
+                    f"Class '{cls}': within-class lower bound ({self.within_ci_[cls][0]:.3f}) < "
+                    f"between-class upper bound ({self.between_ci_[cls][1]:.3f}). "
+                    "Threshold assignment may be ambiguous.",
+                    UserWarning,
+                )
+
+        return self
+
+    def _compute_between_class_similarities(self, X_class, cls, X_all, y_all):
+        """
+        Compute between-class similarities for a given class.
+        
+        Queries each sample in X_class against the full index, filters to
+        neighbors from other classes, and keeps the most similar pairs.
+        """
+        k = self.n_neighbors_query_
+        
+        sims, idxs = _search_index(
+            self.index_, X_class, k, self.backend_, X_fit=X_all
+        )
+
+        # Collect between-class similarities
+        between_sims = []
+        for i in range(len(X_class)):
+            for j in range(k):
+                neighbor_idx = idxs[i, j]
+                if y_all[neighbor_idx] != cls:
+                    between_sims.append(sims[i, j])
+
+        between_sims = np.array(between_sims, dtype=np.float32)
+
+        # Keep only top most similar (these are the "confusable" pairs)
+        if self.max_samples_between_classes is not None and len(between_sims) > self.max_samples_between_classes:
+            # Partial sort to get top-k
+            partition_idx = len(between_sims) - self.max_samples_between_classes
+            between_sims = np.partition(between_sims, partition_idx)[partition_idx:]
+
+        return between_sims
+
+    def predict(self, X, k=10):
+        """
+        Predict class labels for query points.
+
+        Iterates through k nearest neighbors until finding one whose similarity
+        exceeds that class's cutoff threshold. Returns -1 if no neighbor passes.
+
+        Parameters
+        ----------
+        X : np.ndarray or pd.DataFrame
+            L2-normalized query embeddings.
+        k : int
+            Maximum neighbors to consider. Default is 10.
+
+        Returns
+        -------
+        np.ndarray or pd.Series
+            Predicted class labels. -1 if no confident assignment.
+            Returns pd.Series if input was pd.DataFrame.
+        """
+        check_is_fitted(self)
+        X_arr, row_index = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+        k = min(k, len(self.X_fit_))
+        sims, idxs = _search_index(
+            self.index_, X_arr, k, self.backend_, X_fit=self.X_fit_
+        )
+
+        results = np.empty(len(X_arr), dtype=object)
+
+        for i in range(len(X_arr)):
+            assigned = -1
+            for j in range(k):
+                neighbor_idx = idxs[i, j]
+                neighbor_class = self.y_fit_[neighbor_idx]
+                neighbor_sim = sims[i, j]
+                cutoff = self.cutoffs_[neighbor_class]
+
+                if neighbor_sim >= cutoff:
+                    assigned = neighbor_class
+                    break
+
+            results[i] = assigned
+
+        # Return Series if input was DataFrame
+        if row_index is not None:
+            return pd.Series(results, index=row_index)
+        return results
+
+    def search(
+        self,
+        X,
+        k=10,
+        filter_by_cutoff: Union[bool, float, Mapping] = False,
+    ):
+        """
+        Return top-k nearest neighbors for each query point.
+
+        Parameters
+        ----------
+        X : np.ndarray, pd.DataFrame, or pd.Series
+            L2-normalized query embeddings.
+        k : int
+            Number of nearest neighbors. Default is 10.
+        filter_by_cutoff : bool, float, or Mapping
+            How to filter results:
+            - False: no filtering, return all k neighbors
+            - True: filter using stored per-class cutoffs
+            - float: use this value as cutoff for all classes
+            - Mapping (dict or pd.Series): per-class cutoffs (must contain all classes)
+
+        Returns
+        -------
+        OrderedDict
+            Keys are row index/name (or integer position).
+            Values are lists of (neighbor_id, class_label, similarity) tuples,
+            sorted by similarity descending. neighbor_id uses training index
+            labels if available, otherwise integer indices.
+        """
+        check_is_fitted(self)
+        X_arr, row_index = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+        k = min(k, len(self.X_fit_))
+
+        # Resolve cutoffs
+        if filter_by_cutoff is False:
+            cutoffs = None
+        elif filter_by_cutoff is True:
+            cutoffs = self.cutoffs_
+        elif isinstance(filter_by_cutoff, (int, float)):
+            cutoffs = {cls: float(filter_by_cutoff) for cls in self.classes_}
+        elif isinstance(filter_by_cutoff, (Mapping, pd.Series)):
+            missing = set(self.classes_) - set(filter_by_cutoff.keys())
+            if missing:
+                raise ValueError(f"Missing cutoffs for classes: {missing}")
+            cutoffs = dict(filter_by_cutoff)
+        else:
+            raise TypeError(
+                f"filter_by_cutoff must be bool, float, or Mapping, got {type(filter_by_cutoff)}"
+            )
+
+        sims, idxs = _search_index(
+            self.index_, X_arr, k, self.backend_, X_fit=self.X_fit_
+        )
+
+        results = OrderedDict()
+        for qi in range(len(X_arr)):
+            row_key = row_index[qi] if row_index is not None else qi
+            hits = []
+
+            for j in range(k):
+                neighbor_idx = int(idxs[qi, j])
+                neighbor_class = self.y_fit_[neighbor_idx]
+                neighbor_sim = float(sims[qi, j])
+
+                # Apply filtering if cutoffs specified
+                if cutoffs is not None:
+                    if neighbor_sim < cutoffs[neighbor_class]:
+                        continue
+
+                # Use training index labels if available
+                if self.index_labels_ is not None:
+                    neighbor_id = self.index_labels_[neighbor_idx]
+                else:
+                    neighbor_id = neighbor_idx
+
+                hits.append((neighbor_id, neighbor_class, neighbor_sim))
+
+            results[row_key] = hits
+
+        return results
+
+    def get_cutoff(self, cls=None):
+        """
+        Get cutoff threshold(s).
+
+        Parameters
+        ----------
+        cls : class label or None
+            If provided, returns cutoff for that class.
+            If None, returns dict of all cutoffs.
+
+        Returns
+        -------
+        float or dict
+        """
+        check_is_fitted(self)
+        if cls is None:
+            return dict(self.cutoffs_)
+        return self.cutoffs_[cls]
+
+    def summary(self):
+        """
+        Return a DataFrame summarizing per-class statistics.
+
+        Returns
+        -------
+        pd.DataFrame
+        """
+        check_is_fitted(self)
+
+        records = []
+        for cls in self.classes_:
+            within_sims = self.within_class_similarities_[cls]
+            between_sims = self.between_class_similarities_[cls]
+
+            records.append({
+                "class": cls,
+                "n_samples": len(self.class_to_indices_[cls]),
+                "n_within_pairs": len(within_sims),
+                "n_between_pairs": len(between_sims),
+                "within_mean": within_sims.mean() if len(within_sims) > 0 else np.nan,
+                "within_ci_lower": self.within_ci_[cls][0],
+                "within_ci_upper": self.within_ci_[cls][1],
+                "between_mean": between_sims.mean() if len(between_sims) > 0 else np.nan,
+                "between_ci_lower": self.between_ci_[cls][0],
+                "between_ci_upper": self.between_ci_[cls][1],
+                "cutoff": self.cutoffs_[cls],
+            })
+
+        return pd.DataFrame(records).set_index("class")
+
