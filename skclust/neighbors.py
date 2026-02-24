@@ -1023,14 +1023,14 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
             # Cutoff: lower bound of within-class CI
             self.cutoffs_[cls] = self.within_ci_[cls][0]
 
-            # Warn if distributions overlap
-            if self.within_ci_[cls][0] < self.between_ci_[cls][1]:
-                warnings.warn(
-                    f"Class '{cls}': within-class lower bound ({self.within_ci_[cls][0]:.3f}) < "
-                    f"between-class upper bound ({self.between_ci_[cls][1]:.3f}). "
-                    "Threshold assignment may be ambiguous.",
-                    UserWarning,
-                )
+            # # Warn if distributions overlap
+            # if self.within_ci_[cls][0] < self.between_ci_[cls][1]:
+            #     warnings.warn(
+            #         f"Class '{cls}': within-class lower bound ({self.within_ci_[cls][0]:.3f}) < "
+            #         f"between-class upper bound ({self.between_ci_[cls][1]:.3f}). "
+            #         "Threshold assignment may be ambiguous.",
+            #         UserWarning,
+            #     )
 
         return self
 
@@ -1065,12 +1065,9 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
 
         return between_sims
 
-    def predict(self, X, k=10):
+    def predict(self, X, k=10, mode="best"):
         """
         Predict class labels for query points.
-
-        Iterates through k nearest neighbors until finding one whose similarity
-        exceeds that class's cutoff threshold. Returns -1 if no neighbor passes.
 
         Parameters
         ----------
@@ -1078,16 +1075,25 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
             L2-normalized query embeddings.
         k : int
             Maximum neighbors to consider. Default is 10.
+        mode : {'strict', 'best'}
+            Prediction mode:
+            - 'strict': Iterates through k neighbors until finding one whose 
+              similarity exceeds that class's cutoff. Returns -1 if none pass.
+            - 'best': Returns the nearest neighbor's class regardless of 
+              similarity threshold (no rejection).
 
         Returns
         -------
         np.ndarray or pd.Series
-            Predicted class labels. -1 if no confident assignment.
+            Predicted class labels. -1 if no confident assignment (strict mode only).
             Returns pd.Series if input was pd.DataFrame.
         """
         check_is_fitted(self)
         X_arr, row_index = _to_numpy_with_index(X)
         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+        if mode not in ("strict", "best"):
+            raise ValueError(f"mode must be 'strict' or 'best', got '{mode}'")
 
         k = min(k, len(self.X_fit_))
         sims, idxs = _search_index(
@@ -1096,19 +1102,26 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
 
         results = np.empty(len(X_arr), dtype=object)
 
-        for i in range(len(X_arr)):
-            assigned = -1
-            for j in range(k):
-                neighbor_idx = idxs[i, j]
-                neighbor_class = self.y_fit_[neighbor_idx]
-                neighbor_sim = sims[i, j]
-                cutoff = self.cutoffs_[neighbor_class]
+        if mode == "best":
+            # Simple nearest neighbor — no threshold
+            for i in range(len(X_arr)):
+                neighbor_idx = idxs[i, 0]
+                results[i] = self.y_fit_[neighbor_idx]
+        else:
+            # Strict mode — apply per-class thresholds
+            for i in range(len(X_arr)):
+                assigned = -1
+                for j in range(k):
+                    neighbor_idx = idxs[i, j]
+                    neighbor_class = self.y_fit_[neighbor_idx]
+                    neighbor_sim = sims[i, j]
+                    cutoff = self.cutoffs_[neighbor_class]
 
-                if neighbor_sim >= cutoff:
-                    assigned = neighbor_class
-                    break
+                    if neighbor_sim >= cutoff:
+                        assigned = neighbor_class
+                        break
 
-            results[i] = assigned
+                results[i] = assigned
 
         # Return Series if input was DataFrame
         if row_index is not None:
@@ -1118,7 +1131,7 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
     def search(
         self,
         X,
-        k=10,
+        k=100,
         filter_by_cutoff: Union[bool, float, Mapping] = False,
     ):
         """
@@ -1232,18 +1245,22 @@ class CosineSimilarityClassifier(BaseEstimator, ClassifierMixin):
             within_sims = self.within_class_similarities_[cls]
             between_sims = self.between_class_similarities_[cls]
 
+            within_lower = self.within_ci_[cls][0]
+            between_upper = self.between_ci_[cls][1]
+
             records.append({
                 "class": cls,
                 "n_samples": len(self.class_to_indices_[cls]),
                 "n_within_pairs": len(within_sims),
                 "n_between_pairs": len(between_sims),
                 "within_mean": within_sims.mean() if len(within_sims) > 0 else np.nan,
-                "within_ci_lower": self.within_ci_[cls][0],
+                "within_ci_lower": within_lower,
                 "within_ci_upper": self.within_ci_[cls][1],
                 "between_mean": between_sims.mean() if len(between_sims) > 0 else np.nan,
                 "between_ci_lower": self.between_ci_[cls][0],
-                "between_ci_upper": self.between_ci_[cls][1],
+                "between_ci_upper": between_upper,
                 "cutoff": self.cutoffs_[cls],
+                "ambiguous": within_lower < between_upper,
             })
 
         return pd.DataFrame(records).set_index("class")
