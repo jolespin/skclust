@@ -4,13 +4,13 @@
 import numpy as np
 import pandas as pd
 import igraph as ig
+import scipy.sparse as sp
 from itertools import combinations
 from typing import Optional
 from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 from tqdm.auto import tqdm
 from loguru import logger
-import sys
 
 
 def leiden_stability(consensus_ratio: pd.Series) -> pd.Series:
@@ -26,38 +26,28 @@ def leiden_stability(consensus_ratio: pd.Series) -> pd.Series:
     -------
     pd.Series
         Stability metrics with entries:
-        - n_edges: Total number of edges
-        - mean_consensus: Mean consensus ratio
-        - median_consensus: Median consensus ratio
-        - std_consensus: Standard deviation of consensus ratio
-        - min_consensus: Minimum consensus ratio
-        - max_consensus: Maximum consensus ratio
+        - n_consensus_edges: Number of edges with 100% consensus
+        - consensus_ratio: Mean consensus ratio across all edges
+        - consensus_std: Standard deviation of consensus ratio
         - pct_100: Percentage of edges with 100% consensus
         - pct_90plus: Percentage of edges with ≥90% consensus
         - pct_80plus: Percentage of edges with ≥80% consensus
         - pct_70plus: Percentage of edges with ≥70% consensus
         - pct_60plus: Percentage of edges with ≥60% consensus
         - pct_below_50: Percentage of edges with <50% consensus
-        - q25: 25th percentile of consensus ratio
-        - q75: 75th percentile of consensus ratio
     """
     values = consensus_ratio.values
     
     return pd.Series({
-        'n_edges': len(values),
-        'mean_consensus': values.mean(),
-        'median_consensus': np.median(values),
-        'std_consensus': values.std(),
-        'min_consensus': values.min(),
-        'max_consensus': values.max(),
+        'n_consensus_edges': int((values == 1.0).sum()),
+        'consensus_ratio': values.mean(),
+        'consensus_std': values.std(),
         'pct_100': (values == 1.0).mean() * 100,
         'pct_90plus': (values >= 0.9).mean() * 100,
         'pct_80plus': (values >= 0.8).mean() * 100,
         'pct_70plus': (values >= 0.7).mean() * 100,
         'pct_60plus': (values >= 0.6).mean() * 100,
         'pct_below_50': (values < 0.5).mean() * 100,
-        'q25': np.percentile(values, 25),
-        'q75': np.percentile(values, 75),
     }, name="Stability")
 
 
@@ -106,8 +96,7 @@ def cluster_membership_cooccurrence(
     
     if edge_list is not None:
         # OPTIMIZED PATH: Only compute for specified edges
-        n_pairs = len(edge_list)
-        result = np.empty((n_pairs, n_iterations), dtype=bool)
+        result = np.empty((len(edge_list), n_iterations), dtype=bool)
         
         # Convert edges to index pairs
         edge_idx_pairs = []
@@ -291,24 +280,35 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
     ----------
     partitions_ : pd.DataFrame
         Node assignments for each iteration (shape: n_nodes x n_iter)
-    membership_matrix_ : pd.DataFrame
-        Boolean matrix of edge co-membership across iterations (shape: n_edges x n_iter)
-    consensus_edges_ : set of frozenset
-        Edge pairs meeting the consensus_threshold
+    membership_matrix_ : scipy.sparse.csr_matrix
+        Boolean sparse matrix of edge co-membership across iterations 
+        (shape: n_edges x n_iter). Use get_membership_matrix() for 
+        labeled DataFrame access.
+    consensus_edges_ : pd.Index
+        Index of frozenset edge pairs meeting the consensus_threshold
     consensus_ratio_ : pd.Series
         Proportion of iterations each edge had consistent membership
-    stability_report_ : pd.Series
-        Consensus stability metrics (percentiles, thresholds, etc.)
+    summary_ : pd.Series
+        Comprehensive summary including graph sizes, clustering stats,
+        consensus metrics, and modularity scores.
     labels_ : pd.Series
         Cluster labels for each node in qualifying clusters, indexed by 
         node name. Only contains nodes assigned to clusters meeting 
-        minimum_cluster_size. Use excluded_nodes_ to see what was dropped.
-    excluded_nodes_ : pd.Index
-        Node names excluded from clustering results. Includes nodes with 
-        no consensus edges and nodes from clusters below minimum_cluster_size.
+        minimum_cluster_size.
+    unstable_nodes_ : pd.Index
+        Node names with no consensus edges. These nodes had inconsistent
+        cluster assignments across iterations and never achieved consensus.
+    discarded_nodes_ : pd.Index
+        Node names in stable clusters that were too small 
+        (< minimum_cluster_size). These achieved consensus but were filtered.
     consensus_graph_ : ig.Graph
-        Subgraph containing only consensus edges (isolated nodes removed).
-        Represents the raw consensus structure.
+        Subgraph containing only consensus edges, pruned to nodes in
+        qualifying clusters. Same node set as filtered_graph_ but with
+        only consensus edges.
+    consensus_graph_discarded_ : ig.Graph
+        Subgraph containing consensus edges for discarded (small) clusters.
+        Merge with consensus_graph_ to reconstruct the full pre-filter
+        consensus graph.
     filtered_graph_ : ig.Graph
         Subgraph of the original graph induced on nodes in qualifying 
         clusters (>= minimum_cluster_size). Retains original edge structure.
@@ -320,6 +320,16 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         - 'filtered': On the filtered graph (the meaningful metric)
     n_clusters_ : int
         Number of clusters meeting minimum_cluster_size
+    n_nodes_initial_ : int
+        Number of nodes in the original input graph
+    n_edges_initial_ : int
+        Number of edges in the original input graph
+    n_edges_consensus_ : int
+        Number of edges in the consensus graph
+    n_nodes_filtered_ : int
+        Number of nodes in the filtered graph
+    n_edges_filtered_ : int
+        Number of edges in the filtered graph
         
     Notes
     -----
@@ -385,10 +395,12 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self
             Fitted transformer
         """
+        import time
         import os
+        
         os.environ.pop('MallocStackLogging', None)
         os.environ.pop('MallocStackLoggingOutputFilename', None)
-        import time
+        
         start_time = time.time()
         
         # ================================================================
@@ -409,6 +421,9 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         nodes_list = np.asarray(X.vs['name'])
         
         self._log(f"Graph: {X.vcount()} nodes, {X.ecount()} edges", "info")
+        
+        self.n_nodes_initial_ = X.vcount()
+        self.n_edges_initial_ = X.ecount()
         
         # ================================================================
         # Phase 2: Setup Leiden algorithm
@@ -443,7 +458,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self._log(f"Using {n_jobs} parallel jobs", "info")
         
         random_seeds = list(range(self.random_state, self.random_state + self.n_iter))
-        weight_attr = self.weight if self.weight is not None else None
+        weight_attr = self.weight
         worker_args = [
             (X, weight_attr, seed, leiden_kws_full, nodes_list)
             for seed in random_seeds
@@ -509,16 +524,25 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         # ================================================================
         consensus_start = time.time()
         self._log("Computing consensus metrics", "debug")
+        
+        # Compute consensus ratio before converting to sparse
         self.consensus_ratio_ = self.membership_matrix_.mean(axis=1)
-        self.consensus_edges_ = set(
-            self.consensus_ratio_[self.consensus_ratio_ >= self.consensus_threshold].index
+        self.consensus_ratio_.name = "ConsensusRatio"
+        
+        # Store edge/iteration index for get_membership_matrix, then convert to sparse
+        self._membership_edge_index_ = self.membership_matrix_.index
+        self._membership_iteration_index_ = self.membership_matrix_.columns
+        self.membership_matrix_ = sp.csr_matrix(self.membership_matrix_.values)
+        self.consensus_edges_ = pd.Index(
+            sorted(self.consensus_ratio_[self.consensus_ratio_ >= self.consensus_threshold].index),
+            name="Edge",
         )
-        self.stability_report_ = leiden_stability(self.consensus_ratio_)
+        _consensus_stats = leiden_stability(self.consensus_ratio_)
         
         self._log(f"Found {len(self.consensus_edges_)} consensus edges (>= {self.consensus_threshold} threshold)", "info")
         self._log(f"Consensus metrics: {time.time() - consensus_start:.2f}s", "debug")
         
-        # Build consensus graph
+        # Build temporary consensus graph for component detection
         graph_start = time.time()
         self._log("Building consensus graph", "info")
         
@@ -539,25 +563,24 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             if edge_tuple in consensus_edge_tuples:
                 edges_to_keep.append(edge.index)
         
-        # Always remove isolated nodes from consensus graph
-        self.consensus_graph_ = X.subgraph_edges(edges_to_keep, delete_vertices=True)
+        _consensus_graph = X.subgraph_edges(edges_to_keep, delete_vertices=True)
         
         graph_time = time.time() - graph_start
-        self._log(f"Consensus graph: {self.consensus_graph_.vcount()} nodes, {self.consensus_graph_.ecount()} edges ({graph_time:.2f}s)", "info")
+        self._log(f"Consensus graph (pre-filter): {_consensus_graph.vcount()} nodes, {_consensus_graph.ecount()} edges ({graph_time:.2f}s)", "info")
         
         # ================================================================
         # Phase 6: Cluster labels from connected components
         # ================================================================
         label_start = time.time()
         self._log("Computing connected components for cluster labels", "info")
-        components = self.consensus_graph_.connected_components()
+        components = _consensus_graph.connected_components()
         
         # Assign labels sorted by cluster size (largest first)
         node_to_cluster = {}
         cluster_sizes = []
         
         for component in components:
-            nodes_in_component = [self.consensus_graph_.vs[idx]['name'] for idx in component]
+            nodes_in_component = [_consensus_graph.vs[idx]['name'] for idx in component]
             cluster_sizes.append((len(nodes_in_component), nodes_in_component))
         
         cluster_sizes.sort(key=lambda x: x[0], reverse=True)
@@ -574,44 +597,70 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         labels_all.index.name = "Node"
         
         # ================================================================
-        # Phase 7: Filter by minimum_cluster_size
+        # Phase 7: Filter by minimum_cluster_size and categorize nodes
         # ================================================================
         cluster_counts = labels_all.value_counts()
+        
+        # Valid clusters must have size >= minimum_cluster_size
         valid_clusters = set(cluster_counts[cluster_counts >= self.minimum_cluster_size].index)
+        discarded_clusters = set(cluster_counts.index) - valid_clusters
         
         # labels_ only contains nodes in qualifying clusters (no NaN rows)
         self.labels_ = labels_all[labels_all.isin(valid_clusters)].copy()
         self.labels_.index.name = "Node"
         self.n_clusters_ = len(valid_clusters)
         
-        # Track excluded nodes (no consensus edges OR cluster too small)
-        self.excluded_nodes_ = pd.Index(
-            sorted(set(all_nodes) - set(self.labels_.index)),
+        # Unstable nodes: no consensus edges at all (never in consensus graph)
+        consensus_node_names = set(_consensus_graph.vs['name'])
+        self.unstable_nodes_ = pd.Index(
+            sorted(set(all_nodes) - consensus_node_names),
             name="Node",
         )
         
-        n_excluded_small_cluster = labels_all.notna().sum() - len(self.labels_)
-        n_excluded_no_consensus = labels_all.isna().sum()
-        if n_excluded_small_cluster > 0:
-            self._log(f"Excluded {n_excluded_small_cluster} nodes from {cluster_counts.shape[0] - len(valid_clusters)} clusters below minimum_cluster_size={self.minimum_cluster_size}", "info")
-        if n_excluded_no_consensus > 0:
-            self._log(f"Excluded {n_excluded_no_consensus} nodes with no consensus edges", "info")
+        # Discarded nodes: stable but cluster too small
+        self.discarded_nodes_ = pd.Index(
+            sorted(labels_all[labels_all.isin(discarded_clusters)].dropna().index),
+            name="Node",
+        )
+        
+        if len(self.unstable_nodes_) > 0:
+            self._log(f"Unstable nodes (no consensus edges): {len(self.unstable_nodes_)}", "info")
+        if len(self.discarded_nodes_) > 0:
+            self._log(f"Discarded nodes (cluster size < {self.minimum_cluster_size}): {len(self.discarded_nodes_)}", "info")
         
         label_time = time.time() - label_start
         self._log(f"Found {self.n_clusters_} clusters in {label_time:.2f}s", "info")
         
         # ================================================================
-        # Phase 8: Build filtered_graph_ and compute modularity
+        # Phase 8: Build final graphs and compute modularity
         # ================================================================
         filtered_start = time.time()
-        self._log("Building filtered graph and computing modularity", "info")
+        self._log("Building final graphs and computing modularity", "info")
         
-        # Filtered graph: original edges between nodes in qualifying clusters
         valid_node_names = set(self.labels_.index)
+        discarded_node_names = set(self.discarded_nodes_)
+        
+        # Consensus graph: consensus edges, qualifying nodes only
+        valid_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in valid_node_names]
+        self.consensus_graph_ = _consensus_graph.induced_subgraph(valid_consensus_indices)
+        
+        self.n_edges_consensus_ = self.consensus_graph_.ecount()
+        
+        # Discarded consensus graph: consensus edges, small-cluster nodes only
+        discarded_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in discarded_node_names]
+        self.consensus_graph_discarded_ = _consensus_graph.induced_subgraph(discarded_consensus_indices)
+        
+        # Filtered graph: all original edges between qualifying nodes
         valid_node_indices = [v.index for v in X.vs if v['name'] in valid_node_names]
         self.filtered_graph_ = X.induced_subgraph(valid_node_indices)
         
-        self._log(f"Filtered graph: {self.filtered_graph_.vcount()} nodes, {self.filtered_graph_.ecount()} edges", "info")
+        self.n_nodes_filtered_ = self.filtered_graph_.vcount()
+        self.n_edges_filtered_ = self.filtered_graph_.ecount()
+        
+        self._log(f"Consensus graph: {self.n_nodes_filtered_} nodes, {self.n_edges_consensus_} edges", "info")
+        self._log(f"Filtered graph: {self.n_nodes_filtered_} nodes, {self.n_edges_filtered_} edges", "info")
+        if self.consensus_graph_discarded_.vcount() > 0:
+            self._log(f"Discarded consensus graph: {self.consensus_graph_discarded_.vcount()} nodes, {self.consensus_graph_discarded_.ecount()} edges", "info")
         
         # Compute modularity on all three graphs
         modularity_initial = _compute_modularity(X, self.labels_, weight=weight_attr)
@@ -620,8 +669,8 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         
         self.modularity_ = pd.Series({
             'initial': modularity_initial,
-            'consensus': modularity_consensus,
             'filtered': modularity_filtered,
+            'consensus': modularity_consensus,
         }, name="Modularity")
         
         filtered_time = time.time() - filtered_start
@@ -629,39 +678,61 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self._log(f"Filtered graph + modularity: {filtered_time:.2f}s", "debug")
         
         # ================================================================
-        # Phase 9: Summary
+        # Phase 9: Build summary
+        # ================================================================
+        self.summary_ = pd.Series({
+            # Graph sizes
+            'n_nodes_initial': self.n_nodes_initial_,
+            'n_edges_initial': self.n_edges_initial_,
+            'n_nodes_filtered': self.n_nodes_filtered_,
+            'n_edges_filtered': self.n_edges_filtered_,
+            'n_edges_consensus': self.n_edges_consensus_,
+            # Clustering
+            'n_clusters': self.n_clusters_,
+            'n_unstable': len(self.unstable_nodes_),
+            'n_discarded': len(self.discarded_nodes_),
+            # Consensus
+            **_consensus_stats.to_dict(),
+            # Modularity
+            'modularity_initial': self.modularity_['initial'],
+            'modularity_filtered': self.modularity_['filtered'],
+            'modularity_consensus': self.modularity_['consensus'],
+        }, name="Summary")        
+        # ================================================================
+        # Phase 10: Summary
         # ================================================================
         total_time = time.time() - start_time
         self._log(f"Total fit time: {total_time:.2f}s", "info")
         
         if self.verbose >= 2:
+            rep = self.summary_
             logger.info("=" * 60)
             logger.info("CONSENSUS LEIDEN CLUSTERING SUMMARY")
             logger.info("=" * 60)
-            logger.info(f"Input: {X.vcount()} nodes, {X.ecount()} edges")
+            logger.info(f"Input: {rep['n_nodes_initial']:.0f} nodes, {rep['n_edges_initial']:.0f} edges")
             logger.info(f"Iterations: {self.n_iter} (parallel jobs: {n_jobs})")
             logger.info(f"Consensus threshold: {self.consensus_threshold}")
             logger.info(f"Minimum cluster size: {self.minimum_cluster_size}")
-            logger.info(f"Consensus edges: {len(self.consensus_edges_)} ({100*len(self.consensus_edges_)/X.ecount():.2f}%)")
-            logger.info(f"Consensus graph: {self.consensus_graph_.vcount()} nodes, {self.consensus_graph_.ecount()} edges")
-            logger.info(f"Filtered graph: {self.filtered_graph_.vcount()} nodes, {self.filtered_graph_.ecount()} edges")
-            logger.info(f"Clusters: {self.n_clusters_}")
-            logger.info(f"Nodes in clusters: {len(self.labels_)} ({100*len(self.labels_)/X.vcount():.2f}%)")
-            logger.info(f"Excluded nodes: {len(self.excluded_nodes_)}")
+            logger.info(f"Consensus edges: {rep['n_consensus_edges']:.0f} ({100*rep['n_consensus_edges']/rep['n_edges_initial']:.2f}%)")
+            logger.info(f"Consensus graph: {rep['n_nodes_filtered']:.0f} nodes, {rep['n_edges_consensus']:.0f} edges")
+            logger.info(f"Filtered graph: {rep['n_nodes_filtered']:.0f} nodes, {rep['n_edges_filtered']:.0f} edges")
+            logger.info(f"Clusters: {rep['n_clusters']:.0f}")
+            logger.info(f"Unstable nodes (no consensus edges): {rep['n_unstable']:.0f}")
+            logger.info(f"Discarded nodes (small clusters): {rep['n_discarded']:.0f}")
             logger.info("=" * 60)
-            logger.info("STABILITY REPORT")
+            logger.info("CONSENSUS METRICS")
             logger.info("=" * 60)
-            rep = self.stability_report_
-            logger.info(f"Consensus ratio: median={rep['median_consensus']:.3f}, mean={rep['mean_consensus']:.3f}")
+            logger.info(f"Consensus ratio: {rep['consensus_ratio']:.3f} (std={rep['consensus_std']:.3f})")
             logger.info(f"100% consensus: {rep['pct_100']:.1f}% of edges")
+            logger.info(f"≥90% consensus: {rep['pct_90plus']:.1f}% of edges")
             logger.info(f"≥80% consensus: {rep['pct_80plus']:.1f}% of edges")
             logger.info(f"<50% consensus: {rep['pct_below_50']:.1f}% of edges")
             logger.info("=" * 60)
             logger.info("MODULARITY")
             logger.info("=" * 60)
-            logger.info(f"Initial graph:   {self.modularity_['initial']:.4f}")
-            logger.info(f"Consensus graph: {self.modularity_['consensus']:.4f}")
-            logger.info(f"Filtered graph:  {self.modularity_['filtered']:.4f}")
+            logger.info(f"Initial graph:   {rep['modularity_initial']:.4f}")
+            logger.info(f"Filtered graph:  {rep['modularity_filtered']:.4f}")
+            logger.info(f"Consensus graph: {rep['modularity_consensus']:.4f}")
             logger.info("=" * 60)
             logger.info("TIMING BREAKDOWN")
             logger.info("=" * 60)
@@ -727,12 +798,29 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         pd.Index
             Index of frozenset edge pairs from the consensus graph
         """
-        if not hasattr(self, 'consensus_graph_'):
+        if not hasattr(self, 'consensus_edges_'):
             raise RuntimeError("Must call fit() before get_feature_names_out()")
         
-        edges = [
-            frozenset([self.consensus_graph_.vs[e.source]['name'], 
-                       self.consensus_graph_.vs[e.target]['name']])
-            for e in self.consensus_graph_.es
-        ]
-        return pd.Index(edges, name="Edge")
+        return self.consensus_edges_
+    
+    def get_membership_matrix(self) -> pd.DataFrame:
+        """
+        Return the membership co-occurrence matrix as a pandas sparse DataFrame.
+        
+        Returns
+        -------
+        pd.DataFrame
+            Boolean sparse DataFrame with edges as rows and iterations as columns.
+            Uses pd.SparseDtype(bool) for memory efficiency.
+        """
+        if not hasattr(self, 'membership_matrix_'):
+            raise RuntimeError("Must call fit() before get_membership_matrix()")
+        
+        dense = self.membership_matrix_.toarray()
+        df = pd.DataFrame(
+            dense,
+            index=self._membership_edge_index_,
+            columns=self._membership_iteration_index_,
+            dtype=pd.SparseDtype(bool),
+        )
+        return df

@@ -1,15 +1,12 @@
 # Change Log
-* [2026.2.25] - `get_feature_names_out()` now returns `pd.Index` of `frozenset` edges computed from `consensus_graph_`, instead of stored edge strings.
-* [2026.2.25] - Removed `self.graph_` storage; original input graph is no longer retained after `fit()`.
-* [2026.2.25] - Added `consensus_threshold` parameter (default=1.0) to control minimum edge consensus ratio.
-* [2026.2.25] - Added `minimum_cluster_size` parameter (default=1) to filter out small clusters.
-* [2026.2.25] - Added `filtered_graph_` attribute: subgraph of original graph induced on nodes in qualifying clusters, retaining original edge structure.
-* [2026.2.25] - Added `modularity_` attribute as `pd.Series` with keys initial, consensus, filtered.
-* [2026.2.25] - Added `excluded_nodes_` attribute (`pd.Index`) tracking nodes with no consensus edges or from undersized clusters.
-* [2026.2.25] - `labels_` no longer contains NaN rows; only nodes in qualifying clusters are included.
-* [2026.2.25] - `consensus_graph_` now always removes isolated nodes (no delete_vertices parameter).
-* [2026.2.25] - `leiden_stability` returns `pd.Series` instead of single-row `pd.DataFrame`.
-* [2026.2.25] - Removed `get_consensus_graph()` and `get_labels()` methods.
+* [2026.2.25] - Added `consensus_threshold` parameter directly to `ConsensusLeidenClustering.__init__` to apply thresholding during `fit()`. Removed `get_consensus_graph()` and `get_labels()` as they are no longer needed for post-hoc extraction.
+* [2026.2.25] - Added `minimum_cluster_size` parameter to filter out small communities. Nodes are now cleanly categorized into `labels_` (valid), `discarded_nodes_` (stable but too small), and `unstable_nodes_` (never achieved consensus).
+* [2026.2.25] - Replaced `stability_report_` DataFrame with a comprehensive `summary_` Series that includes graph sizes, node categorizations, consensus metrics, and modularity scores.
+* [2026.2.25] - Added automatic modularity computation on the `initial`, `consensus`, and `filtered` graphs, accessible via the new `modularity_` attribute.
+* [2026.2.25] - Added `filtered_graph_` attribute which retains the original edge structure but only includes nodes from clusters meeting the `minimum_cluster_size`. Added `consensus_graph_discarded_` for inspecting dropped components.
+* [2026.2.25] - Optimized `membership_matrix_` by changing it from a dense DataFrame to a memory-efficient `scipy.sparse.csr_matrix`. Added `get_membership_matrix()` to retrieve it as a pandas DataFrame with `SparseDtype`.
+* [2026.2.25] - Updated `consensus_edges_` to be a `pd.Index` instead of a set, and modified `get_feature_names_out()` to return it directly for better scikit-learn compatibility.
+* [2026.2.25] - Removed `graph_` attribute from being stored directly on the estimator object to save memory, as it is now logically split into `filtered_graph_` and `consensus_graph_`.
 * [2026.2.23] - Added `CosineSimilarityClassifier` and reimplemented to `KNeighborsSimilarity` so the overlapping methods are shared
 * [2026.2.23] - Cleaned up `metrics` and removed `distinctiveness_score`
 * [2026.2.4] - Added `metrics` submodule with `cv_score`, `eta_squared_score`, `entropy_score`, `cramers_v_score`, `distinctiveness_score`
