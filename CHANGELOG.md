@@ -1,11 +1,22 @@
 # Change Log
+* [2026.2.25] - `get_feature_names_out()` now returns `pd.Index` of `frozenset` edges computed from `consensus_graph_`, instead of stored edge strings.
+* [2026.2.25] - Removed `self.graph_` storage; original input graph is no longer retained after `fit()`.
+* [2026.2.25] - Added `consensus_threshold` parameter (default=1.0) to control minimum edge consensus ratio.
+* [2026.2.25] - Added `minimum_cluster_size` parameter (default=1) to filter out small clusters.
+* [2026.2.25] - Added `filtered_graph_` attribute: subgraph of original graph induced on nodes in qualifying clusters, retaining original edge structure.
+* [2026.2.25] - Added `modularity_` attribute as `pd.Series` with keys initial, consensus, filtered.
+* [2026.2.25] - Added `excluded_nodes_` attribute (`pd.Index`) tracking nodes with no consensus edges or from undersized clusters.
+* [2026.2.25] - `labels_` no longer contains NaN rows; only nodes in qualifying clusters are included.
+* [2026.2.25] - `consensus_graph_` now always removes isolated nodes (no delete_vertices parameter).
+* [2026.2.25] - `leiden_stability` returns `pd.Series` instead of single-row `pd.DataFrame`.
+* [2026.2.25] - Removed `get_consensus_graph()` and `get_labels()` methods.
 * [2026.2.23] - Added `CosineSimilarityClassifier` and reimplemented to `KNeighborsSimilarity` so the overlapping methods are shared
 * [2026.2.23] - Cleaned up `metrics` and removed `distinctiveness_score`
 * [2026.2.4] - Added `metrics` submodule with `cv_score`, `eta_squared_score`, `entropy_score`, `cramers_v_score`, `distinctiveness_score`
-* [2026.2.1] - New function: leiden_stability(consensus_ratio) - Computes comprehensive stability metrics from Leiden consensus clustering (n_edges, mean/median/std consensus, percentile thresholds at 100%/90%/80%/70%/60%, percentage below 50%, quartiles)
-* [2026.2.1] - New attribute: stability_report_ automatically computed during ConsensusLeidenClustering.fit() - Single-row DataFrame with 14 stability metrics for easy analysis and comparison
-* [2026.2.1] - New method: get_consensus_graph(threshold) - Extract consensus graph at any threshold (0.0-1.0) without refitting, enables post-hoc threshold exploration
-* [2026.2.1] - New method: get_labels(threshold) - Extract cluster labels at any threshold (0.0-1.0) without refitting, computed from connected components in consensus graph
+* [2026.2.1] - Added `leiden_stability(consensus_ratio)` - Computes comprehensive stability metrics from Leiden consensus clustering (n_edges, mean/median/std consensus, percentile thresholds at 100%/90%/80%/70%/60%, percentage below 50%, quartiles)
+* [2026.2.1] - Added `stability_report_` automatically computed during `ConsensusLeidenClustering.fit()` - Single-row DataFrame with 14 stability metrics for easy analysis and comparison
+* [2026.2.1] - Added `get_consensus_graph(threshold)` - Extract consensus graph at any threshold (0.0-1.0) without refitting, enables post-hoc threshold exploration
+* [2026.2.1] - Added `get_labels(threshold)` - Extract cluster labels at any threshold (0.0-1.0) without refitting, computed from connected components in consensus graph
 * [2026.2.1] - Fixed `if index == "auto"` issue when providing `pd.Index`
 * [2025.1.24] - **Major performance optimization** for `ConsensusLeidenClustering`: Co-occurrence matrix now only computed for edges that exist in graph instead of all possible node pairs (55-45,000x speedup for sparse graphs)
 * [2025.1.24] - **Breaking change**: `verbose` parameter in `ConsensusLeidenClustering` changed from `bool` to `int` (0-3) for sklearn-style verbosity levels with `loguru` logging (backward compatible: `verbose=False` → 0, `verbose=True` → 1)
