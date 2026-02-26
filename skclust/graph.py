@@ -26,9 +26,8 @@ def leiden_stability(consensus_ratio: pd.Series) -> pd.Series:
     -------
     pd.Series
         Stability metrics with entries:
-        - n_consensus_edges: Number of edges with 100% consensus
-        - consensus_ratio: Mean consensus ratio across all edges
-        - consensus_std: Standard deviation of consensus ratio
+        - consensus_ratio_before_filter: Mean consensus ratio across all edges
+        - consensus_std_before_filter: Standard deviation of consensus ratio
         - pct_100: Percentage of edges with 100% consensus
         - pct_90plus: Percentage of edges with ≥90% consensus
         - pct_80plus: Percentage of edges with ≥80% consensus
@@ -39,9 +38,8 @@ def leiden_stability(consensus_ratio: pd.Series) -> pd.Series:
     values = consensus_ratio.values
     
     return pd.Series({
-        'n_consensus_edges': int((values == 1.0).sum()),
-        'consensus_ratio': values.mean(),
-        'consensus_std': values.std(),
+        'consensus_ratio_before_filter': values.mean(),
+        'consensus_std_before_filter': values.std(),
         'pct_100': (values == 1.0).mean() * 100,
         'pct_90plus': (values >= 0.9).mean() * 100,
         'pct_80plus': (values >= 0.8).mean() * 100,
@@ -324,8 +322,14 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         Number of nodes in the original input graph
     n_edges_initial_ : int
         Number of edges in the original input graph
-    n_edges_consensus_ : int
-        Number of edges in the consensus graph
+    n_nodes_consensus_before_filter_ : int
+        Number of nodes in the consensus graph before minimum_cluster_size filtering
+    n_edges_consensus_before_filter_ : int
+        Number of edges in the consensus graph before minimum_cluster_size filtering
+    n_nodes_consensus_after_filter_ : int
+        Number of nodes in the consensus graph after minimum_cluster_size filtering
+    n_edges_consensus_after_filter_ : int
+        Number of edges in the consensus graph after minimum_cluster_size filtering
     n_nodes_filtered_ : int
         Number of nodes in the filtered graph
     n_edges_filtered_ : int
@@ -565,8 +569,12 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         
         _consensus_graph = X.subgraph_edges(edges_to_keep, delete_vertices=True)
         
+        # Store before-filter consensus graph sizes
+        self.n_nodes_consensus_before_filter_ = _consensus_graph.vcount()
+        self.n_edges_consensus_before_filter_ = _consensus_graph.ecount()
+        
         graph_time = time.time() - graph_start
-        self._log(f"Consensus graph (pre-filter): {_consensus_graph.vcount()} nodes, {_consensus_graph.ecount()} edges ({graph_time:.2f}s)", "info")
+        self._log(f"Consensus graph (before filter): {self.n_nodes_consensus_before_filter_} nodes, {self.n_edges_consensus_before_filter_} edges ({graph_time:.2f}s)", "info")
         
         # ================================================================
         # Phase 6: Cluster labels from connected components
@@ -644,7 +652,8 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         valid_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in valid_node_names]
         self.consensus_graph_ = _consensus_graph.induced_subgraph(valid_consensus_indices)
         
-        self.n_edges_consensus_ = self.consensus_graph_.ecount()
+        self.n_nodes_consensus_after_filter_ = self.consensus_graph_.vcount()
+        self.n_edges_consensus_after_filter_ = self.consensus_graph_.ecount()
         
         # Discarded consensus graph: consensus edges, small-cluster nodes only
         discarded_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in discarded_node_names]
@@ -657,7 +666,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.n_nodes_filtered_ = self.filtered_graph_.vcount()
         self.n_edges_filtered_ = self.filtered_graph_.ecount()
         
-        self._log(f"Consensus graph: {self.n_nodes_filtered_} nodes, {self.n_edges_consensus_} edges", "info")
+        self._log(f"Consensus graph (after filter): {self.n_nodes_consensus_after_filter_} nodes, {self.n_edges_consensus_after_filter_} edges", "info")
         self._log(f"Filtered graph: {self.n_nodes_filtered_} nodes, {self.n_edges_filtered_} edges", "info")
         if self.consensus_graph_discarded_.vcount() > 0:
             self._log(f"Discarded consensus graph: {self.consensus_graph_discarded_.vcount()} nodes, {self.consensus_graph_discarded_.ecount()} edges", "info")
@@ -684,9 +693,12 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             # Graph sizes
             'n_nodes_initial': self.n_nodes_initial_,
             'n_edges_initial': self.n_edges_initial_,
+            'n_nodes_consensus_before_filter': self.n_nodes_consensus_before_filter_,
+            'n_edges_consensus_before_filter': self.n_edges_consensus_before_filter_,
+            'n_nodes_consensus_after_filter': self.n_nodes_consensus_after_filter_,
+            'n_edges_consensus_after_filter': self.n_edges_consensus_after_filter_,
             'n_nodes_filtered': self.n_nodes_filtered_,
             'n_edges_filtered': self.n_edges_filtered_,
-            'n_edges_consensus': self.n_edges_consensus_,
             # Clustering
             'n_clusters': self.n_clusters_,
             'n_unstable': len(self.unstable_nodes_),
@@ -697,7 +709,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             'modularity_initial': self.modularity_['initial'],
             'modularity_filtered': self.modularity_['filtered'],
             'modularity_consensus': self.modularity_['consensus'],
-        }, name="Summary")        
+        }, name="Summary")
         # ================================================================
         # Phase 10: Summary
         # ================================================================
@@ -713,8 +725,8 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             logger.info(f"Iterations: {self.n_iter} (parallel jobs: {n_jobs})")
             logger.info(f"Consensus threshold: {self.consensus_threshold}")
             logger.info(f"Minimum cluster size: {self.minimum_cluster_size}")
-            logger.info(f"Consensus edges: {rep['n_consensus_edges']:.0f} ({100*rep['n_consensus_edges']/rep['n_edges_initial']:.2f}%)")
-            logger.info(f"Consensus graph: {rep['n_nodes_filtered']:.0f} nodes, {rep['n_edges_consensus']:.0f} edges")
+            logger.info(f"Consensus graph (before filter): {rep['n_nodes_consensus_before_filter']:.0f} nodes, {rep['n_edges_consensus_before_filter']:.0f} edges")
+            logger.info(f"Consensus graph (after filter): {rep['n_nodes_consensus_after_filter']:.0f} nodes, {rep['n_edges_consensus_after_filter']:.0f} edges")
             logger.info(f"Filtered graph: {rep['n_nodes_filtered']:.0f} nodes, {rep['n_edges_filtered']:.0f} edges")
             logger.info(f"Clusters: {rep['n_clusters']:.0f}")
             logger.info(f"Unstable nodes (no consensus edges): {rep['n_unstable']:.0f}")
@@ -722,7 +734,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             logger.info("=" * 60)
             logger.info("CONSENSUS METRICS")
             logger.info("=" * 60)
-            logger.info(f"Consensus ratio: {rep['consensus_ratio']:.3f} (std={rep['consensus_std']:.3f})")
+            logger.info(f"Consensus ratio: {rep['consensus_ratio_before_filter']:.3f} (std={rep['consensus_std_before_filter']:.3f})")
             logger.info(f"100% consensus: {rep['pct_100']:.1f}% of edges")
             logger.info(f"≥90% consensus: {rep['pct_90plus']:.1f}% of edges")
             logger.info(f"≥80% consensus: {rep['pct_80plus']:.1f}% of edges")

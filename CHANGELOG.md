@@ -1,4 +1,7 @@
 # Change Log
+* [2025.2.26] - Renamed `consensus_ratio` and `consensus_std` to `consensus_ratio_before_filter` and `consensus_std_before_filter` in `leiden_stability()` and `summary_` to clarify these metrics are computed on the full input graph prior to `minimum_cluster_size` filtering.
+* [2026.2.26] - Deprecated `CosineSimilarityClassifier` in favor `FaissKNNClassifier` and `FaissKNNTransformer` wrapper around [DESlib](https://github.com/scikit-learn-contrib/DESlib/)
+* [2025.2.26] - Replaced ambiguous `n_consensus_edges` and `n_edges_consensus` summary keys with explicit `n_nodes_consensus_before_filter`, `n_edges_consensus_before_filter`, `n_nodes_consensus_after_filter`, and `n_edges_consensus_after_filter` to clearly distinguish consensus graph sizes before and after `minimum_cluster_size` filtering. Removed `n_consensus_edges` from `leiden_stability()`.
 * [2026.2.25] - Added `consensus_threshold` parameter directly to `ConsensusLeidenClustering.__init__` to apply thresholding during `fit()`. Removed `get_consensus_graph()` and `get_labels()` as they are no longer needed for post-hoc extraction.
 * [2026.2.25] - Added `minimum_cluster_size` parameter to filter out small communities. Nodes are now cleanly categorized into `labels_` (valid), `discarded_nodes_` (stable but too small), and `unstable_nodes_` (never achieved consensus).
 * [2026.2.25] - Replaced `stability_report_` DataFrame with a comprehensive `summary_` Series that includes graph sizes, node categorizations, consensus metrics, and modularity scores.
