@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# skclust/kneighbors.py
+# skclust/neighbors.py
 
 from __future__ import annotations
 import warnings
@@ -14,6 +14,22 @@ from sklearn.neighbors import KNeighborsTransformer
 from scipy.spatial.distance import squareform
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_is_fitted, check_array
+from tqdm import tqdm
+
+try:
+    from deslib.util.faiss_knn_wrapper import FaissKNNClassifier as _FaissKNNClassifier
+    DESLIB_AVAILABLE = True
+except ImportError:
+    DESLIB_AVAILABLE = False
+    _FaissKNNClassifier = None
+
+
+def _check_deslib():
+    if not DESLIB_AVAILABLE:
+        raise ImportError(
+            "FaissKNN wrappers require 'deslib' and 'faiss'. "
+            "Install with: pip install deslib faiss-cpu"
+        )
 
 def kneighbors_graph_from_transformer(
     X, 
@@ -509,48 +525,183 @@ def kneighbors_to_igraph(D, I, index=None, include_self=False):
     graph = ig.Graph.TupleList(edges, weights=True, directed=True)
     return graph
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Private utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _to_numpy_with_index(X):
+    """
+    Convert X to float32 numpy array and extract row index if available.
+
+    Returns
+    -------
+    X_arr : np.ndarray, dtype float32
+    row_index : pd.Index or None
+    """
+    if isinstance(X, pd.DataFrame):
+        return X.values.astype(np.float32), X.index
+    if isinstance(X, pd.Series):
+        return X.values.astype(np.float32).reshape(1, -1), pd.Index([X.name])
+    return np.asarray(X, dtype=np.float32), None
+
+
+def _determine_backend(backend):
+    """
+    Resolve backend preference to 'faiss' or 'sklearn'.
+
+    Parameters
+    ----------
+    backend : {'auto', 'faiss', 'sklearn'}
+
+    Returns
+    -------
+    str : 'faiss' or 'sklearn'
+    """
+    if backend == "sklearn":
+        return "sklearn"
+    if backend == "faiss":
+        try:
+            import faiss  # noqa: F401
+            return "faiss"
+        except ImportError:
+            raise ImportError("FAISS not available. Install with: pip install faiss-cpu")
+    # auto
+    try:
+        import faiss  # noqa: F401
+        return "faiss"
+    except ImportError:
+        warnings.warn("FAISS not available, falling back to sklearn.", UserWarning)
+        return "sklearn"
+
+
+def _build_faiss_index(X, mode="exact", n_voronoi_cells="auto", n_probes=1,
+                       n_subvectors=None, n_bits=8):
+    """
+    Build and return a fitted FAISS index for inner product (cosine on L2-normed data).
+
+    Parameters
+    ----------
+    X : np.ndarray, float32, L2-normalized
+    mode : {'exact', 'ivf', 'pq'}
+    n_voronoi_cells : int or 'auto'
+    n_probes : int
+    n_subvectors : int or None
+    n_bits : int
+
+    Returns
+    -------
+    faiss.Index
+    """
+    import faiss
+
+    n_samples, d = X.shape
+
+    if mode == "exact":
+        index = faiss.IndexFlatIP(d)
+        index.add(X)
+
+    elif mode == "ivf":
+        nlist = int(np.sqrt(n_samples)) if n_voronoi_cells == "auto" else n_voronoi_cells
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFFlat(quantizer, d, nlist)
+        index.train(X)
+        index.add(X)
+        index.nprobe = n_probes
+
+    elif mode == "pq":
+        if n_subvectors is None:
+            m = d // 16
+            while d % m != 0 and m > 1:
+                m -= 1
+            if m == 1:
+                raise ValueError(
+                    f"Cannot determine n_subvectors for dimension {d}. "
+                    f"Specify n_subvectors that divides {d} evenly."
+                )
+        else:
+            m = n_subvectors
+            if d % m != 0:
+                raise ValueError(f"n_subvectors ({m}) must divide dimension ({d}) evenly.")
+        index = faiss.IndexPQ(d, m, n_bits)
+        index.train(X)
+        index.add(X)
+
+    else:
+        raise ValueError(f"mode must be 'exact', 'ivf', or 'pq', got '{mode}'")
+
+    return index
+
+
+def _search_index(index, X_query, k, backend, X_fit=None):
+    """
+    Run nearest-neighbor search against a fitted index.
+
+    Parameters
+    ----------
+    index : faiss.Index or None
+        FAISS index (None if sklearn backend).
+    X_query : np.ndarray, float32
+    k : int
+    backend : str, 'faiss' or 'sklearn'
+    X_fit : np.ndarray or None
+        Required when backend='sklearn'.
+
+    Returns
+    -------
+    similarities : np.ndarray, shape (n_query, k)
+    indices : np.ndarray, shape (n_query, k)
+    """
+    if backend == "faiss":
+        return index.search(X_query, k)
+
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=k, metric="cosine")
+    nn.fit(X_fit)
+    distances, indices = nn.kneighbors(X_query)
+    return 1 - distances, indices  # convert distance → similarity
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KNeighborsCosineSimilarity
+# ══════════════════════════════════════════════════════════════════════════════
+
 class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
     """
     K-Nearest Neighbors using cosine similarity.
-    
+
     Parameters
     ----------
     n_neighbors : int
-        Number of neighbors to find
+        Number of neighbors to find.
     mode : {'exact', 'ivf', 'pq'}, default='exact'
-        Search strategy:
-        - 'exact': Brute force exact search
-        - 'ivf': Inverted file index (approximate)
-        - 'pq': Product quantization (compressed, approximate)
+        Search strategy.
     backend : {'auto', 'faiss', 'sklearn'}, default='auto'
-        Which library to use. 'auto' tries FAISS, falls back to sklearn
+        Which library to use. 'auto' prefers FAISS, falls back to sklearn.
     n_voronoi_cells : int or 'auto', default='auto'
-        Number of IVF cells. If 'auto', uses sqrt(n_samples)
+        Number of IVF cells. If 'auto', uses sqrt(n_samples).
     n_probes : int, default=1
-        Number of cells to search in IVF (FAISS default is 1)
+        Number of cells to search in IVF.
     n_subvectors : int or None, default=None
-        Number of sub-vectors for PQ. If None, uses d//16
+        Number of sub-vectors for PQ. If None, uses d//16.
     n_bits : int, default=8
-        Bits per sub-vector for PQ
-    
+        Bits per sub-vector for PQ.
+
     Attributes
     ----------
     backend_ : str
-        Actual backend used ('faiss' or 'sklearn')
-    index_ : faiss index or None
-        Fitted FAISS index (None if using sklearn)
+    index_ : faiss.Index or None
     similarities_ : np.ndarray, shape (n_samples_fit, n_neighbors)
-        Cosine similarities to k nearest neighbors (higher = more similar)
     indices_ : np.ndarray, shape (n_samples_fit, n_neighbors)
-        Indices of k nearest neighbors
     """
-    
+
     def __init__(
         self,
         n_neighbors,
-        mode='exact',
-        backend='auto',
-        n_voronoi_cells='auto',
+        mode="exact",
+        backend="auto",
+        n_voronoi_cells="auto",
         n_probes=1,
         n_subvectors=None,
         n_bits=8,
@@ -562,181 +713,216 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         self.n_probes = n_probes
         self.n_subvectors = n_subvectors
         self.n_bits = n_bits
-    
-    def _determine_backend(self):
-        """Determine which backend to use."""
-        if self.backend == 'sklearn':
-            return 'sklearn'
-        elif self.backend == 'faiss':
-            try:
-                import faiss
-                return 'faiss'
-            except ImportError:
-                raise ImportError("FAISS not available")
-        else:  # auto
-            try:
-                import faiss
-                return 'faiss'
-            except ImportError:
-                warnings.warn("FAISS not available, falling back to sklearn", UserWarning)
-                return 'sklearn'
-    
+
     def fit(self, X, y=None):
         """
         Fit the k-NN model.
-        
+
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
-            Training data (must be L2-normalized for cosine similarity)
+            L2-normalized training data.
         y : Ignored
-        
-        Returns
-        -------
-        self : object
         """
-        if isinstance(X, pd.DataFrame):
-            self.index_labels_ = X.index
+        X_arr, row_index = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
 
-        X = check_array(X, dtype=np.float32, ensure_2d=True)
-        
-        self.n_samples_fit_ = X.shape[0]
-        self.n_features_in_ = X.shape[1]
-        self.backend_ = self._determine_backend()
-        
-        if self.backend_ == 'faiss':
-            self._fit_faiss(X)
-        else:
-            self._fit_sklearn(X)
-        
-        # Store the training data neighbors
-        self.similarities_, self.indices_ = self.transform(X)
-        
-        return self
-    
-    def _fit_faiss(self, X):
-        """Fit using FAISS backend."""
-        import faiss
-        
-        d = self.n_features_in_
-        
-        if self.mode == 'exact':
-            self.index_ = faiss.IndexFlatIP(d)
-            self.index_.add(X)
-        
-        elif self.mode == 'ivf':
-            # Determine n_voronoi_cells
-            if self.n_voronoi_cells == 'auto':
-                nlist = int(np.sqrt(self.n_samples_fit_))
-            else:
-                nlist = self.n_voronoi_cells
-            
-            quantizer = faiss.IndexFlatIP(d)
-            self.index_ = faiss.IndexIVFFlat(quantizer, d, nlist)
-            self.index_.train(X)
-            self.index_.add(X)
-            self.index_.nprobe = self.n_probes
-        
-        elif self.mode == 'pq':
-            # Determine n_subvectors
-            if self.n_subvectors is None:
-                m = d // 16
-                while d % m != 0 and m > 1:
-                    m -= 1
-                if m == 1:
-                    raise ValueError(
-                        f"Cannot determine n_subvectors for dimension {d}. "
-                        f"Please specify n_subvectors that divides {d} evenly."
-                    )
-            else:
-                m = self.n_subvectors
-                if d % m != 0:
-                    raise ValueError(f"n_subvectors ({m}) must divide dimension ({d}) evenly")
-            
-            self.index_ = faiss.IndexPQ(d, m, self.n_bits)
-            self.index_.train(X)
-            self.index_.add(X)
-        
-        else:
-            raise ValueError(f"mode must be 'exact', 'ivf', or 'pq', got '{self.mode}'")
-    
-    def _fit_sklearn(self, X):
-        """Fit using sklearn backend."""
-        if self.mode != 'exact':
-            warnings.warn(
-                f"sklearn backend only supports exact search, ignoring mode='{self.mode}'",
-                UserWarning
+        if row_index is not None:
+            self.index_labels_ = row_index
+
+        self.n_samples_fit_ = X_arr.shape[0]
+        self.n_features_in_ = X_arr.shape[1]
+        self.backend_ = _determine_backend(self.backend)
+
+        if self.backend_ == "faiss":
+            self.index_ = _build_faiss_index(
+                X_arr,
+                mode=self.mode,
+                n_voronoi_cells=self.n_voronoi_cells,
+                n_probes=self.n_probes,
+                n_subvectors=self.n_subvectors,
+                n_bits=self.n_bits,
             )
-        self.X_fit_ = X
-        self.index_ = None
-    
+            self.X_fit_ = None
+        else:
+            if self.mode != "exact":
+                warnings.warn(
+                    f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.",
+                    UserWarning,
+                )
+            self.X_fit_ = X_arr
+            self.index_ = None
+
+        self.similarities_, self.indices_ = self.transform(X_arr)
+        return self
+
     def transform(self, X):
         """
         Find k-nearest neighbors.
-        
+
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
-            Query vectors (must be L2-normalized)
-        
+            L2-normalized query vectors.
+
         Returns
         -------
         similarities : np.ndarray, shape (n_samples, n_neighbors)
-            Cosine similarities to k nearest neighbors (higher = more similar)
         indices : np.ndarray, shape (n_samples, n_neighbors)
-            Indices of k nearest neighbors
         """
         check_is_fitted(self)
-        X = check_array(X, dtype=np.float32, ensure_2d=True)
-        
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"X has {X.shape[1]} features, expected {self.n_features_in_}")
-        
+        X_arr, _ = _to_numpy_with_index(X)
+        X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+        if X_arr.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {X_arr.shape[1]} features, expected {self.n_features_in_}.")
         if self.n_neighbors > self.n_samples_fit_:
-            raise ValueError(f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})")
-        
-        if self.backend_ == 'faiss':
-            similarities, indices = self.index_.search(X, self.n_neighbors)
-        else:
-            from sklearn.neighbors import NearestNeighbors
-            nn = NearestNeighbors(n_neighbors=self.n_neighbors, metric='cosine')
-            nn.fit(self.X_fit_)
-            distances, indices = nn.kneighbors(X)
-            similarities = 1 - distances  # Convert distance to similarity
-        
-        return similarities, indices
-    
+            raise ValueError(
+                f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})."
+            )
+
+        return _search_index(
+            self.index_, X_arr, self.n_neighbors, self.backend_,
+            X_fit=self.X_fit_,
+        )
+
     def fit_transform(self, X, y=None):
-        """Fit and transform in one step."""
-        return self.fit(X, y).transform(X)
-    
+        """Fit and return neighbors for training data."""
+        self.fit(X, y)
+        return self.similarities_, self.indices_
+
     def to_igraph(self, index="auto", include_self=False):
         """
         Convert fitted k-NN results to igraph.
-        
+
         Parameters
         ----------
-        index : array-like or None, default=None
-            Node labels. If None, uses integers 0 to n-1
+        index : array-like or 'auto'
+            Node labels. 'auto' uses DataFrame index if available, else integers.
         include_self : bool, default=False
-            Whether to include self-loops
-        
+
         Returns
         -------
         ig.Graph
-            Directed graph with edges weighted by cosine similarity
         """
-        check_is_fitted(self, ['similarities_', 'indices_'])
-        if isinstance(index, pd.Index):
-            index = list(index)
+        check_is_fitted(self, ["similarities_", "indices_"])
+
         if index == "auto":
-            if hasattr(self,"index_labels_"):
-                index = self.index_labels_
-            else:
-                index = None
+            index = getattr(self, "index_labels_", None)
+        elif isinstance(index, pd.Index):
+            index = list(index)
+
         return kneighbors_to_igraph(
             self.similarities_,
             self.indices_,
             index=index,
-            include_self=include_self
+            include_self=include_self,
         )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FaissKNNClassifier and FaissKNNTransformer Wrapper from DESlib
+# ══════════════════════════════════════════════════════════════════════════════
+class FaissKNNClassifier(BaseEstimator):
+    """
+    Sklearn-compatible kNN classifier using FAISS via deslib.
+
+    Parameters
+    ----------
+    n_neighbors : int, default=5
+        Number of nearest neighbors.
+    """
+
+    def __init__(self, n_neighbors=5):
+        self.n_neighbors = n_neighbors
+
+    def fit(self, X, y):
+        _check_deslib()
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+        y = np.asarray(y)
+
+        model = _FaissKNNClassifier(n_neighbors=self.n_neighbors)
+        model.fit(X, y)
+        self._index = model.index_  # grab the raw FAISS index
+
+        self.n_samples_fit_ = X.shape[0]
+        self.classes_ = np.unique(y)
+        self.y_fit_ = y
+        return self
+
+    def kneighbors(self, X, n_neighbors=None):
+        """Return (squared_L2_distances, indices) from the FAISS index."""
+        check_is_fitted(self, ["_index"])
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+        X_query = np.ascontiguousarray(X, dtype=np.float32)
+        k = n_neighbors if n_neighbors is not None else self.n_neighbors
+        return self._index.search(X_query, k)
+
+    def predict(self, X):
+        """Predict class labels via majority vote of k-nearest neighbors."""
+        check_is_fitted(self, ["_index", "classes_", "y_fit_"])
+        _, indices = self.kneighbors(X)
+        neighbor_labels = self.y_fit_[indices]
+        preds = np.array([
+            np.bincount(row, minlength=len(self.classes_)).argmax()
+            for row in neighbor_labels
+        ])
+        return self.classes_[preds]
+
+
+class FaissKNNTransformer(BaseEstimator, TransformerMixin):
+    """
+    Sklearn-compatible kNN transformer using FAISS via deslib.
+
+    Outputs a sparse distance matrix matching sklearn's KNeighborsTransformer.
+
+    Parameters
+    ----------
+    n_neighbors : int, default=5
+        Number of nearest neighbors.
+    """
+
+    def __init__(self, n_neighbors=5):
+        self.n_neighbors = n_neighbors
+
+    def fit(self, X, y=None):
+        _check_deslib()
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+
+        # deslib requires y; mock it for unsupervised use
+        if y is None:
+            y = np.zeros(X.shape[0], dtype=int)
+
+        model = _FaissKNNClassifier(n_neighbors=self.n_neighbors)
+        model.fit(X, y)
+        self._index = model.index_
+
+        self.n_samples_fit_ = X.shape[0]
+        return self
+
+    def transform(self, X):
+        """Return sparse csr_matrix of true L2 distances to k-nearest neighbors."""
+        check_is_fitted(self, ["_index"])
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+        X_query = np.ascontiguousarray(X, dtype=np.float32)
+
+        sq_distances, indices = self._index.search(X_query, self.n_neighbors)
+
+        # FAISS returns squared L2; convert to true L2
+        distances = np.sqrt(np.maximum(sq_distances, 0.0))
+
+        n_query = X.shape[0]
+        rows = np.repeat(np.arange(n_query), self.n_neighbors)
+        cols = indices.ravel()
+        data = distances.ravel()
+
+        # Filter FAISS -1 padding (approximate search edge case)
+        valid = cols != -1
+        rows, cols, data = rows[valid], cols[valid], data[valid]
+
+        return sps.csr_matrix(
+            (data, (rows, cols)),
+            shape=(n_query, self.n_samples_fit_),
+        )
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
