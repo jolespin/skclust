@@ -822,6 +822,12 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
 # ══════════════════════════════════════════════════════════════════════════════
 # FaissKNNClassifier and FaissKNNTransformer Wrapper from DESlib
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Strategy: Composition + direct FAISS index access.
+#   - deslib is used ONLY during fit() to build the FAISS index
+#   - All queries go through self._index.search() directly
+#   - This avoids deslib's kneighbors/predict triggering sklearn ≥1.6 tag checks
+
 class FaissKNNClassifier(BaseEstimator):
     """
     Sklearn-compatible kNN classifier using FAISS via deslib.
@@ -830,19 +836,44 @@ class FaissKNNClassifier(BaseEstimator):
     ----------
     n_neighbors : int, default=5
         Number of nearest neighbors.
+    n_jobs : int or None, default=None
+        Number of parallel jobs. If -1, uses all cores.
+    algorithm : {'brute', 'voronoi', 'hierarchical'}, default='brute'
+        - 'brute': IndexFlatL2 (exact search)
+        - 'voronoi': IndexIVFFlat (faster inference, slower training)
+        - 'hierarchical': IndexHNSWFlat (fast + accurate, higher memory)
+    n_cells : int, default=100
+        Number of voronoi cells. Only used when algorithm='voronoi'.
+    n_probes : int, default=1
+        Number of cells visited during search. Only used when algorithm='voronoi'.
     """
 
-    def __init__(self, n_neighbors=5):
+    def __init__(self, n_neighbors=5, n_jobs=None, algorithm="brute",
+                 n_cells=100, n_probes=1):
         self.n_neighbors = n_neighbors
+        self.n_jobs = n_jobs
+        self.algorithm = algorithm
+        self.n_cells = n_cells
+        self.n_probes = n_probes
+
+    def _build_model(self):
+        """Instantiate the deslib model with current parameters."""
+        return _FaissKNNClassifier(
+            n_neighbors=self.n_neighbors,
+            n_jobs=self.n_jobs,
+            algorithm=self.algorithm,
+            n_cells=self.n_cells,
+            n_probes=self.n_probes,
+        )
 
     def fit(self, X, y):
         _check_deslib()
         X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
         y = np.asarray(y)
 
-        model = _FaissKNNClassifier(n_neighbors=self.n_neighbors)
+        model = self._build_model()
         model.fit(X, y)
-        self._index = model.index_  # grab the raw FAISS index
+        self._index = model.index_
 
         self.n_samples_fit_ = X.shape[0]
         self.classes_ = np.unique(y)
@@ -850,7 +881,15 @@ class FaissKNNClassifier(BaseEstimator):
         return self
 
     def kneighbors(self, X, n_neighbors=None):
-        """Return (squared_L2_distances, indices) from the FAISS index."""
+        """
+        Find k-nearest neighbors.
+
+        Returns
+        -------
+        distances : np.ndarray of shape (n_samples, n_neighbors)
+            Squared L2 distances (FAISS convention).
+        indices : np.ndarray of shape (n_samples, n_neighbors)
+        """
         check_is_fitted(self, ["_index"])
         X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
         X_query = np.ascontiguousarray(X, dtype=np.float32)
@@ -879,10 +918,35 @@ class FaissKNNTransformer(BaseEstimator, TransformerMixin):
     ----------
     n_neighbors : int, default=5
         Number of nearest neighbors.
+    n_jobs : int or None, default=None
+        Number of parallel jobs. If -1, uses all cores.
+    algorithm : {'brute', 'voronoi', 'hierarchical'}, default='brute'
+        - 'brute': IndexFlatL2 (exact search)
+        - 'voronoi': IndexIVFFlat (faster inference, slower training)
+        - 'hierarchical': IndexHNSWFlat (fast + accurate, higher memory)
+    n_cells : int, default=100
+        Number of voronoi cells. Only used when algorithm='voronoi'.
+    n_probes : int, default=1
+        Number of cells visited during search. Only used when algorithm='voronoi'.
     """
 
-    def __init__(self, n_neighbors=5):
+    def __init__(self, n_neighbors=5, n_jobs=None, algorithm="brute",
+                 n_cells=100, n_probes=1):
         self.n_neighbors = n_neighbors
+        self.n_jobs = n_jobs
+        self.algorithm = algorithm
+        self.n_cells = n_cells
+        self.n_probes = n_probes
+
+    def _build_model(self):
+        """Instantiate the deslib model with current parameters."""
+        return _FaissKNNClassifier(
+            n_neighbors=self.n_neighbors,
+            n_jobs=self.n_jobs,
+            algorithm=self.algorithm,
+            n_cells=self.n_cells,
+            n_probes=self.n_probes,
+        )
 
     def fit(self, X, y=None):
         _check_deslib()
@@ -892,7 +956,7 @@ class FaissKNNTransformer(BaseEstimator, TransformerMixin):
         if y is None:
             y = np.zeros(X.shape[0], dtype=int)
 
-        model = _FaissKNNClassifier(n_neighbors=self.n_neighbors)
+        model = self._build_model()
         model.fit(X, y)
         self._index = model.index_
 
