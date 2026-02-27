@@ -147,10 +147,10 @@ def cluster_membership_cooccurrence(
 
 def _leiden_worker(args):
     """
-    Worker function for parallel Leiden execution.
+    Worker function for sequential Leiden execution.
     
     Must be at module level for pickling (multiprocessing requirement).
-    Receives all arguments as tuple to work with Pool.map().
+    Receives all arguments as tuple for self-contained execution.
     """
     graph, weight, random_seed, leiden_kws_full, nodes_list = args
     
@@ -172,6 +172,48 @@ def _leiden_worker(args):
     for partition_id, node_indices in enumerate(partition):
         for idx in node_indices:
             node_to_partition[nodes_list[idx]] = partition_id
+            
+    return node_to_partition
+
+
+def _leiden_pool_init(graph, weight, leiden_kws_full, nodes_list):
+    """
+    Pool initializer that stores shared data as process-level globals.
+    
+    Called once per worker process, avoiding redundant pickling of the
+    graph for every iteration. For a 300K-node graph with n_iter=100
+    and n_jobs=4, this reduces graph serialization from 100x to 4x.
+    """
+    global _LEIDEN_GRAPH, _LEIDEN_WEIGHT, _LEIDEN_KWS, _LEIDEN_NODES
+    _LEIDEN_GRAPH = graph
+    _LEIDEN_WEIGHT = weight
+    _LEIDEN_KWS = leiden_kws_full
+    _LEIDEN_NODES = nodes_list
+
+
+def _leiden_worker_parallel(random_seed):
+    """
+    Worker function for parallel Leiden execution.
+    
+    Reads graph and parameters from process-level globals set by
+    _leiden_pool_init. Only the random seed is passed per task.
+    """
+    try:
+        from leidenalg import find_partition
+    except ModuleNotFoundError:
+        raise ImportError("Install leidenalg: pip install leidenalg")
+    
+    partition = find_partition(
+        _LEIDEN_GRAPH,
+        weights=_LEIDEN_WEIGHT,
+        seed=random_seed,
+        **_LEIDEN_KWS
+    )
+    
+    node_to_partition = {}
+    for partition_id, node_indices in enumerate(partition):
+        for idx in node_indices:
+            node_to_partition[_LEIDEN_NODES[idx]] = partition_id
             
     return node_to_partition
 
@@ -463,15 +505,16 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         
         random_seeds = list(range(self.random_state, self.random_state + self.n_iter))
         weight_attr = self.weight
-        worker_args = [
-            (X, weight_attr, seed, leiden_kws_full, nodes_list)
-            for seed in random_seeds
-        ]
         
         partition_start = time.time()
         self._log(f"Running {self.n_iter} Leiden iterations", "info")
         
         if n_jobs == 1:
+            # Sequential: self-contained worker with all args bundled
+            worker_args = [
+                (X, weight_attr, seed, leiden_kws_full, nodes_list)
+                for seed in random_seeds
+            ]
             if self.verbose >= 1:
                 partitions = [
                     _leiden_worker(args) 
@@ -480,21 +523,31 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             else:
                 partitions = [_leiden_worker(args) for args in worker_args]
         else:
+            # Parallel: graph pickled once per worker via initializer,
+            # only random seed sent per task
             import multiprocessing as mp
             ctx = mp.get_context('spawn')
             
             if self.verbose >= 1:
-                with ctx.Pool(processes=n_jobs) as pool:
+                with ctx.Pool(
+                    processes=n_jobs,
+                    initializer=_leiden_pool_init,
+                    initargs=(X, weight_attr, leiden_kws_full, nodes_list),
+                ) as pool:
                     partitions = list(
                         tqdm(
-                            pool.imap(_leiden_worker, worker_args),
-                            total=len(worker_args),
+                            pool.imap(_leiden_worker_parallel, random_seeds),
+                            total=len(random_seeds),
                             desc="Leiden clustering"
                         )
                     )
             else:
-                with ctx.Pool(processes=n_jobs) as pool:
-                    partitions = pool.map(_leiden_worker, worker_args)
+                with ctx.Pool(
+                    processes=n_jobs,
+                    initializer=_leiden_pool_init,
+                    initargs=(X, weight_attr, leiden_kws_full, nodes_list),
+                ) as pool:
+                    partitions = pool.map(_leiden_worker_parallel, random_seeds)
         
         partition_time = time.time() - partition_start
         self._log(f"Leiden iterations completed in {partition_time:.2f}s", "info")
