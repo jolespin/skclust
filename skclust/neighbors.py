@@ -525,6 +525,45 @@ def kneighbors_to_igraph(D, I, index=None, include_self=False):
     graph = ig.Graph.TupleList(edges, weights=True, directed=True)
     return graph
 
+def kneighbors_classification_assignment_score(df_proba, tol_probability=0.1, tol_assignment_score=2.0):
+    """
+    Compute assignment quality metrics for KNN classification.
+    
+    Parameters
+    ----------
+    df_proba : pd.DataFrame
+        Probability matrix (rows=queries, columns=classes) from KNeighborsClassifier.predict_proba
+    tol_probability : float, default=0.1
+        Minimum top class probability for unambiguous assignment
+    tol_assignment_score : float, default=2.0
+        Minimum ratio of top / runner-up probability for unambiguous assignment
+    
+    Returns
+    -------
+    pd.DataFrame
+        Per-query metrics with columns:
+        - max_probability: top class probability
+        - runner_up_probability: second class probability
+        - assignment_score: max_probability / runner_up_probability ratio
+        - prediction: class with highest probability
+        - not_ambiguous: bool, meets both thresholds
+    """
+    eps = np.finfo(df_proba.values.dtype).eps
+    top2 = np.sort(df_proba.values, axis=1)[:, -2:]
+    max_probability = top2[:, 1]
+    runner_up_probability = top2[:, 0]
+    assignment_score = max_probability / (runner_up_probability + eps)
+
+    df_assignment = pd.DataFrame({
+        "max_probability": max_probability,
+        "runner_up_probability": runner_up_probability,
+        "assignment_score": assignment_score,
+        "prediction": df_proba.idxmax(axis=1),
+        "not_ambiguous": (max_probability >= tol_probability) & (assignment_score >= tol_assignment_score),
+    }, index=df_proba.index)
+
+    return df_assignment
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Private utilities
 # ══════════════════════════════════════════════════════════════════════════════
