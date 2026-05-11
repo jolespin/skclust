@@ -177,7 +177,7 @@ def entropy_score(X: pd.DataFrame, labels: pd.Series) -> pd.Series:
     return entropy_per_cluster
 
 
-def _cramers_v_binary(X: pd.DataFrame, labels: pd.Series) -> float:
+def cramers_v_score(X: pd.DataFrame, labels: pd.Series) -> float:
     """
     Compute Cramér's V for binary features (optimized vectorized version).
     
@@ -250,37 +250,3 @@ def _cramers_v_binary(X: pd.DataFrame, labels: pd.Series) -> float:
     return cramers_v_values.mean()
 
 
-def cramers_v_score(X: pd.DataFrame, labels: pd.Series) -> float:
-    """
-    Compute Cramér's V for binary features.
-    
-    Cramér's V measures the association between cluster membership and feature values.
-    
-    Higher V = clusters are more separated.
-    
-    Parameters
-    ----------
-    X : pd.DataFrame
-        Feature matrix (samples x features, binary 0/1 values)
-    labels : pd.Series
-        Cluster assignments (index = sample IDs)
-        
-    Returns
-    -------
-    float
-        Mean Cramér's V (0-1, higher = more separated clusters)
-        
-    Notes
-    -----
-    Interpretation:
-    - V = 0.0: Features are independent of cluster membership
-    - V = 0.3: Knowing cluster improves feature prediction by ~30% (moderate)
-    - V = 1.0: Features perfectly predict cluster membership (perfect separation)
-    
-    Examples
-    --------
-    >>> v = cramers_v_score(X_binary, labels)
-    >>> print(f"Cramér's V: {v:.3f}")  # Higher = better
-    >>> # Target: V > 0.25 for separated clusters
-    """
-    return _cramers_v_binary(X, labels)
