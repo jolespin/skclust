@@ -14,6 +14,8 @@ A comprehensive clustering toolkit with hierarchical clustering, k-nearest neigh
 - **Hierarchical clustering** with multiple linkage methods and tree cutting strategies
 - **K-nearest neighbors** with cosine similarity using FAISS or sklearn backends
 - **Consensus Leiden clustering** with parallel execution and edge co-occurrence analysis
+- **Cluster validation metrics** for continuous and binary features
+- **FAISS-based kNN classifiers and transformers** via DESlib integration
 - **Rich visualizations** with dendrograms and metadata tracks
 - **Distance matrix utilities** for kNN graph construction and conversion
 
@@ -37,6 +39,12 @@ pip install leidenalg igraph
 
 # For fast k-NN with large datasets 
 pip install faiss-cpu  # or faiss-gpu (Python < 3.13)
+
+# For FAISS-based kNN classifier/transformer (via DESlib)
+pip install deslib
+
+# For ensemble network analysis
+pip install ensemble-networkx
 ```
 
 ## Quick Start
@@ -85,6 +93,8 @@ graph.vs['name'] = [f'node_{i}' for i in range(graph.vcount())]
 leiden = ConsensusLeidenClustering(
     n_iter=100,
     resolution_parameter=1.0,
+    consensus_threshold=1.0,
+    minimum_cluster_size=3,
     n_jobs=-1,
     random_state=42
 )
@@ -92,9 +102,10 @@ leiden = ConsensusLeidenClustering(
 labels = leiden.fit_transform(graph)
 print(f"Found {leiden.n_clusters_} clusters")
 print(f"Consensus edges: {leiden.consensus_graph_.ecount()}")
+print(f"Modularity (filtered): {leiden.modularity_['filtered']:.3f}")
 ```
 
-**Output:** Returns pandas Series with cluster labels indexed by node names. The `consensus_graph_` contains only edges where nodes consistently clustered together across all iterations.
+**Output:** Returns pandas Series with cluster labels indexed by node names. The `consensus_graph_` contains only edges where nodes consistently clustered together across all iterations. Nodes in clusters smaller than `minimum_cluster_size` are available via `discarded_nodes_`.
 
 ### K-Nearest Neighbors with Cosine Similarity
 
@@ -147,25 +158,41 @@ Hierarchical clustering with multiple linkage methods and tree cutting strategie
 
 **ConsensusLeidenClustering**
 
-Runs Leiden clustering multiple times with different random seeds and returns only consensus edges.
+Runs Leiden clustering multiple times with different random seeds, computes edge consensus ratios, and builds a consensus graph from edges meeting the threshold. Final labels come from connected components, optionally filtered by minimum cluster size.
 
 **Key Parameters:**
 - `n_iter`: Number of Leiden iterations (default: 100)
 - `resolution_parameter`: Controls cluster size (1.0 = modularity, >1.0 = smaller clusters)
+- `consensus_threshold`: Minimum consensus ratio for edges (default: 1.0, i.e. 100% agreement)
+- `minimum_cluster_size`: Clusters smaller than this are removed from `labels_` (default: 1)
+- `weight`: Edge weight attribute name (default: None for unweighted)
 - `n_jobs`: Number of parallel processes (-1 = use all CPUs)
-- `cluster_prefix`: String prefix for cluster labels
+- `cluster_prefix`: String prefix for cluster labels (default: "leiden_")
+- `verbose`: Verbosity level 0-3 (0=silent, 1=progress bars, 2=stage info, 3=detailed timing)
 
 **Key Methods:**
 - `fit(graph)`: Fit on igraph.Graph with named vertices
 - `transform(graph)`: Return cluster labels as pandas Series
+- `get_membership_matrix()`: Return membership matrix as a pandas DataFrame with SparseDtype
 
 **Attributes:**
-- `labels_`: Final cluster labels from connected components
+- `labels_`: Cluster labels for nodes in qualifying clusters (pd.Series)
+- `n_clusters_`: Number of clusters meeting `minimum_cluster_size`
 - `partitions_`: Node assignments for each iteration (DataFrame)
-- `membership_matrix_`: Boolean edge co-occurrence matrix
-- `consensus_ratio_`: Proportion of iterations each edge had consistent membership
-- `consensus_edges_`: Edges with 100% co-occurrence
-- `consensus_graph_`: Subgraph containing only consensus edges
+- `membership_matrix_`: Sparse boolean edge co-membership matrix (scipy.sparse.csr_matrix)
+- `consensus_ratio_`: Proportion of iterations each edge had consistent membership (pd.Series)
+- `consensus_edges_`: Edge pairs meeting `consensus_threshold` (pd.Index)
+- `consensus_graph_`: Subgraph with only consensus edges, pruned to qualifying clusters
+- `consensus_graph_discarded_`: Consensus edges for small clusters that were filtered out
+- `filtered_graph_`: Original edge structure induced on nodes in qualifying clusters
+- `modularity_`: Modularity scores for initial, consensus, and filtered graphs (pd.Series)
+- `summary_`: Comprehensive summary with graph sizes, consensus metrics, and modularity
+- `unstable_nodes_`: Nodes with no consensus edges across iterations
+- `discarded_nodes_`: Nodes in stable but too-small clusters
+
+**leiden_stability(consensus_ratio)**
+
+Computes comprehensive stability metrics from consensus ratio values.
 
 **cluster_membership_cooccurrence(df)**
 
@@ -174,7 +201,7 @@ Compute edge-wise cluster co-occurrence across iterations.
 **Parameters:**
 - `df`: DataFrame where rows are nodes and columns are iterations
 
-**Returns:** Boolean DataFrame showing whether each node pair shared cluster membership in each iteration.
+**Returns:** Sparse boolean matrix showing whether each node pair shared cluster membership in each iteration.
 
 ### skclust.neighbors
 
@@ -196,6 +223,32 @@ K-nearest neighbors using cosine similarity with FAISS or sklearn backend.
 - `similarities_`: Cosine similarities to k nearest neighbors
 - `indices_`: Indices of k nearest neighbors
 
+**FaissKNNClassifier**
+
+Sklearn-compatible kNN classifier using FAISS via DESlib. Supports exact (brute), Voronoi (IVF), and hierarchical (HNSW) search algorithms.
+
+**Key Parameters:**
+- `n_neighbors`: Number of neighbors (default: 5)
+- `algorithm`: Search strategy ('brute', 'voronoi', 'hierarchical')
+- `n_jobs`: Number of parallel jobs
+
+**Key Methods:**
+- `fit(X, y)`: Fit classifier
+- `predict(X)`: Predict class labels via majority vote
+- `kneighbors(X)`: Return (distances, indices) of k nearest neighbors
+
+**FaissKNNTransformer**
+
+Sklearn-compatible kNN transformer using FAISS via DESlib. Outputs a sparse distance matrix matching sklearn's KNeighborsTransformer interface.
+
+**Key Parameters:**
+- `n_neighbors`: Number of neighbors (default: 5)
+- `algorithm`: Search strategy ('brute', 'voronoi', 'hierarchical')
+
+**Key Methods:**
+- `fit(X)`: Fit transformer
+- `transform(X)`: Return sparse csr_matrix of L2 distances to k nearest neighbors
+
 **Utility Functions:**
 
 - `kneighbors_graph_from_transformer()`: Build kNN graph from any KNeighborsTransformer
@@ -203,6 +256,19 @@ K-nearest neighbors using cosine similarity with FAISS or sklearn backend.
 - `pairwise_distances_kneighbors()`: Compute full or sparse pairwise distances
 - `convert_distance_matrix_to_kneighbors_matrix()`: Convert dense distance matrix to sparse kNN matrix
 - `kneighbors_to_igraph()`: Convert kNN results to igraph
+- `kneighbors_classification_assignment_score()`: Compute assignment quality metrics (ambiguity detection) for kNN classification
+
+### skclust.metrics
+
+Cluster validation metrics for evaluating cluster quality.
+
+**Continuous Features:**
+- `cv_score(X, labels)`: Coefficient of variation within each cluster (lower = more compact)
+- `eta_squared_score(X, labels)`: Eta-squared (η²), ratio of between-cluster variance to total variance (higher = more separated)
+
+**Binary Features:**
+- `entropy_score(X, labels)`: Shannon entropy within each cluster (lower = more consistent)
+- `cramers_v_score(X, labels)`: Cramér's V association between cluster membership and feature values (higher = more separated)
 
 ## Advanced Usage
 
