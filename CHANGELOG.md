@@ -1,4 +1,6 @@
 # Change Log
+* [2026.5.11] - Updated `eta_squared_score` with `method` parameter supporting `"trace"` (variance-weighted, Calinski-Harabasz style) and `"per_feature"` (equal-weighted) computation. Added input validation to `cv_score` with `checks` and `atol` parameters to flag non-positive values and near-zero means.
+* [2026.5.11] - Added support for NumPy 2.0 compatibility
 * [2026.3.1] - Added `kneighbors_classification_assignment_score`
 * [2026.2.27] - Optimized parallel Leiden execution by using a Pool initializer to share the graph once per worker process instead of pickling it with every task, reducing serialization overhead from n_iter to n_jobs times.
 * [2026.2.26] - Fixed `FaissKNNClassifier` and `FaissKNNTransformer` compatibility with sklearn ≥1.6. Replaced broken inheritance chain with composition + direct FAISS index access, avoiding __sklearn_tags__ MRO conflicts. All deslib parameters (algorithm, n_cells, n_probes, n_jobs) are now exposed and compatible with get_params/clone.
