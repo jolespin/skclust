@@ -19,7 +19,7 @@ from loguru import logger
 # from scipy.stats.contingency import association
 
 
-def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
+def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None, verbose=0):
     """
     Compute intra-cluster and inter-cluster cosine distance summaries
     for L2-normalized embeddings.
@@ -34,6 +34,8 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
         Verify that X_l2 is L2-normalized
     chunk_size : int or None, default None
         Row chunk size for inter-cluster matrix multiplications to limit peak memory.
+    verbose : int, default 0
+        If > 0, log warnings for singleton or empty clusters.
     
     Returns
     -------
@@ -49,7 +51,7 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
         raise TypeError("X_l2 is a DataFrame but labels is not a Series")
     if _labels_is_series and not _X_is_df:
         raise TypeError("labels is a Series but X_l2 is not a DataFrame")
-
+ 
     # Index alignment check for pandas inputs
     if _X_is_df and _labels_is_series:
         if not X_l2.index.equals(labels.index):
@@ -59,7 +61,7 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
                 f"with {len(X_l2.index.difference(labels.index))} in X_l2 only and "
                 f"{len(labels.index.difference(X_l2.index))} in labels only"
             )
-
+ 
     # Coerce to numpy
     if _X_is_df:
         X_l2 = X_l2.values
@@ -67,10 +69,10 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
         labels = labels.values
     X_l2 = np.asarray(X_l2, dtype=np.float32)
     labels = np.asarray(labels)
-
+ 
     assert X_l2.shape[0] == labels.shape[0], \
         f"X_l2 rows ({X_l2.shape[0]}) != labels length ({labels.shape[0]})"
-
+ 
     if check:
         norms = np.linalg.norm(X_l2, axis=1)
         if not np.allclose(norms, 1.0, atol=1e-5):
@@ -78,10 +80,10 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
                 f"X_l2 is not L2-normalized. "
                 f"Norm range: [{norms.min():.6f}, {norms.max():.6f}]"
             )
-
+ 
     metrics = ["n_pairs", "mean", "median", "std", "mad"]
     unique_labels = np.unique(labels)
-
+ 
     def _summarize(distances):
         return {
             "n_pairs": distances.size,
@@ -90,20 +92,21 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
             "std": np.std(distances, ddof=1),
             "mad": median_abs_deviation(distances),
         }
-
+ 
     results = dict()
-
+ 
     for id_cluster in unique_labels:
         mask = labels == id_cluster
         A = X_l2[mask]
         B = X_l2[~mask]
         n_cluster = A.shape[0]
-
+ 
         row = {("size", "n"): n_cluster}
-
+ 
         # --- Intracluster ---
         if n_cluster < 2:
-            logger.warning(f"Cluster '{id_cluster}' has {n_cluster} member(s); intra-cluster stats will be NaN")
+            if verbose > 0:
+                logger.warning(f"Cluster '{id_cluster}' has {n_cluster} member(s); intra-cluster stats will be NaN")
             for m in metrics:
                 row[("intra-cluster", m)] = np.nan
         else:
@@ -113,10 +116,11 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
             for m, v in _summarize(intra_distances).items():
                 row[("intra-cluster", m)] = v
             del D, intra_distances
-
+ 
         # --- Intercluster ---
         if B.shape[0] == 0:
-            logger.warning(f"Cluster '{id_cluster}' has no out-group points; inter-cluster stats will be NaN")
+            if verbose > 0:
+                logger.warning(f"Cluster '{id_cluster}' has no out-group points; inter-cluster stats will be NaN")
             for m in metrics:
                 row[("inter-cluster", m)] = np.nan
         elif chunk_size is not None:
@@ -133,13 +137,13 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None):
             for m, v in _summarize(inter_distances).items():
                 row[("inter-cluster", m)] = v
             del inter_distances
-
+ 
         results[id_cluster] = row
-
+ 
     df_results = pd.DataFrame.from_dict(results, orient="index")
     df_results.columns = pd.MultiIndex.from_tuples(df_results.columns)
     df_results.index.name = "id_cluster"
-
+ 
     return df_results
 
 # ============================================================================
