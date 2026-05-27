@@ -1,4 +1,5 @@
 # Change Log
+* [2026.5.27] - Added `skclust.metrics.clustered_cosine_distances` for computing intra-cluster and inter-cluster cosine distance summaries from L2-normalized embeddings. Returns per-cluster median, mean, std, MAD, and number of pairs as a MultiIndex DataFrame. Supports chunked matrix multiplication for large datasets via `chunk_size` parameter.
 * [2026.5.11] - Updated `eta_squared_score` with `method` parameter supporting `"trace"` (variance-weighted, Calinski-Harabasz style) and `"per_feature"` (equal-weighted) computation. Added input validation to `cv_score` with `checks` and `atol` parameters to flag non-positive values and near-zero means.
 * [2026.5.11] - Added support for NumPy 2.0 compatibility
 * [2026.3.1] - Added `kneighbors_classification_assignment_score`
