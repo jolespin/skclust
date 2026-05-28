@@ -19,7 +19,9 @@ from tqdm.auto import tqdm
 from loguru import logger
 # from scipy.stats.contingency import association
 
-
+# ============================================================================
+# DISTANCES
+# ============================================================================
 def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None, verbose=0):
     """
     Compute intra-cluster and inter-cluster cosine distance summaries
@@ -146,6 +148,8 @@ def clustered_cosine_distances(X_l2, labels, check=True, chunk_size=None, verbos
     df_results.index.name = "id_cluster"
 
     return df_results
+
+
 
 # ============================================================================
 # CONTINUOUS FEATURES

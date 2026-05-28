@@ -18,3 +18,4 @@ from . import hierarchical
 from . import neighbors
 from . import graph
 from . import metrics
+from . import distance
