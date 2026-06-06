@@ -1,4 +1,6 @@
 # Change Log
+* [2026.6.5] - Added `skbio` as a required dependency
+* [2026.6.5] - Removed `clustered_cosine_distances` and `clustered_jaccard_distances` in place of `skclust.distance.ClusteredDistances`, `pairwise_cosine_distances`, and `pairwise_jaccard_distances`
 * [2026.6.3] - Updated `clustered_cosine_distances` and added `clustered_jaccard_distances`
 * [2026.5.27] - Added `cosine_distances_to_representatives` to `skclust.distance` — computes cosine distances from each observation to its group's representative embeddings (e.g., core/union centroids). Supports multiple representative types per group, returns a `DataFrame` with one column per type. Includes `pandas/numpy` type concordance checks and index alignment validation consistent with `clustered_cosine_distances`.
 * [2026.5.27] - Added `skclust.metrics.clustered_cosine_distances` for computing intra-cluster and inter-cluster cosine distance summaries from L2-normalized embeddings. Returns per-cluster median, mean, std, MAD, and number of pairs as a MultiIndex DataFrame. Supports chunked matrix multiplication for large datasets via `chunk_size` parameter.
