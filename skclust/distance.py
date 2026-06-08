@@ -383,6 +383,7 @@ class ClusteredDistances:
         chunk_size: Optional[int] = None,
         verbose: int = 0,
         n_permutations: Optional[int] = None,
+        random_state: Optional[int] = None
     ):
         if metric not in self._VALID_METRICS:
             raise ValueError(
