@@ -1,4 +1,5 @@
 # Change Log
+* [2026.6.17] - Added `kneighbors_to_snn_graph` to `skclust.neighbors` to build Jaccard-weighted Shared Nearest Neighbor (SNN) graphs from KNN indices
 * [2026.6.17] - Fixed automatic index attribute storing when using `pd.DataFrame` on `KNeighborsCosineSimilarity`
 * [2026.6.5] - Added `skbio` as a required dependency
 * [2026.6.5] - Removed `clustered_cosine_distances` and `clustered_jaccard_distances` in place of `skclust.distance.ClusteredDistances`, `pairwise_cosine_distances`, and `pairwise_jaccard_distances`

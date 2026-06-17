@@ -162,6 +162,88 @@ def kneighbors_graph_from_transformer(
                 
     return knn_graph
 
+def kneighbors_to_snn_graph(indices, k=None, skip_self=True):
+    """
+    Build a Jaccard-weighted Shared Nearest Neighbor (SNN) graph from KNN indices.
+    
+    For each pair of connected nodes (i, j), computes the Jaccard similarity
+    of their K-nearest neighbor sets:
+    
+        J(i, j) = |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
+    
+    where N(i) and N(j) are the K-nearest neighbor sets of nodes i and j.
+    Since each node has exactly K neighbors, |N(i) ∪ N(j)| = 2K - |N(i) ∩ N(j)|.
+    
+    SNN reweighting amplifies edges between nodes that share many neighbors
+    (within-cluster) and suppresses edges between nodes with little neighborhood
+    overlap (between-cluster), producing a more informative graph for community
+    detection than raw distance or similarity weights.
+    
+    Parameters
+    ----------
+    indices : np.ndarray, shape (n_samples, K_max)
+        Neighbor indices, e.g. from KNeighborsCosineSimilarity.indices_
+    k : int or None, default=None
+        Number of neighbors to use. If None, uses all available neighbors.
+    skip_self : bool, default=True
+        If True, assumes column 0 contains self-indices and slicing starts at 1.
+        
+    Returns
+    -------
+    A_snn : scipy.sparse.csr_matrix, shape (n_samples, n_samples)
+        Symmetric Jaccard-weighted adjacency matrix. Edges exist for all pairs
+        where at least one node has the other in its K-nearest neighbors.
+        
+    Raises
+    ------
+    ValueError
+        If k exceeds the number of available neighbor columns.
+        
+    Notes
+    -----
+    The output graph is symmetrized via union: an edge (i, j) exists if i is 
+    in N(j) OR j is in N(i). This follows the convention used in PhenoGraph [2]_
+    and Seurat.
+    
+    References
+    ----------
+    .. [1] Jarvis, R.A. & Patrick, E.A. (1973). Clustering Using a Similarity 
+       Measure Based on Shared Near Neighbors. IEEE Transactions on Computers, 
+       C-22(11), 1025-1034. doi:10.1109/T-C.1973.223640
+       
+    .. [2] Levine, J.H. et al. (2015). Data-Driven Phenotypic Dissection of AML 
+       Reveals Progenitor-like Cells that Correlate with Prognosis. Cell, 162(1), 
+       184-197. doi:10.1016/j.cell.2015.05.047
+       
+    Examples
+    --------
+    >>> from skclust.neighbors import KNeighborsCosineSimilarity, kneighbors_to_snn_graph
+    >>> knn = KNeighborsCosineSimilarity(n_neighbors=100, backend="faiss")
+    >>> knn.fit(X)
+    >>> A_snn = kneighbors_to_snn_graph(knn.indices_, k=75)
+    """
+    offset = 1 if skip_self else 0
+    k_max = indices.shape[1] - offset
+
+    if k is None:
+        k = k_max
+    if k > k_max:
+        raise ValueError(f"k={k} exceeds available neighbors ({k_max})")
+
+    I = indices[:, offset:k + offset]
+    n = indices.shape[0]
+
+    rows = np.repeat(np.arange(n), k)
+    A = sps.csr_matrix((np.ones(len(rows)), (rows, I.ravel())), shape=(n, n))
+
+    intersection = A.dot(A.T)
+    A_sym = A.maximum(A.T)
+    r, c = A_sym.nonzero()
+    inter_vals = np.array(intersection[r, c]).ravel()
+    jaccard_vals = inter_vals / (k + k - inter_vals)
+
+    return sps.csr_matrix((jaccard_vals, (r, c)), shape=(n, n))
+
 
 def brute_force_kneighbors_graph_from_rectangular_distance(
     distance_matrix: np.ndarray, 
