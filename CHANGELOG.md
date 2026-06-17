@@ -1,4 +1,5 @@
 # Change Log
+* [2026.6.17] - Fixed automatic index attribute storing when using `pd.DataFrame` on `KNeighborsCosineSimilarity`
 * [2026.6.5] - Added `skbio` as a required dependency
 * [2026.6.5] - Removed `clustered_cosine_distances` and `clustered_jaccard_distances` in place of `skclust.distance.ClusteredDistances`, `pairwise_cosine_distances`, and `pairwise_jaccard_distances`
 * [2026.6.3] - Updated `clustered_cosine_distances` and added `clustered_jaccard_distances`

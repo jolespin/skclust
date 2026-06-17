@@ -763,11 +763,13 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
             L2-normalized training data.
         y : Ignored
         """
+        self.index_labels_ = None
+        if isinstance(X, pd.DataFrame):
+            self.index_labels_ = X.index
         X_arr, row_index = _to_numpy_with_index(X)
         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
 
-        if row_index is not None:
-            self.index_labels_ = row_index
+
 
         self.n_samples_fit_ = X_arr.shape[0]
         self.n_features_in_ = X_arr.shape[1]
