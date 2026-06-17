@@ -488,7 +488,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
             **self.leiden_kws
         }
         
-        if (self.partition_type is None or partition_type is RBConfigurationVertexPartition):
+        if hasattr(partition_type, 'resolution_parameter'):
             if 'resolution_parameter' not in self.leiden_kws:
                 leiden_kws_full['resolution_parameter'] = self.resolution_parameter
         
