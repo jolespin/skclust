@@ -3,6 +3,20 @@
 
 import numpy as np
 import pandas as pd
+from itertools import combinations
+from typing import (
+    Optional,
+    Union,
+)
+from loguru import logger
+from scipy.spatial.distance import squareform
+from scipy.stats import (
+    mannwhitneyu,
+    median_abs_deviation,
+)
+from skbio import DistanceMatrix
+from skbio.stats.distance import permanova
+from tqdm import tqdm
 
 def cosine_distances_to_representatives(
     X_l2,
@@ -150,3 +164,614 @@ def cosine_distances_to_representatives(
     df_distances.index.name = index_name
     
     return df_distances
+
+def pairwise_cosine_distances(X, check=True, redundant_form=True):
+    """
+    Cosine distances via matrix multiplication (assumes L2-normalized rows).
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame, shape (n, d)
+        L2-normalized embeddings.
+    check : bool, default True
+        Verify each row has unit L2 norm.
+    redundant_form : bool, default True
+        True -> (n, n) square matrix; False -> condensed upper triangle.
+
+    Returns
+    -------
+    np.ndarray or pd.DataFrame/pd.Series if X is a pd.DataFrame
+        - pd.DataFrame input, redundant_form=True  -> pd.DataFrame(index, columns=index)
+        - pd.DataFrame input, redundant_form=False -> pd.Series(index=frozenset pairs)
+        - np.ndarray input                         -> np.ndarray
+    """
+    index = None
+    if isinstance(X, pd.DataFrame):
+        index = X.index
+        X = X.values
+    X = np.asarray(X, dtype=np.float32)
+
+    if check:
+        norms = np.linalg.norm(X, axis=1)
+        if not np.allclose(norms, 1.0, atol=1e-5):
+            raise ValueError(
+                f"X is not L2-normalized (norm range "
+                f"[{norms.min():.6f}, {norms.max():.6f}]). Pass check=False to skip."
+            )
+
+    distances = np.clip(1.0 - X @ X.T, 0.0, 2.0)
+    np.fill_diagonal(distances, 0.0)
+
+    if redundant_form:
+        if index is not None:
+            return pd.DataFrame(distances, index=index, columns=index)
+        return distances
+    else:
+        condensed = squareform(distances, checks=False)
+        if index is not None:
+            pair_index = pd.Index(list(map(frozenset, combinations(index, 2))), name=index.name)
+            if pair_index.name is None:
+                pair_index.name = "cosine_distance"
+            return pd.Series(condensed, index=pair_index)
+        return condensed
+
+
+def pairwise_jaccard_distances(X, check=True, redundant_form=True):
+    """
+    Jaccard distances via matrix multiplication (assumes binary rows).
+
+    Jaccard distance = 1 - |A intersect B| / |A union B|, with the intersection
+    obtained as X @ X.T and the union from row sums. Two all-zero rows are
+    treated as identical (distance 0).
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame, shape (n, d)
+        Binary (0/1) presence-absence matrix.
+    check : bool, default True
+        Verify all values are 0 or 1.
+    redundant_form : bool, default True
+        True -> (n, n) square matrix; False -> condensed upper triangle.
+
+    Returns
+    -------
+    np.ndarray or pd.DataFrame/pd.Series if X is a pd.DataFrame
+        - pd.DataFrame input, redundant_form=True  -> pd.DataFrame(index, columns=index)
+        - pd.DataFrame input, redundant_form=False -> pd.Series(index=frozenset pairs)
+        - np.ndarray input                         -> np.ndarray
+    """
+    index = None
+    if isinstance(X, pd.DataFrame):
+        index = X.index
+        X = X.values
+    X = np.asarray(X)
+
+    if check and not np.isin(np.unique(X), (0, 1)).all():
+        raise ValueError("X is not binary (values must be 0 or 1). Pass check=False to skip.")
+
+    X = X.astype(np.float32)
+    intersection = X @ X.T
+    row_sums = X.sum(axis=1)
+    union = row_sums[:, None] + row_sums[None, :] - intersection
+    distances = np.where(union > 0, 1.0 - intersection / union, 0.0)
+    np.fill_diagonal(distances, 0.0)
+
+    if redundant_form:
+        if index is not None:
+            return pd.DataFrame(distances, index=index, columns=index)
+        return distances
+    else:
+        condensed = squareform(distances, checks=False)
+        if index is not None:
+            pair_index = pd.Index(list(map(frozenset, combinations(index, 2))), name=index.name)
+            if pair_index.name is None:
+                pair_index.name = "jaccard_distance"
+            return pd.Series(condensed, index=pair_index)
+        return condensed
+
+class ClusteredDistances:
+    """
+    Compute intra- and inter-cluster distance summaries with effect sizes
+    and optional PERMANOVA testing.
+
+    For each cluster, intra-cluster distances are the n*(n-1)/2 pairwise
+    distances among cluster members, and inter-cluster distances are the
+    n_cluster * n_other pairwise distances between members and non-members.
+    A rank-biserial correlation quantifies separation; PERMANOVA provides
+    a valid significance test.
+
+    Parameters
+    ----------
+    metric : str, default "cosine"
+        Distance metric: "cosine" (requires L2-normalized rows),
+        "jaccard" (requires binary 0/1 rows), or "precomputed"
+        (X is a square distance matrix). A square pd.DataFrame with
+        matching index and columns is auto-detected as precomputed.
+    check : bool, default True
+        Validate input (L2-norm for cosine, binary for jaccard,
+        symmetry for precomputed).
+    chunk_size : int or None, default None
+        Row chunk size for inter-cluster matrix multiplications to
+        limit peak memory. Only applies to cosine/jaccard metrics.
+    verbose : int, default 0
+        If > 0, log warnings for singleton or empty clusters.
+    n_permutations : int or None, default None
+        Number of PERMANOVA permutations. None skips PERMANOVA
+        entirely (and avoids computing the full N×N distance matrix
+        for cosine/jaccard). Setting this on large datasets will
+        force an O(N²) distance computation.
+    random_state : int or None, default None
+        Random state of PERMANOVA
+
+
+    Attributes
+    ----------
+    results_ : pd.DataFrame
+        MultiIndex columns with cluster size and intra/inter-cluster
+        summary statistics (n_pairs, mean, median, std, mad).
+        Index named ``id_cluster``.
+    effect_sizes_ : pd.Series
+        Rank-biserial correlation per cluster (index: id_cluster).
+    u_statistics_ : pd.Series
+        Mann-Whitney U statistic per cluster (index: id_cluster).
+    p_values_naive_ : pd.Series
+        Mann-Whitney U p-values per cluster. **These are invalid —
+        see Notes.** Stored for transparency; do not cite.
+    effect_size_method_ : str
+        Fixed: ``"rank_biserial"``.
+    permanova_ : pd.Series or None
+        Output of ``skbio.stats.distance.permanova``, or None if
+        ``n_permutations`` was not set.
+    labels_ : np.ndarray or pd.Series
+        Cluster labels as passed to ``fit``.
+    n_samples_ : int
+        Number of samples.
+    n_features_ : int or None
+        Number of features (None for precomputed).
+
+    Notes
+    -----
+    **Interpreting effect sizes vs. p-values**
+
+    The rank-biserial correlation (``.effect_sizes_``) is a valid
+    descriptive statistic. It is the probability that a randomly chosen
+    within-cluster pair is closer than a randomly chosen between-cluster
+    pair, computed deterministically from the observed distances. It
+    assumes nothing about independence.
+
+    The Mann-Whitney U p-value (``.p_values_naive_``), however, is
+    **not valid** and should not be used for inference. The test is run
+    on pairwise distances, which are not independent observations: each
+    sample appears in (n − 1) pairs, so the effective sample size is the
+    number of points, not the number of pairs. Mann-Whitney's variance
+    formula assumes independent observations, treats the inflated pair
+    count as real information, understates the standard error, and
+    produces anti-conservative p-values that typically underflow to ≈ 0
+    regardless of effect magnitude. Pair count, not effect strength,
+    drives the result.
+
+    These are two distinct failure modes with a single root cause.
+    Non-independence breaks the p-value; it does not affect the effect
+    size. That asymmetry is the key point.
+
+    **PERMANOVA**
+
+    For a valid significance test of group structure in the embedding
+    space, use the PERMANOVA result (``.permanova_``). PERMANOVA
+    permutes group labels across points (the correct observational
+    unit) and is unaffected by the non-independence of pairwise
+    distances. Note that PERMANOVA tests centroid separation, which
+    is a related but distinct contrast from the rank-biserial, and
+    is sensitive to dispersion differences in unbalanced designs.
+    It should not be interpreted as a drop-in p-value for the
+    rank-biserial correlation.
+
+    **Confounding**
+
+    Neither the effect size nor PERMANOVA separates ecological or
+    functional distinctness from phylogenetic clustering, since group
+    labels often track clades. Both statistics quantify embedding-space
+    separation, not its cause.
+    """
+
+    _VALID_METRICS = {"cosine", "jaccard", "precomputed"}
+
+    def __init__(
+        self,
+        metric: str = "cosine",
+        check: bool = True,
+        chunk_size: Optional[int] = None,
+        verbose: int = 0,
+        n_permutations: Optional[int] = None,
+        random_state: Optional[int] = None
+    ):
+        if metric not in self._VALID_METRICS:
+            raise ValueError(
+                f"metric must be one of {sorted(self._VALID_METRICS)}, "
+                f"got '{metric}'"
+            )
+        self.metric = metric
+        self.check = check
+        self.chunk_size = chunk_size
+        self.verbose = verbose
+        self.n_permutations = n_permutations
+        self.random_state = random_state
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _summarize(distances: np.ndarray) -> dict:
+        return {
+            "n_pairs": distances.size,
+            "mean": np.mean(distances),
+            "median": np.median(distances),
+            "std": np.std(distances, ddof=1),
+            "mad": median_abs_deviation(distances),
+        }
+
+    def _compute_intra(
+        self,
+        X: np.ndarray,
+        mask: np.ndarray,
+        metric: str,
+        id_cluster,
+    ) -> Optional[np.ndarray]:
+        """Return condensed intra-cluster distances, or None for singletons."""
+        n = mask.sum()
+        if n < 2:
+            if self.verbose > 0:
+                logger.warning(
+                    f"Cluster '{id_cluster}' has {n} member(s); "
+                    f"intra-cluster stats will be NaN"
+                )
+            return None
+
+        if metric == "precomputed":
+            D = X[np.ix_(mask, mask)].copy()
+            np.fill_diagonal(D, 0.0)
+            return squareform(D, checks=False)
+
+        A = X[mask]
+
+        if metric == "cosine":
+            D = np.clip(1.0 - A @ A.T, 0.0, 2.0)
+            np.fill_diagonal(D, 0.0)
+            return squareform(D, checks=False)
+
+        # jaccard
+        row_sums = A.sum(axis=1)
+        intersection = A @ A.T
+        union = row_sums[:, None] + row_sums[None, :] - intersection
+        with np.errstate(divide="ignore", invalid="ignore"):
+            D = np.where(union > 0, 1.0 - intersection / union, 0.0)
+        np.fill_diagonal(D, 0.0)
+        return squareform(D, checks=False)
+
+    def _compute_inter(
+        self,
+        X: np.ndarray,
+        mask: np.ndarray,
+        metric: str,
+        id_cluster,
+    ) -> Optional[np.ndarray]:
+        """Return flattened inter-cluster distances, or None if no out-group."""
+        if metric == "precomputed":
+            sub = X[np.ix_(mask, ~mask)]
+            if sub.shape[1] == 0:
+                if self.verbose > 0:
+                    logger.warning(
+                        f"Cluster '{id_cluster}' has no out-group points; "
+                        f"inter-cluster stats will be NaN"
+                    )
+                return None
+            return sub.ravel()
+
+        A = X[mask]
+        B = X[~mask]
+
+        if B.shape[0] == 0:
+            if self.verbose > 0:
+                logger.warning(
+                    f"Cluster '{id_cluster}' has no out-group points; "
+                    f"inter-cluster stats will be NaN"
+                )
+            return None
+
+        if metric == "cosine":
+            if self.chunk_size is not None:
+                chunks = [
+                    np.clip(1.0 - A[i : i + self.chunk_size] @ B.T, 0.0, 2.0).ravel()
+                    for i in range(0, A.shape[0], self.chunk_size)
+                ]
+                return np.concatenate(chunks)
+            return np.clip(1.0 - A @ B.T, 0.0, 2.0).ravel()
+
+        # jaccard
+        row_sums_A = A.sum(axis=1)
+        row_sums_B = B.sum(axis=1)
+
+        if self.chunk_size is not None:
+            chunks = []
+            for i in range(0, A.shape[0], self.chunk_size):
+                A_chunk = A[i : i + self.chunk_size]
+                intersection = A_chunk @ B.T
+                union = (
+                    row_sums_A[i : i + self.chunk_size, None]
+                    + row_sums_B[None, :]
+                    - intersection
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    d = np.where(union > 0, 1.0 - intersection / union, 0.0)
+                chunks.append(d.ravel())
+            return np.concatenate(chunks)
+
+        intersection = A @ B.T
+        union = row_sums_A[:, None] + row_sums_B[None, :] - intersection
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(union > 0, 1.0 - intersection / union, 0.0).ravel()
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_cosine(X: np.ndarray):
+        norms = np.linalg.norm(X, axis=1)
+        if not np.allclose(norms, 1.0, atol=1e-5):
+            raise ValueError(
+                f"X is not L2-normalized (norm range "
+                f"[{norms.min():.6f}, {norms.max():.6f}]). "
+                f"Pass check=False to skip."
+            )
+
+    @staticmethod
+    def _validate_jaccard(X: np.ndarray):
+        if X.dtype.kind == "b":
+            return
+        xmin, xmax = float(X.min()), float(X.max())
+        if xmin < 0 or xmax > 1:
+            raise ValueError(
+                f"X must be binary (0/1 or bool). "
+                f"Value range: [{xmin}, {xmax}]"
+            )
+        if not np.array_equal(X, X.astype(bool)):
+            raise ValueError(
+                "X must be binary (0/1 or bool). Found non-integer values."
+            )
+
+    @staticmethod
+    def _validate_precomputed(X: np.ndarray):
+        if X.shape[0] != X.shape[1]:
+            raise ValueError(
+                f"metric='precomputed' but X is not square: "
+                f"shape {X.shape}"
+            )
+        if not np.allclose(X, X.T, atol=1e-5):
+            raise ValueError(
+                "metric='precomputed' but X is not symmetric."
+            )
+
+    # ------------------------------------------------------------------
+    # fit / fit_transform
+    # ------------------------------------------------------------------
+    def fit(
+        self,
+        X: Union[np.ndarray, pd.DataFrame],
+        labels: Union[np.ndarray, pd.Series],
+    ) -> "ClusteredDistances":
+        """
+        Compute cluster distance summaries and effect sizes.
+
+        Parameters
+        ----------
+        X : np.ndarray or pd.DataFrame, shape (n, d) or (n, n)
+            Data matrix or precomputed distance matrix.
+        labels : np.ndarray or pd.Series, shape (n,)
+            Cluster labels aligned with rows of X.
+
+        Returns
+        -------
+        self
+        """
+        # -- Type concordance --
+        _X_is_df = isinstance(X, pd.DataFrame)
+        _labels_is_series = isinstance(labels, pd.Series)
+        if _X_is_df and not _labels_is_series:
+            raise TypeError("X is a DataFrame but labels is not a Series")
+        if _labels_is_series and not _X_is_df:
+            raise TypeError("labels is a Series but X is not a DataFrame")
+
+        # -- Resolve metric (auto-detect precomputed) --
+        metric = self.metric
+        if (
+            _X_is_df
+            and X.shape[0] == X.shape[1]
+            and X.index.equals(X.columns)
+        ):
+            if metric != "precomputed":
+                logger.info(
+                    f"X is a square DataFrame with matching index/columns; "
+                    f"overriding metric='{metric}' → 'precomputed'"
+                )
+                metric = "precomputed"
+
+        # -- Index alignment --
+        index = None
+        if _X_is_df and _labels_is_series:
+            if not X.index.equals(labels.index):
+                raise ValueError(
+                    f"X.index and labels.index do not match. "
+                    f"X has {len(X.index)} entries, labels has "
+                    f"{len(labels.index)} entries, with "
+                    f"{len(X.index.difference(labels.index))} in X only and "
+                    f"{len(labels.index.difference(X.index))} in labels only."
+                )
+            index = X.index
+
+        # -- Store metadata --
+        self.n_samples_ = X.shape[0]
+        self.n_features_ = X.shape[1] if metric != "precomputed" else None
+        self.labels_ = labels
+
+        # -- Coerce to numpy --
+        X_values = X.values if _X_is_df else np.asarray(X)
+        labels_values = labels.values if _labels_is_series else np.asarray(labels)
+
+        assert X_values.shape[0] == labels_values.shape[0], (
+            f"X rows ({X_values.shape[0]}) != "
+            f"labels length ({labels_values.shape[0]})"
+        )
+
+        # -- Validate --
+        if self.check:
+            if metric == "cosine":
+                self._validate_cosine(X_values)
+            elif metric == "jaccard":
+                self._validate_jaccard(X_values)
+            elif metric == "precomputed":
+                self._validate_precomputed(X_values)
+
+        # -- Cast for matmul --
+        X_values = X_values.astype(np.float32)
+
+        # -- Per-cluster loop --
+        _summary_metrics = ["n_pairs", "mean", "median", "std", "mad"]
+        unique_labels = np.unique(labels_values)
+
+        results = {}
+        effect_sizes = {}
+        u_statistics = {}
+        p_values_naive = {}
+
+        for id_cluster in tqdm(unique_labels, desc="Clusters", unit="cluster"):
+            mask = labels_values == id_cluster
+            n_cluster = int(mask.sum())
+
+            row = {("size", "n"): n_cluster}
+
+            # Intra-cluster
+            intra_dists = self._compute_intra(X_values, mask, metric, id_cluster)
+            if intra_dists is None:
+                for m in _summary_metrics:
+                    row[("intra-cluster", m)] = np.nan
+            else:
+                for m, v in self._summarize(intra_dists).items():
+                    row[("intra-cluster", m)] = v
+
+            # Inter-cluster
+            inter_dists = self._compute_inter(X_values, mask, metric, id_cluster)
+            if inter_dists is None:
+                for m in _summary_metrics:
+                    row[("inter-cluster", m)] = np.nan
+            else:
+                for m, v in self._summarize(inter_dists).items():
+                    row[("inter-cluster", m)] = v
+
+            # Mann-Whitney U + rank-biserial
+            if intra_dists is not None and inter_dists is not None:
+                stat, pval = mannwhitneyu(
+                    intra_dists, inter_dists, alternative="two-sided",
+                )
+                es = 1.0 - (2.0 * stat) / (intra_dists.size * inter_dists.size)
+                effect_sizes[id_cluster] = es
+                u_statistics[id_cluster] = stat
+                p_values_naive[id_cluster] = pval
+            else:
+                effect_sizes[id_cluster] = np.nan
+                u_statistics[id_cluster] = np.nan
+                p_values_naive[id_cluster] = np.nan
+
+            del intra_dists, inter_dists
+            results[id_cluster] = row
+
+        # -- Assemble results DataFrame --
+        df_results = pd.DataFrame.from_dict(results, orient="index")
+        df_results.columns = pd.MultiIndex.from_tuples(df_results.columns)
+        df_results.index.name = "id_cluster"
+
+        col_order = (
+            [("size", "n")]
+            + [("intra-cluster", m) for m in _summary_metrics]
+            + [("inter-cluster", m) for m in _summary_metrics]
+        )
+        self.results_ = df_results[col_order]
+
+        # -- Store test attributes --
+        self.effect_sizes_ = pd.Series(
+            effect_sizes, name="effect_size",
+        )
+        self.effect_sizes_.index.name = "id_cluster"
+
+        self.u_statistics_ = pd.Series(
+            u_statistics, name="u_statistic",
+        )
+        self.u_statistics_.index.name = "id_cluster"
+
+        self.p_values_naive_ = pd.Series(
+            p_values_naive, name="p_value_naive",
+        )
+        self.p_values_naive_.index.name = "id_cluster"
+
+        self.effect_size_method_ = "rank_biserial"
+
+        # -- PERMANOVA --
+        if self.n_permutations is not None:
+            ids = list(index) if index is not None else list(range(self.n_samples_))
+
+            if metric == "precomputed":
+                dm = DistanceMatrix(X_values, ids=ids)
+            elif metric == "cosine":
+                full_dm = pairwise_cosine_distances(
+                    X_values, check=False, redundant_form=True,
+                )
+                dm = DistanceMatrix(full_dm, ids=ids)
+                del full_dm
+            elif metric == "jaccard":
+                full_dm = pairwise_jaccard_distances(
+                    X_values, check=False, redundant_form=True,
+                )
+                dm = DistanceMatrix(full_dm, ids=ids)
+                del full_dm
+
+            grouping = pd.Series(labels_values, index=ids, name="group")
+            self.permanova_ = permanova(
+                dm, grouping, permutations=self.n_permutations,seed=self.random_state,
+            )
+            self.p_value_ = self.permanova_["p-value"]
+            del dm
+        else:
+            self.permanova_ = None
+
+        # -- Runtime caveat --
+        logger.warning(
+            "Effect sizes (rank-biserial correlation) are valid descriptive "
+            "statistics. Mann-Whitney U p-values (.p_values_naive_) are "
+            "anti-conservative due to non-independence of pairwise distances "
+            "— pair count, not effect strength, drives the result. "
+            "For valid significance testing of group structure, use "
+            "PERMANOVA (.permanova_). See class docstring for details."
+        )
+
+        return self
+
+    def fit_transform(
+        self,
+        X: Union[np.ndarray, pd.DataFrame],
+        labels: Union[np.ndarray, pd.Series],
+    ) -> pd.DataFrame:
+        """
+        Fit and return the cluster summary table.
+
+        Parameters
+        ----------
+        X : np.ndarray or pd.DataFrame
+            Data matrix or precomputed distance matrix.
+        labels : np.ndarray or pd.Series
+            Cluster labels.
+
+        Returns
+        -------
+        pd.DataFrame
+            Same as ``self.results_``.
+        """
+        return self.fit(X, labels).results_

@@ -1,405 +1,309 @@
 # -*- coding: utf-8 -*-
 # skclust/graph.py
 
+import inspect
+from typing import Optional
+from multiprocessing import cpu_count
+
 import numpy as np
 import pandas as pd
 import igraph as ig
 import scipy.sparse as sp
-from itertools import combinations
-from typing import Optional
-from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
-from multiprocessing import cpu_count
+from sklearn.base import BaseEstimator, ClusterMixin
 from tqdm.auto import tqdm
 from loguru import logger
 
 
-def leiden_stability(consensus_ratio: pd.Series) -> pd.Series:
-    """
-    Compute consensus stability metrics from edge consensus ratios.
-    
-    Parameters
-    ----------
-    consensus_ratio : pd.Series
-        Consensus ratio for each edge (fraction of iterations with co-clustering)
-    
-    Returns
-    -------
-    pd.Series
-        Stability metrics with entries:
-        - consensus_ratio_before_filter: Mean consensus ratio across all edges
-        - consensus_std_before_filter: Standard deviation of consensus ratio
-        - pct_100: Percentage of edges with 100% consensus
-        - pct_90plus: Percentage of edges with ≥90% consensus
-        - pct_80plus: Percentage of edges with ≥80% consensus
-        - pct_70plus: Percentage of edges with ≥70% consensus
-        - pct_60plus: Percentage of edges with ≥60% consensus
-        - pct_below_50: Percentage of edges with <50% consensus
-    """
-    values = consensus_ratio.values
-    
-    return pd.Series({
-        'consensus_ratio_before_filter': values.mean(),
-        'consensus_std_before_filter': values.std(),
-        'pct_100': (values == 1.0).mean() * 100,
-        'pct_90plus': (values >= 0.9).mean() * 100,
-        'pct_80plus': (values >= 0.8).mean() * 100,
-        'pct_70plus': (values >= 0.7).mean() * 100,
-        'pct_60plus': (values >= 0.6).mean() * 100,
-        'pct_below_50': (values < 0.5).mean() * 100,
-    }, name="Stability")
-
-
-def cluster_membership_cooccurrence(
-    df: pd.DataFrame,
-    edge_list: Optional[list] = None,
-    edge_type: str = "Edge",
-    iteration_type: str = "Iteration"
-) -> pd.DataFrame:
-    """
-    Compute pairwise cluster membership co-occurrence across iterations.
-    
-    OPTIMIZED: If edge_list provided, only computes for actual graph edges
-    instead of all possible node pairs.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame where rows are nodes and columns are iterations.
-    edge_list : list of frozenset, optional
-        Only compute co-occurrence for these edges. If None, computes for all pairs.
-    edge_type : str, default="Edge"
-        Name for the index of the output DataFrame (node pairs)
-    iteration_type : str, default="Iteration"
-        Name for the columns of the output DataFrame (iterations)
-    
-    Returns
-    -------
-    pd.DataFrame
-        Boolean DataFrame with co-occurrence for each edge/pair.
-    """
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError(f"Expected pd.DataFrame, got {type(df)}")
-    
-    if df.empty:
-        raise ValueError("Input DataFrame is empty")
-    
-    X = df.values
-    nodes = df.index.values
-    iterations = df.columns
-    n_nodes = len(nodes)
-    n_iterations = len(iterations)
-    
-    # Create node name to index mapping
-    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
-    
-    if edge_list is not None:
-        # OPTIMIZED PATH: Only compute for specified edges
-        result = np.empty((len(edge_list), n_iterations), dtype=bool)
-        
-        # Convert edges to index pairs
-        edge_idx_pairs = []
-        valid_edges = []
-        
-        for edge in edge_list:
-            edge_nodes = list(edge)
-            if len(edge_nodes) != 2:
-                continue
-            
-            node_a, node_b = edge_nodes
-            if node_a in node_to_idx and node_b in node_to_idx:
-                idx_a = node_to_idx[node_a]
-                idx_b = node_to_idx[node_b]
-                edge_idx_pairs.append((idx_a, idx_b))
-                valid_edges.append(edge)
-        
-        edge_idx_pairs = np.array(edge_idx_pairs, dtype=np.int32)
-        
-        # Vectorized comparison for only these edges
-        for i in range(n_iterations):
-            col = X[:, i]
-            result[:len(valid_edges), i] = col[edge_idx_pairs[:, 0]] == col[edge_idx_pairs[:, 1]]
-        
-        return pd.DataFrame(
-            data=result[:len(valid_edges)],
-            index=pd.Index(valid_edges, name=edge_type),
-            columns=pd.Index(iterations, name=iteration_type),
-        )
-    
-    else:
-        # ORIGINAL PATH: Compute for all possible pairs
-        n_pairs = (n_nodes * (n_nodes - 1)) // 2
-        result = np.empty((n_pairs, n_iterations), dtype=bool)
-        
-        pairs = np.array(list(combinations(range(n_nodes), 2)), dtype=np.int32)
-        
-        for i in range(n_iterations):
-            col = X[:, i]
-            result[:, i] = col[pairs[:, 0]] == col[pairs[:, 1]]
-        
-        edge_labels = [frozenset([nodes[i], nodes[j]]) for i, j in pairs]
-        
-        return pd.DataFrame(
-            data=result,
-            index=pd.Index(edge_labels, name=edge_type),
-            columns=pd.Index(iterations, name=iteration_type),
-        )
-
-
+# ============================================================================
+# Leiden workers (module level for multiprocessing pickling)
+# ============================================================================
 def _leiden_worker(args):
     """
-    Worker function for sequential Leiden execution.
-    
-    Must be at module level for pickling (multiprocessing requirement).
-    Receives all arguments as tuple for self-contained execution.
+    Sequential Leiden worker. All arguments bundled for self-contained execution.
+
+    Returns the vertex-ordered membership array (membership[i] = community of
+    vertex i), which aligns with igraph vertex ids.
     """
-    graph, weight, random_seed, leiden_kws_full, nodes_list = args
-    
+    graph, weight, random_seed, leiden_kws_full = args
+
     try:
         from leidenalg import find_partition
     except ModuleNotFoundError:
         raise ImportError("Install leidenalg: pip install leidenalg")
-    
-    # Run Leiden
+
     partition = find_partition(
-        graph, 
+        graph,
         weights=weight,
         seed=random_seed,
-        **leiden_kws_full
+        **leiden_kws_full,
     )
-    
-    # Convert to node->partition mapping
-    node_to_partition = {}
-    for partition_id, node_indices in enumerate(partition):
-        for idx in node_indices:
-            node_to_partition[nodes_list[idx]] = partition_id
-            
-    return node_to_partition
+    return np.asarray(partition.membership)
 
 
-def _leiden_pool_init(graph, weight, leiden_kws_full, nodes_list):
+def _leiden_pool_init(graph, weight, leiden_kws_full):
     """
-    Pool initializer that stores shared data as process-level globals.
-    
-    Called once per worker process, avoiding redundant pickling of the
-    graph for every iteration. For a 300K-node graph with n_iter=100
-    and n_jobs=4, this reduces graph serialization from 100x to 4x.
+    Pool initializer storing shared data as process-level globals.
+
+    Called once per worker, so the graph is pickled once per process instead
+    of once per iteration.
     """
-    global _LEIDEN_GRAPH, _LEIDEN_WEIGHT, _LEIDEN_KWS, _LEIDEN_NODES
+    global _LEIDEN_GRAPH, _LEIDEN_WEIGHT, _LEIDEN_KWS
     _LEIDEN_GRAPH = graph
     _LEIDEN_WEIGHT = weight
     _LEIDEN_KWS = leiden_kws_full
-    _LEIDEN_NODES = nodes_list
 
 
 def _leiden_worker_parallel(random_seed):
-    """
-    Worker function for parallel Leiden execution.
-    
-    Reads graph and parameters from process-level globals set by
-    _leiden_pool_init. Only the random seed is passed per task.
-    """
+    """Parallel Leiden worker. Reads graph/params from globals; only seed varies."""
     try:
         from leidenalg import find_partition
     except ModuleNotFoundError:
         raise ImportError("Install leidenalg: pip install leidenalg")
-    
+
     partition = find_partition(
         _LEIDEN_GRAPH,
         weights=_LEIDEN_WEIGHT,
         seed=random_seed,
-        **_LEIDEN_KWS
+        **_LEIDEN_KWS,
     )
-    
-    node_to_partition = {}
-    for partition_id, node_indices in enumerate(partition):
-        for idx in node_indices:
-            node_to_partition[_LEIDEN_NODES[idx]] = partition_id
-            
-    return node_to_partition
+    return np.asarray(partition.membership)
 
 
-def _compute_modularity(graph, labels, weight=None):
+# ============================================================================
+# Consensus + quality helpers
+# ============================================================================
+def _compute_consensus(
+    partitions_by_iter: np.ndarray,
+    edgelist: np.ndarray,
+    n_iter: int,
+    store_disagreement_matrix: bool = False,
+):
     """
-    Compute modularity for a graph given cluster labels.
-    
-    Nodes present in the graph but absent from labels (or NaN) are 
-    each assigned a unique singleton cluster ID.
-    
+    One-pass edge consensus from per-iteration memberships.
+
     Parameters
     ----------
-    graph : ig.Graph
-        Graph with named vertices
-    labels : pd.Series
-        Cluster labels indexed by node name
-    weight : str or None
-        Edge weight attribute name
-        
+    partitions_by_iter : np.ndarray
+        Shape (n_iter, n_nodes). Row i is the membership for iteration i,
+        indexed by igraph vertex id.
+    edgelist : np.ndarray
+        Shape (n_edges, 2). Vertex-id endpoints for each edge, in edge-id order.
+    n_iter : int
+        Number of iterations.
+    store_disagreement_matrix : bool
+        If True, also build the edge x iteration disagreement matrix as a scipy
+        CSR (True where the endpoints land in different clusters). Built directly
+        from the disagreements, so it is genuinely sparse for high-consensus data.
+
     Returns
     -------
-    float
-        Modularity score
+    n_agree : np.ndarray
+        Shape (n_edges,). Number of iterations in which each edge co-clustered.
+    disagreement_matrix : scipy.sparse.csr_matrix or None
+        Boolean (n_edges x n_iter) disagreement matrix, or None.
+
+    Notes
+    -----
+    The loop is over iterations on purpose. Comparing all iterations at once
+    (partitions_by_iter[:, a] == partitions_by_iter[:, b]) would materialise an
+    (n_iter x n_edges) boolean array. The loop keeps peak memory at O(n_edges).
     """
-    unique_labels = labels.dropna().unique()
-    label_to_int = {label: i for i, label in enumerate(sorted(unique_labels))}
+    idx_a = edgelist[:, 0]
+    idx_b = edgelist[:, 1]
+    n_edges = edgelist.shape[0]
+
+    n_agree = np.zeros(n_edges, dtype=np.int32)
+
+    rows = []
+    cols = []
+    for i in range(n_iter):
+        membership_i = partitions_by_iter[i]  # contiguous (n_nodes,)
+        same = membership_i[idx_a] == membership_i[idx_b]
+        n_agree += same
+        if store_disagreement_matrix:
+            nz = np.flatnonzero(~same)
+            rows.append(nz)
+            cols.append(np.full(nz.shape, i, dtype=np.int32))
+
+    disagreement_matrix = None
+    if store_disagreement_matrix:
+        if rows:
+            row_idx = np.concatenate(rows)
+            col_idx = np.concatenate(cols)
+            data = np.ones(row_idx.shape, dtype=bool)
+        else:
+            row_idx = np.array([], dtype=np.int32)
+            col_idx = np.array([], dtype=np.int32)
+            data = np.array([], dtype=bool)
+        disagreement_matrix = sp.csr_matrix(
+            (data, (row_idx, col_idx)),
+            shape=(n_edges, n_iter),
+        )
+
+    return n_agree, disagreement_matrix
+
+
+def _compute_quality(graph, labels, partition_type, resolution_parameter, weight=None):
+    """
+    Quality of a partition under its own objective function.
+
+    Builds a leidenalg partition of `partition_type` from `labels` (without
+    re-optimising) and returns `.quality()`. Whatever objective the chosen type
+    implements (modularity, CPM, significance, surprise, ...) is what is
+    reported. Vertices missing from `labels` are each placed in a singleton.
+
+    `resolution_parameter` and `weight` are only passed to partition types whose
+    constructor accepts them, so any leidenalg partition type works unchanged.
+    """
+    node_to_label = labels.dropna().to_dict()
+    unique_labels = sorted(set(node_to_label.values()))
+    label_to_int = {label: i for i, label in enumerate(unique_labels)}
     next_id = len(unique_labels)
-    
+
     membership = []
     for v in graph.vs:
-        name = v['name']
-        label = labels.get(name)
-        if pd.notna(label) and label in label_to_int:
-            membership.append(label_to_int[label])
-        else:
+        label = node_to_label.get(v["name"])
+        if label is None:
             membership.append(next_id)
             next_id += 1
-    
-    return graph.modularity(membership, weights=weight)
+        else:
+            membership.append(label_to_int[label])
+
+    sig_params = inspect.signature(partition_type).parameters
+    partition_kws = {"initial_membership": membership}
+    if "resolution_parameter" in sig_params:
+        partition_kws["resolution_parameter"] = resolution_parameter
+    if weight is not None and "weights" in sig_params:
+        partition_kws["weights"] = weight
+
+    return partition_type(graph, **partition_kws).quality()
 
 
-class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
+def _pielou_evenness(sizes: np.ndarray) -> float:
     """
-    Sklearn-compatible transformer for consensus Leiden clustering.
-    
-    Runs multiple iterations of Leiden with different random seeds in parallel,
-    computes edge consensus ratios, and builds a consensus graph from edges 
-    meeting the consensus threshold. Final cluster labels are determined by 
-    connected components in the consensus graph, optionally filtered by 
-    minimum cluster size.
-    
+    Pielou's evenness J = H / ln(S) for a cluster-size distribution.
+
+    H is the Shannon entropy of the size proportions and S the number of
+    clusters. J is 1.0 when all clusters are equal in size and approaches 0 as
+    one cluster dominates. Undefined (NaN) for fewer than two clusters.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    n_clusters = sizes.shape[0]
+    if n_clusters < 2:
+        return float("nan")
+    proportions = sizes / sizes.sum()
+    entropy = -(proportions * np.log(proportions)).sum()
+    return float(entropy / np.log(n_clusters))
+
+
+# ============================================================================
+# Consensus Leiden clustering
+# ============================================================================
+class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
+    """
+    Consensus Leiden clustering with unanimous edge agreement.
+
+    Runs `n_iter` Leiden partitions with different random seeds, then keeps only
+    edges that co-cluster in *every* iteration (unanimous consensus). Final
+    clusters are the connected components of the unanimous-edge graph, optionally
+    filtered by `minimum_cluster_size`.
+
+    Unanimous agreement (rather than a tunable threshold) is deliberate: the
+    "all iterations agree" relation is an equivalence relation, so its components
+    are exactly the cliques of fully-agreeing nodes. Any threshold below 1.0
+    would break transitivity and degrade into single-linkage clustering on the
+    co-association matrix, so no threshold parameter is exposed. The full
+    distribution is still available in `consensus_ratio_` for inspection.
+
     Parameters
     ----------
-    n_iter : int, default=100
-        Number of Leiden iterations with different random seeds
+    n_iter : int, default=10
+        Number of Leiden iterations (random seeds). Lower values make unanimity
+        easier to reach, i.e. a weaker consensus filter.
     weight : str or None, default=None
-        Edge weight attribute name in graph. If None, unweighted clustering is used.
+        Edge weight attribute name. None => unweighted.
     random_state : int, default=0
-        Base random seed (actual seeds: random_state to random_state + n_iter - 1)
+        Seeds are random_state .. random_state + n_iter - 1.
     partition_type : leidenalg partition class, default=None
-        Leiden partition type to use. If None, uses RBConfigurationVertexPartition
-        with resolution_parameter=1.0 (equivalent to modularity).
-        Common options:
-        - RBConfigurationVertexPartition: Reichardt-Bornholdt quality (recommended)
-        - ModularityVertexPartition: Classic modularity optimization
-        - CPMVertexPartition: Constant Potts Model for weighted graphs
-        - SignificanceVertexPartition: Statistical significance-based
+        None => RBConfigurationVertexPartition. Any leidenalg partition type is
+        supported (e.g. CPMVertexPartition, ModularityVertexPartition).
     resolution_parameter : float, default=1.0
-        Resolution parameter for RBConfigurationVertexPartition.
-        Only used if partition_type is None or RBConfigurationVertexPartition.
-        - 1.0: Standard modularity
-        - >1.0: Smaller, more clusters
-        - <1.0: Larger, fewer clusters
+        Passed through to any partition type whose constructor accepts it
+        (RBConfiguration, CPM, ...). Ignored by types that do not (Modularity,
+        Significance, Surprise).
     n_iterations : int, default=-1
-        Number of iterations for Leiden convergence (-1 for auto convergence)
-    consensus_threshold : float, default=1.0
-        Minimum consensus ratio (0.0-1.0) for edges to include in the
-        consensus graph. 1.0 means only edges with 100% co-clustering
-        across all iterations are retained.
+        Leiden internal convergence iterations (-1 => until convergence).
     minimum_cluster_size : int, default=1
-        Minimum number of nodes for a cluster to be retained.
-        Clusters smaller than this are removed from labels_ and 
-        their nodes are excluded from filtered_graph_.
+        Clusters smaller than this are dropped from `labels_`.
     cluster_prefix : str, default="leiden_"
-        Prefix for cluster labels (e.g., "leiden_1", "leiden_2", ...)
+        Cluster label prefix (clusters numbered largest-first).
     n_jobs : int, default=1
-        Number of parallel processes. 
-        - 1: Sequential execution (no multiprocessing)
-        - -1: Use all available CPUs
-        - >1: Use specific number of processes
+        1 => sequential; -1 => all CPUs; >1 => that many processes.
     verbose : int, default=0
-        Verbosity level (sklearn-style):
-        - 0: Silent
-        - 1: Progress bars only (tqdm)
-        - 2: Stage information (loguru INFO)
-        - 3: Detailed timing (loguru DEBUG)
+        0 silent, 1 progress bars, 2 stage summary, 3 detailed timing.
+    store_disagreement_matrix : bool, default=False
+        If True, build and retain the edge x iteration disagreement matrix
+        (CSR; True where the endpoints land in different clusters). Access via
+        get_disagreement_matrix(). For high-consensus data this is mostly False,
+        so CSR is genuinely sparse.
     leiden_kws : dict, optional
-        Additional keyword arguments passed to leidenalg.find_partition.
-        Note: resolution_parameter should be set via the resolution_parameter
-        parameter rather than leiden_kws for proper sklearn compatibility.
-        
+        Extra kwargs forwarded to leidenalg.find_partition. Set
+        resolution_parameter via the parameter above, not here.
+
     Attributes
     ----------
     partitions_ : pd.DataFrame
-        Node assignments for each iteration (shape: n_nodes x n_iter)
-    membership_matrix_ : scipy.sparse.csr_matrix
-        Boolean sparse matrix of edge co-membership across iterations 
-        (shape: n_edges x n_iter). Use get_membership_matrix() for 
-        labeled DataFrame access.
-    consensus_edges_ : pd.Index
-        Index of frozenset edge pairs meeting the consensus_threshold
+        Per-iteration cluster ids (n_nodes x n_iter), int32.
     consensus_ratio_ : pd.Series
-        Proportion of iterations each edge had consistent membership
-    summary_ : pd.Series
-        Comprehensive summary including graph sizes, clustering stats,
-        consensus metrics, and modularity scores.
+        Fraction of iterations each edge co-clustered, indexed by frozenset edge.
+    consensus_edges_ : pd.Index
+        Unanimous edges (consensus_ratio_ == 1.0), in canonical order.
+    disagreement_matrix_ : scipy.sparse.csr_matrix or None
+        Disagreement matrix if store_disagreement_matrix else None.
     labels_ : pd.Series
-        Cluster labels for each node in qualifying clusters, indexed by 
-        node name. Only contains nodes assigned to clusters meeting 
-        minimum_cluster_size.
+        Cluster label per node in qualifying clusters (no NaN rows).
+    cluster_sizes_ : pd.Series
+        Node count per cluster, largest first.
     unstable_nodes_ : pd.Index
-        Node names with no consensus edges. These nodes had inconsistent
-        cluster assignments across iterations and never achieved consensus.
+        Nodes with no unanimous edges (never in the consensus graph).
     discarded_nodes_ : pd.Index
-        Node names in stable clusters that were too small 
-        (< minimum_cluster_size). These achieved consensus but were filtered.
+        Nodes in stable-but-too-small clusters.
     consensus_graph_ : ig.Graph
-        Subgraph containing only consensus edges, pruned to nodes in
-        qualifying clusters. Same node set as filtered_graph_ but with
-        only consensus edges.
+        Unanimous edges among qualifying nodes.
     consensus_graph_discarded_ : ig.Graph
-        Subgraph containing consensus edges for discarded (small) clusters.
-        Merge with consensus_graph_ to reconstruct the full pre-filter
-        consensus graph.
+        Unanimous edges among discarded (small-cluster) nodes.
     filtered_graph_ : ig.Graph
-        Subgraph of the original graph induced on nodes in qualifying 
-        clusters (>= minimum_cluster_size). Retains original edge structure.
-        This is the graph to use for downstream analysis.
-    modularity_ : pd.Series
-        Modularity scores with keys:
-        - 'initial': On the full input graph
-        - 'consensus': On the consensus graph (near 1.0 by construction)
-        - 'filtered': On the filtered graph (the meaningful metric)
-    n_clusters_ : int
-        Number of clusters meeting minimum_cluster_size
-    n_nodes_initial_ : int
-        Number of nodes in the original input graph
-    n_edges_initial_ : int
-        Number of edges in the original input graph
-    n_nodes_consensus_before_filter_ : int
-        Number of nodes in the consensus graph before minimum_cluster_size filtering
-    n_edges_consensus_before_filter_ : int
-        Number of edges in the consensus graph before minimum_cluster_size filtering
-    n_nodes_consensus_after_filter_ : int
-        Number of nodes in the consensus graph after minimum_cluster_size filtering
-    n_edges_consensus_after_filter_ : int
-        Number of edges in the consensus graph after minimum_cluster_size filtering
-    n_nodes_filtered_ : int
-        Number of nodes in the filtered graph
-    n_edges_filtered_ : int
-        Number of edges in the filtered graph
-        
+        Original edges induced on qualifying nodes (use this downstream).
+    quality_ : pd.Series
+        Partition quality under the chosen objective: 'initial' (full graph)
+        and 'filtered' (filtered graph). Resolution/weight handled per type.
+    summary_ : pd.Series
+        Graph sizes, cluster counts, mean_consensus_ratio, stable-node and
+        stable-edge fractions, discard rate, Pielou cluster-size evenness,
+        partition_type / quality_metric / resolution_parameter (context for
+        interpreting quality), and quality_initial / quality_filtered. Mixed
+        dtype (contains strings).
+    n_clusters_, n_nodes_initial_, n_edges_initial_, ... : int
+        Size scalars (also in summary_).
+
     Notes
     -----
-    The original input graph is NOT stored. Use filtered_graph_ for 
-    downstream analysis and consensus_graph_ for inspecting consensus structure.
-    
-    Multiprocessing uses 'spawn' context for cross-platform compatibility.
-    Each process gets a copy of the graph, which is memory-intensive for large graphs.
-    For very large graphs (>100k nodes), consider using n_jobs=1 or smaller n_iter.
+    The original input graph is not retained. Multiprocessing uses 'spawn'.
     """
-    
+
     def __init__(
         self,
-        n_iter: int = 100,
+        n_iter: int = 10,
         weight: Optional[str] = None,
         random_state: int = 0,
         partition_type=None,
         resolution_parameter: float = 1.0,
         n_iterations: int = -1,
-        consensus_threshold: float = 1.0,
         minimum_cluster_size: int = 1,
         cluster_prefix: str = "leiden_",
         n_jobs: int = 1,
         verbose: int = 0,
+        store_disagreement_matrix: bool = False,
         leiden_kws: Optional[dict] = None,
     ):
         self.n_iter = n_iter
@@ -408,484 +312,377 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin, TransformerMixin):
         self.partition_type = partition_type
         self.resolution_parameter = resolution_parameter
         self.n_iterations = n_iterations
-        self.consensus_threshold = consensus_threshold
         self.minimum_cluster_size = minimum_cluster_size
         self.cluster_prefix = cluster_prefix
         self.n_jobs = n_jobs
         self.verbose = verbose
-        self.leiden_kws = leiden_kws or {}
-    
+        self.store_disagreement_matrix = store_disagreement_matrix
+        self.leiden_kws = leiden_kws
+
     def _log(self, message: str, level: str = "info"):
-        """Log message based on verbosity level"""
         if self.verbose == 0:
             return
-        
         if level == "info" and self.verbose >= 2:
             logger.info(message)
         elif level == "debug" and self.verbose >= 3:
             logger.debug(message)
-    
+
     def fit(self, X, y=None):
         """
-        Run N iterations of Leiden clustering and compute consensus.
-        
+        Run n_iter Leiden iterations and build the unanimous consensus.
+
         Parameters
         ----------
         X : ig.Graph
-            Input graph with named vertices
+            Graph with named vertices.
         y : None
-            Ignored, exists for sklearn compatibility
-            
+            Ignored (sklearn compatibility).
+
         Returns
         -------
         self
-            Fitted transformer
         """
-        import time
         import os
-        
-        os.environ.pop('MallocStackLogging', None)
-        os.environ.pop('MallocStackLoggingOutputFilename', None)
-        
+        import time
+
+        os.environ.pop("MallocStackLogging", None)
+        os.environ.pop("MallocStackLoggingOutputFilename", None)
+
         start_time = time.time()
-        
-        # ================================================================
-        # Phase 1: Validate input
-        # ================================================================
+
+        # --- Phase 1: validate input -------------------------------------
         self._log("Validating input graph", "info")
         if not isinstance(X, ig.Graph):
             raise TypeError("Graph must be igraph.Graph instance")
-        if 'name' not in X.vs.attributes():
+        if "name" not in X.vs.attributes():
             raise ValueError("Graph vertices must have 'name' attribute")
         if self.weight is not None and self.weight not in X.es.attributes():
             raise ValueError(f"Weight attribute '{self.weight}' not found in graph edges")
-        if not 0.0 <= self.consensus_threshold <= 1.0:
-            raise ValueError(f"consensus_threshold must be between 0.0 and 1.0, got {self.consensus_threshold}")
         if self.minimum_cluster_size < 1:
             raise ValueError(f"minimum_cluster_size must be >= 1, got {self.minimum_cluster_size}")
-        
-        nodes_list = np.asarray(X.vs['name'])
-        
-        self._log(f"Graph: {X.vcount()} nodes, {X.ecount()} edges", "info")
-        
+
+        nodes_list = np.asarray(X.vs["name"])
         self.n_nodes_initial_ = X.vcount()
         self.n_edges_initial_ = X.ecount()
-        
-        # ================================================================
-        # Phase 2: Setup Leiden algorithm
-        # ================================================================
+        self._log(f"Graph: {self.n_nodes_initial_} nodes, {self.n_edges_initial_} edges", "info")
+
+        # --- Phase 2: set up Leiden --------------------------------------
         self._log("Setting up Leiden algorithm", "debug")
         try:
-            from leidenalg import find_partition, RBConfigurationVertexPartition
+            from leidenalg import RBConfigurationVertexPartition
         except ModuleNotFoundError:
             raise ImportError("Install leidenalg: pip install leidenalg")
-        
-        partition_type = self.partition_type if self.partition_type is not None else RBConfigurationVertexPartition
-        
+
+        partition_type = (
+            self.partition_type if self.partition_type is not None
+            else RBConfigurationVertexPartition
+        )
+        leiden_kws = self.leiden_kws or {}
         leiden_kws_full = {
-            'partition_type': partition_type,
-            'n_iterations': self.n_iterations,
-            **self.leiden_kws
+            "partition_type": partition_type,
+            "n_iterations": self.n_iterations,
+            **leiden_kws,
         }
-        
-        if (self.partition_type is None or partition_type is RBConfigurationVertexPartition):
-            if 'resolution_parameter' not in self.leiden_kws:
-                leiden_kws_full['resolution_parameter'] = self.resolution_parameter
-        
-        self._log(f"Resolution parameter: {leiden_kws_full.get('resolution_parameter', 'N/A')}", "debug")
-        
-        # ================================================================
-        # Phase 3: Run Leiden iterations
-        # ================================================================
+        # Wire resolution_parameter for any partition type that accepts it
+        # (RBConfiguration, CPM, ...), unless the user already set it.
+        if "resolution_parameter" not in leiden_kws:
+            if "resolution_parameter" in inspect.signature(partition_type).parameters:
+                leiden_kws_full["resolution_parameter"] = self.resolution_parameter
+        self._log(
+            f"Partition: {partition_type.__name__}, "
+            f"resolution={leiden_kws_full.get('resolution_parameter', 'N/A')}",
+            "debug",
+        )
+
+        # --- Phase 3: run Leiden iterations ------------------------------
         n_jobs = cpu_count() if self.n_jobs == -1 else self.n_jobs
         if n_jobs < 1:
             raise ValueError(f"n_jobs must be -1 or >= 1, got {self.n_jobs}")
-        
         self._log(f"Using {n_jobs} parallel jobs", "info")
-        
+
         random_seeds = list(range(self.random_state, self.random_state + self.n_iter))
         weight_attr = self.weight
-        
+
         partition_start = time.time()
         self._log(f"Running {self.n_iter} Leiden iterations", "info")
-        
+
         if n_jobs == 1:
-            # Sequential: self-contained worker with all args bundled
             worker_args = [
-                (X, weight_attr, seed, leiden_kws_full, nodes_list)
-                for seed in random_seeds
+                (X, weight_attr, seed, leiden_kws_full) for seed in random_seeds
             ]
             if self.verbose >= 1:
-                partitions = [
-                    _leiden_worker(args) 
+                results = [
+                    _leiden_worker(args)
                     for args in tqdm(worker_args, desc="Leiden clustering")
                 ]
             else:
-                partitions = [_leiden_worker(args) for args in worker_args]
+                results = [_leiden_worker(args) for args in worker_args]
         else:
-            # Parallel: graph pickled once per worker via initializer,
-            # only random seed sent per task
             import multiprocessing as mp
-            ctx = mp.get_context('spawn')
-            
-            if self.verbose >= 1:
-                with ctx.Pool(
-                    processes=n_jobs,
-                    initializer=_leiden_pool_init,
-                    initargs=(X, weight_attr, leiden_kws_full, nodes_list),
-                ) as pool:
-                    partitions = list(
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
+                processes=n_jobs,
+                initializer=_leiden_pool_init,
+                initargs=(X, weight_attr, leiden_kws_full),
+            ) as pool:
+                if self.verbose >= 1:
+                    results = list(
                         tqdm(
                             pool.imap(_leiden_worker_parallel, random_seeds),
                             total=len(random_seeds),
-                            desc="Leiden clustering"
+                            desc="Leiden clustering",
                         )
                     )
-            else:
-                with ctx.Pool(
-                    processes=n_jobs,
-                    initializer=_leiden_pool_init,
-                    initargs=(X, weight_attr, leiden_kws_full, nodes_list),
-                ) as pool:
-                    partitions = pool.map(_leiden_worker_parallel, random_seeds)
-        
+                else:
+                    results = pool.map(_leiden_worker_parallel, random_seeds)
+
         partition_time = time.time() - partition_start
         self._log(f"Leiden iterations completed in {partition_time:.2f}s", "info")
-        
-        # ================================================================
-        # Phase 4: Build partitions DataFrame and co-occurrence matrix
-        # ================================================================
-        df_start = time.time()
-        self._log("Converting partitions to DataFrame", "debug")
-        self.partitions_ = pd.DataFrame(partitions).T
-        self.partitions_.index.name = "Node"
-        self.partitions_.columns.name = "Iteration"
-        self._log(f"DataFrame conversion: {time.time() - df_start:.2f}s", "debug")
-        
-        cooccur_start = time.time()
-        self._log("Computing cluster membership co-occurrence matrix", "info")
-        
-        edge_list = [frozenset([X.vs[e.source]['name'], X.vs[e.target]['name']]) 
-                    for e in X.es]
-        
-        self.membership_matrix_ = cluster_membership_cooccurrence(
-            self.partitions_,
-            edge_list=edge_list,
+
+        # --- Phase 4: partitions matrix ----------------------------------
+        # (n_iter, n_nodes): row access per iteration is contiguous for Phase 5.
+        partitions_by_iter = np.asarray(results, dtype=np.int32)
+        self.partitions_ = pd.DataFrame(
+            partitions_by_iter.T,
+            index=pd.Index(nodes_list, name="Node"),
+            columns=pd.Index(range(self.n_iter), name="Iteration"),
         )
-        
-        cooccur_time = time.time() - cooccur_start
-        self._log(f"Co-occurrence matrix: {self.membership_matrix_.shape}, computed in {cooccur_time:.2f}s", "info")
-        
-        # ================================================================
-        # Phase 5: Consensus metrics and consensus graph
-        # ================================================================
+
+        # --- Phase 5: edge consensus -------------------------------------
         consensus_start = time.time()
-        self._log("Computing consensus metrics", "debug")
-        
-        # Compute consensus ratio before converting to sparse
-        self.consensus_ratio_ = self.membership_matrix_.mean(axis=1)
-        self.consensus_ratio_.name = "ConsensusRatio"
-        
-        # Store edge/iteration index for get_membership_matrix, then convert to sparse
-        self._membership_edge_index_ = self.membership_matrix_.index
-        self._membership_iteration_index_ = self.membership_matrix_.columns
-        self.membership_matrix_ = sp.csr_matrix(self.membership_matrix_.values)
-        self.consensus_edges_ = pd.Index(
-            sorted(self.consensus_ratio_[self.consensus_ratio_ >= self.consensus_threshold].index),
+        self._log("Computing edge consensus", "info")
+
+        edgelist = np.asarray(X.get_edgelist(), dtype=np.int64)
+        n_agree, disagreement_matrix = _compute_consensus(
+            partitions_by_iter,
+            edgelist,
+            self.n_iter,
+            store_disagreement_matrix=self.store_disagreement_matrix,
+        )
+        unanimous_mask = n_agree == self.n_iter
+
+        # frozenset edge index (built once, reused for ratio + edges + matrix)
+        edge_name_pairs = nodes_list[edgelist]
+        edge_index = pd.Index(
+            [frozenset(pair) for pair in edge_name_pairs.tolist()],
             name="Edge",
         )
-        _consensus_stats = leiden_stability(self.consensus_ratio_)
-        
-        self._log(f"Found {len(self.consensus_edges_)} consensus edges (>= {self.consensus_threshold} threshold)", "info")
-        self._log(f"Consensus metrics: {time.time() - consensus_start:.2f}s", "debug")
-        
-        # Build temporary consensus graph for component detection
+        self.consensus_ratio_ = pd.Series(
+            n_agree / self.n_iter, index=edge_index, name="ConsensusRatio"
+        )
+        self.consensus_edges_ = pd.Index(
+            sorted(edge_index[unanimous_mask], key=lambda fs: tuple(sorted(fs))),
+            name="Edge",
+        )
+
+        self.disagreement_matrix_ = disagreement_matrix
+        if self.store_disagreement_matrix:
+            self._disagreement_edge_index_ = edge_index
+            self._disagreement_iteration_index_ = pd.Index(
+                range(self.n_iter), name="Iteration"
+            )
+
+        self._log(
+            f"Found {len(self.consensus_edges_)} unanimous edges "
+            f"of {self.n_edges_initial_} ({time.time() - consensus_start:.2f}s)",
+            "info",
+        )
+
+        # --- Phase 6: consensus graph + components -----------------------
         graph_start = time.time()
         self._log("Building consensus graph", "info")
-        
-        consensus_edge_tuples = set()
-        for edge in self.consensus_edges_:
-            consensus_edge_tuples.add(tuple(sorted(edge)))
-        
-        edges_to_keep = []
-        if self.verbose >= 1:
-            edge_iter = tqdm(X.es, desc="Filtering consensus edges", total=X.ecount())
-        else:
-            edge_iter = X.es
-            
-        for edge in edge_iter:
-            source_name = X.vs[edge.source]['name']
-            target_name = X.vs[edge.target]['name']
-            edge_tuple = tuple(sorted([source_name, target_name]))
-            if edge_tuple in consensus_edge_tuples:
-                edges_to_keep.append(edge.index)
-        
+
+        edges_to_keep = np.flatnonzero(unanimous_mask).tolist()
         _consensus_graph = X.subgraph_edges(edges_to_keep, delete_vertices=True)
-        
-        # Store before-filter consensus graph sizes
         self.n_nodes_consensus_before_filter_ = _consensus_graph.vcount()
         self.n_edges_consensus_before_filter_ = _consensus_graph.ecount()
-        
-        graph_time = time.time() - graph_start
-        self._log(f"Consensus graph (before filter): {self.n_nodes_consensus_before_filter_} nodes, {self.n_edges_consensus_before_filter_} edges ({graph_time:.2f}s)", "info")
-        
-        # ================================================================
-        # Phase 6: Cluster labels from connected components
-        # ================================================================
-        label_start = time.time()
-        self._log("Computing connected components for cluster labels", "info")
+
         components = _consensus_graph.connected_components()
-        
-        # Assign labels sorted by cluster size (largest first)
-        node_to_cluster = {}
-        cluster_sizes = []
-        
-        for component in components:
-            nodes_in_component = [_consensus_graph.vs[idx]['name'] for idx in component]
-            cluster_sizes.append((len(nodes_in_component), nodes_in_component))
-        
+        cluster_sizes = [
+            (len(component), [_consensus_graph.vs[idx]["name"] for idx in component])
+            for component in components
+        ]
         cluster_sizes.sort(key=lambda x: x[0], reverse=True)
-        
-        for i, (size, nodes) in enumerate(cluster_sizes, start=1):
+
+        node_to_cluster = {}
+        for i, (_, nodes) in enumerate(cluster_sizes, start=1):
             cluster_label = f"{self.cluster_prefix}{i}"
             for node in nodes:
                 node_to_cluster[node] = cluster_label
-        
-        # All labels before minimum_cluster_size filtering
-        all_nodes = [v['name'] for v in X.vs]
-        labels_all = pd.Series(node_to_cluster, name="Cluster")
-        labels_all = labels_all.reindex(all_nodes)
+
+        all_nodes = nodes_list.tolist()
+        labels_all = pd.Series(node_to_cluster, name="Cluster").reindex(all_nodes)
         labels_all.index.name = "Node"
-        
-        # ================================================================
-        # Phase 7: Filter by minimum_cluster_size and categorize nodes
-        # ================================================================
+        self._log(
+            f"Consensus graph (before filter): "
+            f"{self.n_nodes_consensus_before_filter_} nodes, "
+            f"{self.n_edges_consensus_before_filter_} edges ({time.time() - graph_start:.2f}s)",
+            "info",
+        )
+
+        # --- Phase 7: minimum_cluster_size filter ------------------------
         cluster_counts = labels_all.value_counts()
-        
-        # Valid clusters must have size >= minimum_cluster_size
         valid_clusters = set(cluster_counts[cluster_counts >= self.minimum_cluster_size].index)
         discarded_clusters = set(cluster_counts.index) - valid_clusters
-        
-        # labels_ only contains nodes in qualifying clusters (no NaN rows)
+
         self.labels_ = labels_all[labels_all.isin(valid_clusters)].copy()
         self.labels_.index.name = "Node"
         self.n_clusters_ = len(valid_clusters)
-        
-        # Unstable nodes: no consensus edges at all (never in consensus graph)
-        consensus_node_names = set(_consensus_graph.vs['name'])
+
+        self.cluster_sizes_ = self.labels_.value_counts()
+        self.cluster_sizes_.index.name = "Cluster"
+        self.cluster_sizes_.name = "Size"
+
+        consensus_node_names = set(_consensus_graph.vs["name"])
         self.unstable_nodes_ = pd.Index(
-            sorted(set(all_nodes) - consensus_node_names),
-            name="Node",
+            sorted(set(all_nodes) - consensus_node_names), name="Node"
         )
-        
-        # Discarded nodes: stable but cluster too small
         self.discarded_nodes_ = pd.Index(
             sorted(labels_all[labels_all.isin(discarded_clusters)].dropna().index),
             name="Node",
         )
-        
         if len(self.unstable_nodes_) > 0:
-            self._log(f"Unstable nodes (no consensus edges): {len(self.unstable_nodes_)}", "info")
+            self._log(f"Unstable nodes (no unanimous edges): {len(self.unstable_nodes_)}", "info")
         if len(self.discarded_nodes_) > 0:
-            self._log(f"Discarded nodes (cluster size < {self.minimum_cluster_size}): {len(self.discarded_nodes_)}", "info")
-        
-        label_time = time.time() - label_start
-        self._log(f"Found {self.n_clusters_} clusters in {label_time:.2f}s", "info")
-        
-        # ================================================================
-        # Phase 8: Build final graphs and compute modularity
-        # ================================================================
+            self._log(
+                f"Discarded nodes (cluster size < {self.minimum_cluster_size}): "
+                f"{len(self.discarded_nodes_)}",
+                "info",
+            )
+
+        # --- Phase 8: final graphs + quality -----------------------------
         filtered_start = time.time()
-        self._log("Building final graphs and computing modularity", "info")
-        
+        self._log("Building final graphs and computing quality", "info")
+
         valid_node_names = set(self.labels_.index)
         discarded_node_names = set(self.discarded_nodes_)
-        
-        # Consensus graph: consensus edges, qualifying nodes only
-        valid_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in valid_node_names]
+
+        consensus_names = np.asarray(_consensus_graph.vs["name"])
+        valid_consensus_indices = np.flatnonzero(
+            np.isin(consensus_names, list(valid_node_names))
+        ).tolist()
         self.consensus_graph_ = _consensus_graph.induced_subgraph(valid_consensus_indices)
-        
         self.n_nodes_consensus_after_filter_ = self.consensus_graph_.vcount()
         self.n_edges_consensus_after_filter_ = self.consensus_graph_.ecount()
-        
-        # Discarded consensus graph: consensus edges, small-cluster nodes only
-        discarded_consensus_indices = [v.index for v in _consensus_graph.vs if v['name'] in discarded_node_names]
-        self.consensus_graph_discarded_ = _consensus_graph.induced_subgraph(discarded_consensus_indices)
-        
-        # Filtered graph: all original edges between qualifying nodes
-        valid_node_indices = [v.index for v in X.vs if v['name'] in valid_node_names]
+
+        discarded_consensus_indices = np.flatnonzero(
+            np.isin(consensus_names, list(discarded_node_names))
+        ).tolist()
+        self.consensus_graph_discarded_ = _consensus_graph.induced_subgraph(
+            discarded_consensus_indices
+        )
+
+        valid_node_indices = np.flatnonzero(
+            np.isin(nodes_list, list(valid_node_names))
+        ).tolist()
         self.filtered_graph_ = X.induced_subgraph(valid_node_indices)
-        
         self.n_nodes_filtered_ = self.filtered_graph_.vcount()
         self.n_edges_filtered_ = self.filtered_graph_.ecount()
-        
-        self._log(f"Consensus graph (after filter): {self.n_nodes_consensus_after_filter_} nodes, {self.n_edges_consensus_after_filter_} edges", "info")
-        self._log(f"Filtered graph: {self.n_nodes_filtered_} nodes, {self.n_edges_filtered_} edges", "info")
-        if self.consensus_graph_discarded_.vcount() > 0:
-            self._log(f"Discarded consensus graph: {self.consensus_graph_discarded_.vcount()} nodes, {self.consensus_graph_discarded_.ecount()} edges", "info")
-        
-        # Compute modularity on all three graphs
-        modularity_initial = _compute_modularity(X, self.labels_, weight=weight_attr)
-        modularity_consensus = _compute_modularity(self.consensus_graph_, self.labels_, weight=weight_attr)
-        modularity_filtered = _compute_modularity(self.filtered_graph_, self.labels_, weight=weight_attr)
-        
-        self.modularity_ = pd.Series({
-            'initial': modularity_initial,
-            'filtered': modularity_filtered,
-            'consensus': modularity_consensus,
-        }, name="Modularity")
-        
-        filtered_time = time.time() - filtered_start
-        self._log(f"Modularity (initial={modularity_initial:.4f}, consensus={modularity_consensus:.4f}, filtered={modularity_filtered:.4f})", "info")
-        self._log(f"Filtered graph + modularity: {filtered_time:.2f}s", "debug")
-        
-        # ================================================================
-        # Phase 9: Build summary
-        # ================================================================
-        self.summary_ = pd.Series({
-            # Graph sizes
-            'n_nodes_initial': self.n_nodes_initial_,
-            'n_edges_initial': self.n_edges_initial_,
-            'n_nodes_consensus_before_filter': self.n_nodes_consensus_before_filter_,
-            'n_edges_consensus_before_filter': self.n_edges_consensus_before_filter_,
-            'n_nodes_consensus_after_filter': self.n_nodes_consensus_after_filter_,
-            'n_edges_consensus_after_filter': self.n_edges_consensus_after_filter_,
-            'n_nodes_filtered': self.n_nodes_filtered_,
-            'n_edges_filtered': self.n_edges_filtered_,
-            # Clustering
-            'n_clusters': self.n_clusters_,
-            'n_unstable': len(self.unstable_nodes_),
-            'n_discarded': len(self.discarded_nodes_),
-            # Consensus
-            **_consensus_stats.to_dict(),
-            # Modularity
-            'modularity_initial': self.modularity_['initial'],
-            'modularity_filtered': self.modularity_['filtered'],
-            'modularity_consensus': self.modularity_['consensus'],
-        }, name="Summary")
-        # ================================================================
-        # Phase 10: Summary
-        # ================================================================
+
+        quality_initial = _compute_quality(
+            X, self.labels_, partition_type, self.resolution_parameter, weight=weight_attr
+        )
+        quality_filtered = _compute_quality(
+            self.filtered_graph_, self.labels_, partition_type,
+            self.resolution_parameter, weight=weight_attr,
+        )
+        self.quality_ = pd.Series(
+            {"initial": quality_initial, "filtered": quality_filtered}, name="Quality"
+        )
+        self._log(
+            f"Quality (initial={quality_initial:.4f}, filtered={quality_filtered:.4f}) "
+            f"in {time.time() - filtered_start:.2f}s",
+            "info",
+        )
+
+        # --- Phase 9: summary --------------------------------------------
+        n_unstable = len(self.unstable_nodes_)
+        n_discarded = len(self.discarded_nodes_)
+        self.summary_ = pd.Series(
+            {
+                "n_nodes_initial": self.n_nodes_initial_,
+                "n_edges_initial": self.n_edges_initial_,
+                "n_nodes_consensus_before_filter": self.n_nodes_consensus_before_filter_,
+                "n_edges_consensus_before_filter": self.n_edges_consensus_before_filter_,
+                "n_nodes_consensus_after_filter": self.n_nodes_consensus_after_filter_,
+                "n_edges_consensus_after_filter": self.n_edges_consensus_after_filter_,
+                "n_nodes_filtered": self.n_nodes_filtered_,
+                "n_edges_filtered": self.n_edges_filtered_,
+                "n_clusters": self.n_clusters_,
+                "n_unstable": n_unstable,
+                "n_discarded": n_discarded,
+                "mean_consensus_ratio": self.consensus_ratio_.mean(),
+                "ratio_stable_nodes": 1 - n_unstable / self.n_nodes_initial_,
+                "ratio_stable_edges": (
+                    len(self.consensus_edges_) / self.n_edges_initial_
+                    if self.n_edges_initial_ else float("nan")
+                ),
+                "discard_rate": n_discarded / self.n_nodes_initial_,
+                "pielou_evenness": _pielou_evenness(self.cluster_sizes_.to_numpy()),
+                "partition_type": partition_type.__name__,
+                "quality_metric": partition_type.__name__.replace("VertexPartition", ""),
+                "resolution_parameter": leiden_kws_full.get("resolution_parameter", float("nan")),
+                "quality_initial": self.quality_["initial"],
+                "quality_filtered": self.quality_["filtered"],
+            },
+            name="Summary",
+        )
+
         total_time = time.time() - start_time
         self._log(f"Total fit time: {total_time:.2f}s", "info")
-        
         if self.verbose >= 2:
-            rep = self.summary_
-            logger.info("=" * 60)
-            logger.info("CONSENSUS LEIDEN CLUSTERING SUMMARY")
-            logger.info("=" * 60)
-            logger.info(f"Input: {rep['n_nodes_initial']:.0f} nodes, {rep['n_edges_initial']:.0f} edges")
-            logger.info(f"Iterations: {self.n_iter} (parallel jobs: {n_jobs})")
-            logger.info(f"Consensus threshold: {self.consensus_threshold}")
-            logger.info(f"Minimum cluster size: {self.minimum_cluster_size}")
-            logger.info(f"Consensus graph (before filter): {rep['n_nodes_consensus_before_filter']:.0f} nodes, {rep['n_edges_consensus_before_filter']:.0f} edges")
-            logger.info(f"Consensus graph (after filter): {rep['n_nodes_consensus_after_filter']:.0f} nodes, {rep['n_edges_consensus_after_filter']:.0f} edges")
-            logger.info(f"Filtered graph: {rep['n_nodes_filtered']:.0f} nodes, {rep['n_edges_filtered']:.0f} edges")
-            logger.info(f"Clusters: {rep['n_clusters']:.0f}")
-            logger.info(f"Unstable nodes (no consensus edges): {rep['n_unstable']:.0f}")
-            logger.info(f"Discarded nodes (small clusters): {rep['n_discarded']:.0f}")
-            logger.info("=" * 60)
-            logger.info("CONSENSUS METRICS")
-            logger.info("=" * 60)
-            logger.info(f"Consensus ratio: {rep['consensus_ratio_before_filter']:.3f} (std={rep['consensus_std_before_filter']:.3f})")
-            logger.info(f"100% consensus: {rep['pct_100']:.1f}% of edges")
-            logger.info(f"≥90% consensus: {rep['pct_90plus']:.1f}% of edges")
-            logger.info(f"≥80% consensus: {rep['pct_80plus']:.1f}% of edges")
-            logger.info(f"<50% consensus: {rep['pct_below_50']:.1f}% of edges")
-            logger.info("=" * 60)
-            logger.info("MODULARITY")
-            logger.info("=" * 60)
-            logger.info(f"Initial graph:   {rep['modularity_initial']:.4f}")
-            logger.info(f"Filtered graph:  {rep['modularity_filtered']:.4f}")
-            logger.info(f"Consensus graph: {rep['modularity_consensus']:.4f}")
-            logger.info("=" * 60)
-            logger.info("TIMING BREAKDOWN")
-            logger.info("=" * 60)
-            logger.info(f"Leiden iterations: {partition_time:.2f}s ({100*partition_time/total_time:.1f}%)")
-            logger.info(f"Co-occurrence matrix: {cooccur_time:.2f}s ({100*cooccur_time/total_time:.1f}%)")
-            logger.info(f"Consensus graph: {graph_time:.2f}s ({100*graph_time/total_time:.1f}%)")
-            logger.info(f"Cluster labels: {label_time:.2f}s ({100*label_time/total_time:.1f}%)")
-            logger.info(f"Filtered graph + modularity: {filtered_time:.2f}s ({100*filtered_time/total_time:.1f}%)")
-            logger.info(f"Total: {total_time:.2f}s")
-            logger.info("=" * 60)
-        
+            logger.info(
+                "ConsensusLeiden | {} clusters | {} iters x {} jobs | unanimous consensus".format(
+                    self.n_clusters_, self.n_iter, n_jobs
+                )
+            )
+            logger.info(
+                "Nodes: {} initial -> {} clustered | {:.1%} stable, {:.1%} discarded".format(
+                    self.n_nodes_initial_, self.n_nodes_filtered_,
+                    self.summary_["ratio_stable_nodes"], self.summary_["discard_rate"],
+                )
+            )
+            logger.info(
+                "Quality ({}, resolution={}): initial={:.4f}, filtered={:.4f}".format(
+                    partition_type.__name__, self.resolution_parameter,
+                    self.quality_["initial"], self.quality_["filtered"],
+                )
+            )
+
         return self
-    
+
     def transform(self, X) -> pd.Series:
-        """
-        Return cluster labels.
-        
-        Parameters
-        ----------
-        X : ig.Graph
-            Input graph (ignored, exists for sklearn compatibility)
-            
-        Returns
-        -------
-        pd.Series
-            Cluster labels for each node in qualifying clusters, 
-            indexed by node name.
-        """
-        if not hasattr(self, 'labels_'):
+        """Return cluster labels (X ignored; sklearn convenience)."""
+        if not hasattr(self, "labels_"):
             raise RuntimeError("Must call fit() before transform()")
-        
         return self.labels_
-    
+
     def fit_transform(self, X, y=None) -> pd.Series:
-        """
-        Fit and transform in one step.
-        
-        Parameters
-        ----------
-        X : ig.Graph
-            Input graph
-        y : None
-            Ignored
-            
-        Returns
-        -------
-        pd.Series
-            Cluster labels
-        """
+        """Fit and return cluster labels."""
         return self.fit(X, y).transform(X)
-    
+
     def get_feature_names_out(self, input_features=None) -> pd.Index:
-        """
-        Return consensus edges as a pd.Index of frozensets.
-        
-        Parameters
-        ----------
-        input_features : None
-            Ignored, exists for sklearn compatibility
-            
-        Returns
-        -------
-        pd.Index
-            Index of frozenset edge pairs from the consensus graph
-        """
-        if not hasattr(self, 'consensus_edges_'):
+        """Unanimous consensus edges (convenience alias for consensus_edges_)."""
+        if not hasattr(self, "consensus_edges_"):
             raise RuntimeError("Must call fit() before get_feature_names_out()")
-        
         return self.consensus_edges_
-    
-    def get_membership_matrix(self) -> pd.DataFrame:
+
+    def get_disagreement_matrix(self) -> pd.DataFrame:
         """
-        Return the membership co-occurrence matrix as a pandas sparse DataFrame.
-        
-        Returns
-        -------
-        pd.DataFrame
-            Boolean sparse DataFrame with edges as rows and iterations as columns.
-            Uses pd.SparseDtype(bool) for memory efficiency.
+        Return the disagreement matrix as a boolean sparse DataFrame.
+
+        True where an edge's endpoints landed in different clusters in that
+        iteration. Requires store_disagreement_matrix=True at fit time.
         """
-        if not hasattr(self, 'membership_matrix_'):
-            raise RuntimeError("Must call fit() before get_membership_matrix()")
-        
-        dense = self.membership_matrix_.toarray()
-        df = pd.DataFrame(
-            dense,
-            index=self._membership_edge_index_,
-            columns=self._membership_iteration_index_,
+        if not hasattr(self, "disagreement_matrix_"):
+            raise RuntimeError("Must call fit() before get_disagreement_matrix()")
+        if self.disagreement_matrix_ is None:
+            raise RuntimeError(
+                "Disagreement matrix not stored. Set store_disagreement_matrix=True before fitting."
+            )
+        return pd.DataFrame(
+            self.disagreement_matrix_.toarray(),
+            index=self._disagreement_edge_index_,
+            columns=self._disagreement_iteration_index_,
             dtype=pd.SparseDtype(bool),
         )
-        return df
