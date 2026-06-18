@@ -6,12 +6,10 @@ scikit-learn>=1.0.0
 scikit-bio>=0.5.6
 python-igraph
 loguru
+fastcluster>=1.2.0
 
 # Optional dependencies
 # =====================
-# For faster linkage computations
-# fastcluster>=1.2.0
-
 # For dynamic tree cutting algorithms
 # dynamicTreeCut>=0.1.0
 

@@ -11,8 +11,7 @@ from collections import (
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import (
-    linkage, 
-    dendrogram as scipy_dendrogram, 
+    dendrogram as scipy_dendrogram,
     fcluster,
 )
 from scipy.spatial.distance import (
@@ -27,10 +26,10 @@ from sklearn.base import (
 from sklearn.metrics import pairwise_distances_argmin_min
 from sklearn.utils import check_array, check_X_y
 from sklearn.utils.multiclass import check_classification_targets
+from fastcluster import linkage
+from skbio import DistanceMatrix, TreeNode
 
 from loguru import logger
-
-# Optional dependencies are loaded lazily in methods to avoid import-time warnings
     
 # Classes
 class HierarchicalClustering(BaseEstimator, ClusterMixin):
@@ -43,8 +42,8 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     
     Parameters
     ----------
-    method : str, default='ward'
-        The linkage method to use. Options: 'ward', 'complete', 'average', 
+    method : str, default='average'
+        The linkage method to use. Options: 'ward', 'complete', 'average',
         'single', 'centroid', 'median', 'weighted'.
     metric : str, default='euclidean'
         The distance metric to use for computing pairwise distances.
@@ -62,30 +61,39 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         Random state for reproducible results.
     distance_matrix_tol : float, default=1e-10
         Tolerance for validating distance matrix properties (symmetry, zero diagonal).
-    outlier_cluster : int, default=-1
-        Label used for outlier/noise samples that don't belong to any cluster.
     cluster_prefix : str, optional
         If provided, cluster labels will be converted to strings with this prefix
         (e.g., cluster_prefix="C" -> "C1", "C2", etc.).
-        
+    store_data : bool, default=False
+        If True, store the input data as ``data_`` after fitting.
+
     Attributes
     ----------
-    labels_ : ndarray of shape (n_samples,)
-        Cluster labels for each sample.
+    labels_ : pd.Series or ndarray of shape (n_samples,)
+        Cluster labels for each sample. Returns a pd.Series indexed by
+        sample IDs when input is a pd.DataFrame or skbio.DistanceMatrix,
+        otherwise an ndarray.
+    data_ : skbio.DistanceMatrix
+        Copy of the distance matrix with sample IDs. Only present
+        when ``store_data=True``.
     linkage_matrix_ : ndarray
         The linkage matrix from hierarchical clustering.
     tree_ : skbio.TreeNode
-        The hierarchical tree (if skbio is available).
+        The hierarchical tree.
     dendrogram_ : dict
         Dendrogram data structure from scipy.
     n_clusters_ : int
         Number of clusters found.
+    n_outliers_ : int
+        Number of outlier samples. Only nonzero when cut_method='dynamic'.
+    outliers_ : list
+        Sample labels of outlier samples identified by dynamic tree cutting.
     tracks_ : dict
         Dictionary of metadata tracks for visualization.
     """
     
-    def __init__(self, 
-                 method='ward',
+    def __init__(self,
+                 method='average',
                  metric='euclidean',
                  min_cluster_size=3,
                  deep_split=2,
@@ -94,9 +102,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                  name=None,
                  random_state=None,
                  distance_matrix_tol=1e-10,
-                 outlier_cluster=-1,
-                 cluster_prefix=None):
-        
+                 cluster_prefix=None,
+                 store_data=False):
+
         # Validate parameters
         valid_methods = ['ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted']
         if method not in valid_methods:
@@ -127,15 +135,17 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         self.name = name
         self.random_state = random_state
         self.distance_matrix_tol = distance_matrix_tol
-        self.outlier_cluster = outlier_cluster
         self.cluster_prefix = cluster_prefix
-        
+        self.store_data = store_data
+
         # Initialize attributes
         self.labels_ = None
         self.linkage_matrix_ = None
         self.tree_ = None
         self.dendrogram_ = None
         self.n_clusters_ = None
+        self.n_outliers_ = 0
+        self.outliers_ = []
         self.tracks_ = OrderedDict()
         self._is_fitted = False
         
@@ -146,41 +156,68 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features) or (n_samples, n_samples)
-            Training data. If square matrix, assumed to be distance matrix.
+            Training data. If a precomputed distance matrix (square DataFrame,
+            ndarray, or skbio DistanceMatrix), set metric='precomputed'.
         y : Ignored
             Not used, present for API consistency.
-            
+
         Returns
         -------
         self : object
             Returns the instance itself.
         """
-        X = self._validate_input(X)
-        
-        # Store original data and create sample labels ONCE
-        self.data_ = X
-        if hasattr(X, 'index'):
+        X, is_skbio_dm = self._validate_input(X)
+
+        # Validate metric='precomputed' for distance matrix inputs
+        if is_skbio_dm and self.metric != 'precomputed':
+            raise ValueError(
+                "Input is a skbio DistanceMatrix. "
+                "Please set metric='precomputed'."
+            )
+
+        # Create sample labels and track whether input had real IDs
+        if is_skbio_dm:
+            self._has_sample_ids = True
+            self.sample_labels_ = list(X.ids)
+        elif hasattr(X, 'index'):
+            self._has_sample_ids = True
             self.sample_labels_ = list(X.index)
         else:
+            self._has_sample_ids = False
             self.sample_labels_ = list(range(X.shape[0]))
-        
-        # Compute distance matrix if needed
-        if self._is_distance_matrix(X, tol=self.distance_matrix_tol):
+
+        # Validate precomputed metric for distance-like inputs
+        if not is_skbio_dm and self._is_distance_matrix(X, tol=self.distance_matrix_tol):
+            if self.metric != 'precomputed':
+                raise ValueError(
+                    "Input appears to be a precomputed distance matrix "
+                    "(square, symmetric, zero diagonal). "
+                    "Please set metric='precomputed'."
+                )
+
+        # Compute or wrap distance matrix as skbio DistanceMatrix
+        if is_skbio_dm:
             self.distance_matrix_ = X
+        elif self.metric == 'precomputed':
+            values = X.values if hasattr(X, 'values') else X
+            self.distance_matrix_ = DistanceMatrix(values, ids=self.sample_labels_)
         else:
-            is_symmetric_object = X.__class__.__name__ == "Symmetric"
-            if is_symmetric_object:
-                self.distance_matrix_ = X.to_pandas_dataframe()
-            else:
-                self.distance_matrix_ = self._compute_distance_matrix(X)
-            
+            self.distance_matrix_ = self._compute_distance_matrix(X)
+
+        if self.store_data:
+            self.data_ = self.distance_matrix_.copy()
+
         # Perform hierarchical clustering
         self._perform_clustering()
         
         # Cut tree to get clusters
         self._cut_tree()
-        
-        # Build tree representation (will silently skip if skbio not available)
+
+        # Wrap labels as pd.Series when input had sample IDs
+        if self._has_sample_ids and self.labels_ is not None:
+            self.labels_ = pd.Series(self.labels_, index=self.sample_labels_)
+
+        # Build tree representation
         self._build_tree()
             
         self._is_fitted = True
@@ -189,16 +226,18 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def transform(self, X=None):
         """
         Return cluster labels.
-        
+
         Parameters
         ----------
         X : Ignored
             Not used, present for API consistency.
-            
+
         Returns
         -------
-        labels : ndarray of shape (n_samples,)
-            Cluster labels.
+        labels : pd.Series or ndarray of shape (n_samples,)
+            Cluster labels. Returns a pd.Series indexed by sample IDs
+            when the input to fit() was a pd.DataFrame or skbio.DistanceMatrix,
+            otherwise an ndarray.
         """
         self._check_fitted()
         return self.labels_
@@ -206,27 +245,38 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def fit_transform(self, X, y=None):
         """
         Fit hierarchical clustering and return cluster labels.
-        
+
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
             Training data.
         y : Ignored
             Not used, present for API consistency.
-            
+
         Returns
         -------
-        labels : ndarray of shape (n_samples,)
-            Cluster labels.
+        labels : pd.Series or ndarray of shape (n_samples,)
+            Cluster labels. Returns a pd.Series indexed by sample IDs
+            when X is a pd.DataFrame or skbio.DistanceMatrix,
+            otherwise an ndarray.
         """
         return self.fit(X, y).transform()
         
     def _validate_input(self, X):
-        """Validate and convert input data."""
+        """Validate and convert input data.
+
+        Returns
+        -------
+        tuple of (array-like, bool)
+            The validated/converted input and whether it was a skbio DistanceMatrix.
+        """
+        if isinstance(X, DistanceMatrix):
+            return X, True
+
         if hasattr(X, 'values'):  # pandas DataFrame
-            return X
+            return X, False
         else:
-            return np.asarray(X)
+            return np.asarray(X), False
             
     def _is_distance_matrix(self, X, tol=1e-10):
         """
@@ -273,28 +323,14 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             X_values = X.values
         else:
             X_values = X
-            
+
         distances = pdist(X_values, metric=self.metric)
-        return pd.DataFrame(
-            squareform(distances),
-            index=self.sample_labels_,
-            columns=self.sample_labels_
-        )
+        return DistanceMatrix(squareform(distances), ids=self.sample_labels_)
         
     def _perform_clustering(self):
         """Perform hierarchical clustering."""
-        # Get condensed distance matrix
-        if hasattr(self.distance_matrix_, 'values'):
-            dist_condensed = squareform(self.distance_matrix_.values)
-        else:
-            dist_condensed = squareform(self.distance_matrix_)
-            
-        # Perform linkage - try to use fastcluster if available
-        try:
-            from fastcluster import linkage as fast_linkage
-            self.linkage_matrix_ = fast_linkage(dist_condensed, method=self.method)
-        except ImportError:
-            self.linkage_matrix_ = linkage(dist_condensed, method=self.method)
+        dist_condensed = self.distance_matrix_.condensed_form()
+        self.linkage_matrix_ = linkage(dist_condensed, method=self.method)
             
         # Generate dendrogram
         self.dendrogram_ = scipy_dendrogram(
@@ -320,13 +356,16 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 "Must be 'dynamic', 'height', or 'maxclust'."
             )
         
-        # Set n_clusters_ after cutting
+        # Set n_clusters_ and outlier info after cutting
         if self.labels_ is not None:
             unique_labels = np.unique(self.labels_)
-            # Remove outlier/noise labels 
-            cluster_labels = unique_labels[unique_labels != self.outlier_cluster]
+            cluster_labels = unique_labels[unique_labels != -1]
             self.n_clusters_ = len(cluster_labels)
-            
+
+            outlier_mask = self.labels_ == -1
+            self.outliers_ = [self.sample_labels_[i] for i, is_outlier in enumerate(outlier_mask) if is_outlier]
+            self.n_outliers_ = len(self.outliers_)
+
             # Apply cluster prefix if specified
             if self.cluster_prefix is not None:
                 self.labels_ = self._apply_cluster_prefix(self.labels_)
@@ -352,13 +391,14 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             params['cutHeight'] = self.cut_threshold
         
         try:
-            distance_matrix = (self.distance_matrix_.values 
-                              if hasattr(self.distance_matrix_, 'values') 
-                              else self.distance_matrix_)
-            
+            # dynamicTreeCut uses np.in1d which was removed in NumPy 2.0
+            _in1d_patched = not hasattr(np, 'in1d')
+            if _in1d_patched:
+                np.in1d = np.isin
+
             results = dynamicTreeCut.cutreeHybrid(
                 self.linkage_matrix_,
-                distance_matrix,
+                self.distance_matrix_.data,
                 **params
             )
             
@@ -366,9 +406,16 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 self.labels_ = results['labels']
             else:
                 self.labels_ = results
-                
+
+            # dynamicTreeCut labels outliers as 0 and clusters as 1, 2, ...
+            # Shift by -1 so outliers become -1 and clusters start at 0
+            self.labels_ = self.labels_ - 1
+
         except Exception as e:
             raise RuntimeError(f"Dynamic tree cutting failed: {e}")
+        finally:
+            if _in1d_patched:
+                del np.in1d
             
     def _cut_tree_height(self):
         """Cut tree at specified height."""
@@ -399,17 +446,11 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         )
         
     def _build_tree(self):
-        """Build skbio tree from linkage matrix."""
+        """Build tree from linkage matrix."""
         try:
-            import skbio
-        except ImportError:
-            self.tree_ = None
-            return
-            
-        try:
-            self.tree_ = skbio.TreeNode.from_linkage_matrix(
+            self.tree_ = TreeNode.from_linkage_matrix(
                 self.linkage_matrix_,
-                self.sample_labels_  # Already a list
+                self.sample_labels_
             )
             if self.name:
                 self.tree_.name = self.name
@@ -598,59 +639,53 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     def _apply_cluster_prefix(self, labels):
         """Apply cluster prefix to labels, converting to strings."""
         prefixed_labels = np.empty(len(labels), dtype=object)
-        
+
         for i, label in enumerate(labels):
-            if label == self.outlier_cluster:
-                # Keep outlier cluster as is (could be string or int)
-                prefixed_labels[i] = label
+            if label == -1:
+                prefixed_labels[i] = -1
             else:
-                # Apply prefix to non-outlier clusters
                 prefixed_labels[i] = f"{self.cluster_prefix}{label}"
-                
+
         return prefixed_labels
         
-    def _generate_cluster_colors(self):
+    def _generate_cluster_colors(self, outlier_color='white', outlier_label=""):
         """Generate colors for clusters."""
         import matplotlib.pyplot as plt
         from matplotlib.colors import rgb2hex
-        
+
         if self.n_clusters_ is None:
             return {}
-            
+
         if self.n_clusters_ <= 10:
             colors = plt.cm.tab10(np.linspace(0, 1, self.n_clusters_))
         else:
             colors = plt.cm.tab20(np.linspace(0, 1, min(self.n_clusters_, 20)))
-            
-        # Get actual cluster IDs (exclude outlier cluster)
+
+        # Get actual cluster IDs (exclude outliers)
         unique_labels = np.unique(self.labels_)
-        if self.cluster_prefix is not None:
-            # Handle string cluster labels
-            cluster_ids = [label for label in unique_labels if label != self.outlier_cluster]
-        else:
-            # Handle numeric cluster labels
-            cluster_ids = unique_labels[unique_labels != self.outlier_cluster]
-        
+        cluster_ids = [label for label in unique_labels if label != -1]
+
         color_dict = {}
         for i, cluster_id in enumerate(cluster_ids):
             if i < len(colors):
                 color_dict[cluster_id] = rgb2hex(colors[i])
             else:
-                # Fallback for too many clusters
                 color_dict[cluster_id] = 'gray'
-                
+
         # Add outlier color if outliers exist
-        if self.outlier_cluster in unique_labels:
-            color_dict[self.outlier_cluster] = 'white'
-            
+        if -1 in unique_labels:
+            color_dict[-1] = outlier_color
+
         return color_dict
 
     def plot(self, figsize=(13, 5), show_clusters=True, show_tracks=True,
-             cluster_colors=None, track_height=0.8, show_cluster_labels=False, 
-             cluster_label="Clusters", branch_color="black", show_leaf_labels=True, **kwargs):
+             cluster_colors=None, track_height=0.8, show_cluster_labels=False,
+             cluster_label="Clusters", branch_color="black", show_leaf_labels=True,
+             title=None, track_padding=None, outlier_color='white',
+             outlier_label=None, **kwargs):
         """
         Plot dendrogram with optional cluster coloring and tracks.
-        
+
         Parameters
         ----------
         figsize : tuple, default=(13, 5)
@@ -671,9 +706,20 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             Color for dendrogram branches.
         show_leaf_labels : bool, default=True
             Whether to show sample labels on the x-axis.
+        title : str or None, default=None
+            Custom title for the plot. If None, auto-generates based on
+            the instance name.
+        track_padding : float or None, default=None
+            Vertical spacing (hspace) between subplots. If None, uses
+            matplotlib's tight_layout(). Typical values: 0.0-0.5.
+        outlier_color : str, default='white'
+            Color used for the outlier cluster in the cluster track.
+        outlier_label : str or None, default=None
+            Display label for outlier samples in the cluster track.
+            If None, defaults to an empty string.
         **kwargs
             Additional dendrogram plotting parameters.
-            
+
         Raises
         ------
         ImportError
@@ -734,7 +780,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         ax_dendro.set_xlim(0, tree_width)
         ax_dendro.set_ylim(0, tree_height)
         
-        if self.name:
+        if title is not None:
+            ax_dendro.set_title(title)
+        elif self.name:
             ax_dendro.set_title(f'Hierarchical Clustering: {self.name}')
         else:
             ax_dendro.set_title('Hierarchical Clustering')
@@ -762,15 +810,24 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
         # Plot clusters (treat as categorical data)
         if show_clusters and self.labels_ is not None and n_subplots > 1:
+            if outlier_label is None:
+                outlier_label = ""
+
             if cluster_colors is None:
-                cluster_colors = self._generate_cluster_colors()
-                
-            # Create cluster data as pandas Series using the dendrogram leaf order
-            cluster_data = pd.Series(self.labels_, index=self.sample_labels_)
-            
+                cluster_colors = self._generate_cluster_colors(outlier_color=outlier_color)
+
+            # Replace -1 with the display outlier_label in colors and data
+            if -1 in cluster_colors:
+                cluster_colors[outlier_label] = cluster_colors.pop(-1)
+
+            if isinstance(self.labels_, pd.Series):
+                cluster_data = self.labels_.replace({-1: outlier_label})
+            else:
+                cluster_data = pd.Series(self.labels_, index=self.sample_labels_).replace({-1: outlier_label})
+
             # Plot clusters using the categorical track method
             ax_clusters = axes[current_axis_idx]
-            self._plot_categorical_track(ax_clusters, cluster_data, cluster_colors, 
+            self._plot_categorical_track(ax_clusters, cluster_data, cluster_colors,
                                        show_labels=show_cluster_labels, label_text=cluster_label)
             current_axis_idx += 1
             
@@ -785,7 +842,10 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             bottom_axis.set_xticks(leaf_positions)
             bottom_axis.set_xticklabels(self.leaves_, rotation=90)
             
-        plt.tight_layout()
+        if track_padding is not None:
+            plt.subplots_adjust(hspace=track_padding)
+        else:
+            plt.tight_layout()
         return fig, axes
         
     def summary(self):
@@ -809,13 +869,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
         if self.labels_ is not None:
             cluster_counts = pd.Series(self.labels_).value_counts().sort_index()
-            # Only include non-outlier cluster labels in summary
-            non_outlier_clusters = cluster_counts[cluster_counts.index != self.outlier_cluster]
+            non_outlier_clusters = cluster_counts[cluster_counts.index != -1]
             summary_dict['cluster_sizes'] = non_outlier_clusters.to_dict()
-            
-            # Add outlier count if present
-            if self.outlier_cluster in cluster_counts.index:
-                summary_dict['n_outliers'] = cluster_counts[self.outlier_cluster]
+            summary_dict['n_outliers'] = self.n_outliers_
             
         print("Hierarchical Clustering Summary")
         print("=" * 30)
@@ -833,7 +889,52 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 
         return summary_dict
 
-# # Export main classes and functions
-# __all__ = [
-#     'HierarchicalClustering',
-# ]
+    def to_igraph(self, threshold=None):
+        """
+        Convert the fitted distance matrix to an igraph weighted graph.
+
+        Creates a weighted undirected graph from the pairwise distance matrix.
+        Edge weights are the distances. If a threshold is provided, only edges
+        with distances <= threshold are included; otherwise, a fully connected
+        graph is created.
+
+        Parameters
+        ----------
+        threshold : float or None, default=None
+            Maximum distance for edge inclusion. If None, all pairwise
+            distances are included (fully connected graph).
+
+        Returns
+        -------
+        ig.Graph
+            Undirected weighted graph. Vertex attribute ``name`` contains
+            sample labels; vertex attribute ``cluster`` contains cluster
+            assignments (if available). Edge attribute ``weight`` contains
+            pairwise distances.
+        """
+        self._check_fitted()
+
+        import igraph as ig
+
+        dm_values = self.distance_matrix_.data
+        n = dm_values.shape[0]
+        i_indices, j_indices = np.triu_indices(n, k=1)
+        distances = dm_values[i_indices, j_indices]
+
+        if threshold is not None:
+            mask = distances <= threshold
+            i_indices = i_indices[mask]
+            j_indices = j_indices[mask]
+            distances = distances[mask]
+
+        edges = list(zip(i_indices.tolist(), j_indices.tolist()))
+        weights = distances.tolist()
+
+        graph = ig.Graph(n=n, edges=edges, directed=False)
+        graph.es['weight'] = weights
+        graph.vs['name'] = [str(label) for label in self.sample_labels_]
+
+        if self.labels_ is not None:
+            graph.vs['cluster'] = list(self.labels_)
+
+        return graph
