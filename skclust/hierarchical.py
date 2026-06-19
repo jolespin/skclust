@@ -35,11 +35,11 @@ from loguru import logger
 class HierarchicalClustering(BaseEstimator, ClusterMixin):
     """
     Hierarchical clustering with advanced tree cutting and visualization.
-    
+
     This class provides a comprehensive hierarchical clustering implementation
     that follows scikit-learn conventions while offering advanced features like
-    dynamic tree cutting, metadata tracks, and network analysis.
-    
+    hybrid/dynamic tree cutting, metadata tracks, and network analysis.
+
     Parameters
     ----------
     method : str, default='average'
@@ -47,14 +47,89 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         'single', 'centroid', 'median', 'weighted'.
     metric : str, default='euclidean'
         The distance metric to use for computing pairwise distances.
-    min_cluster_size : int, default=3
-        Minimum cluster size for dynamic tree cutting.
-    deep_split : int, default=2
-        Deep split parameter for dynamic tree cutting (0-4).
-    cut_method : str, default='dynamic'
-        Tree cutting method: 'dynamic', 'height', or 'maxclust'.
+    min_cluster_size : int, default=20
+        Minimum cluster size. Used by ``cut_method='hybrid'`` and
+        ``cut_method='height'`` (as ``minClusterSize`` and ``minModuleSize``
+        in the underlying ``dynamicTreeCut`` library, respectively).
+    deep_split : int or bool, default=1
+        Controls sensitivity to cluster splitting.  Ignored for
+        ``cut_method='height'`` and ``cut_method='maxclust'``.
+
+        * For ``cut_method='hybrid'``: integer 0--4
+          where higher values produce more and smaller clusters
+          (default 1).  A boolean is also accepted (``False`` → 0,
+          ``True`` → 1).  A finer control can be achieved via the
+          ``maxCoreScatter`` / ``minGap`` parameters in the underlying
+          ``cutreeHybrid`` function.
+        * For ``cut_method='tree'``: boolean where ``True`` enables
+          iterative sub-cluster detection within initial clusters and
+          ``False`` keeps only the initial static height cut
+          (default ``True``).
+    cut_method : str, default='hybrid'
+        Tree cutting method. One of:
+
+        * ``'hybrid'`` -- Adaptive branch pruning using both the
+          dendrogram structure and the original distance matrix.  First
+          identifies cluster cores from dendrogram branches, then
+          refines assignments with a PAM-like stage that uses pairwise
+          distances to reassign outlier and small-cluster objects.
+          Requires the distance matrix (always available since
+          ``HierarchicalClustering`` computes it internally).
+          Parameters: ``min_cluster_size``, ``deep_split`` (0--4),
+          ``cut_threshold`` (as ``cutHeight``), ``pam_stage``,
+          ``pam_respects_dendro``, ``use_medoids``, ``max_pam_dist``,
+          ``respect_small_clusters``.  Corresponds to
+          ``cutreeDynamic(method="hybrid")`` / ``cutreeHybrid`` in the
+          R ``dynamicTreeCut`` package.
+        * ``'tree'`` -- Adaptive branch pruning using only the dendrogram
+          structure (no distance matrix).  Faster but may give incorrect
+          assignments for outlying objects.  Parameters:
+          ``min_cluster_size`` (as ``minModuleSize``), ``deep_split``
+          (boolean), ``cut_threshold`` (as ``maxTreeHeight``, default 1).
+          This corresponds to ``cutreeDynamic(method="tree")`` /
+          ``cutreeDynamicTree`` in the R ``dynamicTreeCut`` package.
+          **Note:** The Python ``dynamicTreeCut`` package does not include
+          this method; a bundled implementation is provided.
+        * ``'height'`` -- Fixed-height cut using
+          ``scipy.cluster.hierarchy.fcluster`` with ``criterion='distance'``.
+          Parameters: ``cut_threshold`` (if ``None``, defaults to 70%
+          of max linkage height).
+        * ``'maxclust'`` -- Fixed number of clusters using
+          ``scipy.cluster.hierarchy.fcluster`` with ``criterion='maxclust'``.
+          Parameters: ``cut_threshold`` (required, positive integer).
     cut_threshold : float, optional
-        Threshold for height-based cutting or number of clusters for maxclust.
+        Interpretation depends on ``cut_method``:
+
+        * ``'hybrid'``: Maximum joining height (``cutHeight``).  If
+          ``None``, defaults to 99% of the range between the 5th
+          percentile and the maximum of the joining heights.
+        * ``'tree'``: Maximum tree height (``maxTreeHeight``).
+          Defaults to 1.
+        * ``'height'``: Height at which to cut.  If ``None``, uses 70%
+          of max linkage height.
+        * ``'maxclust'``: Number of clusters (required, positive integer).
+    pam_stage : bool, default=True
+        Only used for ``cut_method='hybrid'``.  If ``True``, perform the
+        second PAM-like stage that reassigns unassigned objects and small
+        clusters to their nearest cluster using the distance matrix.
+    pam_respects_dendro : bool, default=True
+        Only used for ``cut_method='hybrid'``.  If ``True``, the PAM stage
+        respects the dendrogram structure: objects can only be assigned to
+        clusters that lie on the same branch in the dendrogram.
+    use_medoids : bool, default=False
+        Only used for ``cut_method='hybrid'``.  If ``True``, the PAM stage
+        uses object-to-medoid distances; if ``False`` (recommended), uses
+        average object-to-cluster distances.
+    max_pam_dist : float, optional
+        Only used for ``cut_method='hybrid'``.  Maximum distance for PAM
+        assignment.  Objects farther than this from all clusters remain
+        unassigned (labeled -1).  Defaults to ``cut_threshold`` (i.e.,
+        ``cutHeight``).
+    respect_small_clusters : bool, default=True
+        Only used for ``cut_method='hybrid'``.  If ``True``, branches that
+        failed to become clusters only because of insufficient size are
+        assigned together in the PAM stage.  If ``False``, all objects are
+        assigned individually.
     name : str, optional
         Name for the clustering instance.
     random_state : int, optional
@@ -85,20 +160,46 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
     n_clusters_ : int
         Number of clusters found.
     n_outliers_ : int
-        Number of outlier samples. Only nonzero when cut_method='dynamic'.
+        Number of outlier samples. Only nonzero when
+        ``cut_method='hybrid'`` or ``cut_method='tree'``.
     outliers_ : list
         Sample labels of outlier samples identified by dynamic tree cutting.
     tracks_ : dict
         Dictionary of metadata tracks for visualization.
+
+    Notes
+    -----
+    The ``'hybrid'`` and ``'tree'`` methods are based on the R package
+    ``dynamicTreeCut`` by Peter Langfelder, Bin Zhang, and Steve Horvath
+    [1]_.  The R package's ``cutreeDynamic(method="hybrid")`` dispatches
+    to ``cutreeHybrid``, and ``cutreeDynamic(method="tree")`` dispatches
+    to ``cutreeDynamicTree``.  This class exposes the method choice
+    directly via ``cut_method``.
+
+    The ``'hybrid'`` method uses the Python ``dynamicTreeCut`` package
+    (``pip install dynamicTreeCut``).  The ``'tree'`` method uses a
+    bundled pure-Python implementation since the Python ``dynamicTreeCut``
+    package does not include it.
+
+    References
+    ----------
+    .. [1] Langfelder P, Zhang B, Horvath S (2008). "Defining clusters
+       from a hierarchical cluster tree: the Dynamic Tree Cut package for
+       R." *Bioinformatics*, 24(5):719-720.
     """
-    
+
     def __init__(self,
                  method='average',
                  metric='euclidean',
-                 min_cluster_size=3,
-                 deep_split=2,
-                 cut_method='dynamic',
+                 min_cluster_size=20,
+                 deep_split=1,
+                 cut_method='hybrid',
                  cut_threshold=None,
+                 pam_stage=True,
+                 pam_respects_dendro=True,
+                 use_medoids=False,
+                 max_pam_dist=None,
+                 respect_small_clusters=True,
                  name=None,
                  random_state=None,
                  distance_matrix_tol=1e-10,
@@ -109,29 +210,44 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         valid_methods = ['ward', 'complete', 'average', 'single', 'centroid', 'median', 'weighted']
         if method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
-        
-        valid_cut_methods = ['dynamic', 'height', 'maxclust']
+
+        valid_cut_methods = ['hybrid', 'tree', 'height', 'maxclust']
         if cut_method not in valid_cut_methods:
             raise ValueError(f"cut_method must be one of {valid_cut_methods}, got '{cut_method}'")
-        
-        if deep_split not in range(5):  # 0-4
-            raise ValueError(f"deep_split must be between 0 and 4, got {deep_split}")
-        
+
+        if cut_method == 'hybrid':
+            if isinstance(deep_split, bool):
+                deep_split = int(deep_split)
+                logger.info(f"deep_split converted from bool to int ({deep_split}) for cut_method='hybrid'")
+            if not isinstance(deep_split, int) or deep_split not in range(5):
+                raise ValueError(f"deep_split must be an integer between 0 and 4 for cut_method='hybrid', got {deep_split}")
+        elif cut_method == 'tree':
+            if isinstance(deep_split, int) and not isinstance(deep_split, bool):
+                deep_split = bool(deep_split)
+                logger.info(f"deep_split converted from int to bool ({deep_split}) for cut_method='tree'")
+            if not isinstance(deep_split, bool):
+                raise ValueError(f"deep_split must be a boolean for cut_method='tree', got {deep_split}")
+
         if min_cluster_size < 1:
             raise ValueError(f"min_cluster_size must be >= 1, got {min_cluster_size}")
-        
+
         if distance_matrix_tol <= 0:
             raise ValueError(f"distance_matrix_tol must be positive, got {distance_matrix_tol}")
-        
+
         if cluster_prefix is not None and not isinstance(cluster_prefix, str):
             raise ValueError(f"cluster_prefix must be a string or None, got {type(cluster_prefix)}")
-        
+
         self.method = method
         self.metric = metric
         self.min_cluster_size = min_cluster_size
         self.deep_split = deep_split
         self.cut_method = cut_method
         self.cut_threshold = cut_threshold
+        self.pam_stage = pam_stage
+        self.pam_respects_dendro = pam_respects_dendro
+        self.use_medoids = use_medoids
+        self.max_pam_dist = max_pam_dist
+        self.respect_small_clusters = respect_small_clusters
         self.name = name
         self.random_state = random_state
         self.distance_matrix_tol = distance_matrix_tol
@@ -344,8 +460,10 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         
     def _cut_tree(self):
         """Cut tree to obtain clusters."""
-        if self.cut_method == 'dynamic':
-            self._cut_tree_dynamic()
+        if self.cut_method == 'hybrid':
+            self._cut_tree_hybrid()
+        elif self.cut_method == 'tree':
+            self._cut_tree_dynamic_tree()
         elif self.cut_method == 'height':
             self._cut_tree_height()
         elif self.cut_method == 'maxclust':
@@ -353,9 +471,9 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
         else:
             raise ValueError(
                 f"Unknown cut_method '{self.cut_method}'. "
-                "Must be 'dynamic', 'height', or 'maxclust'."
+                "Must be 'hybrid', 'tree', 'height', or 'maxclust'."
             )
-        
+
         # Set n_clusters_ and outlier info after cutting
         if self.labels_ is not None:
             unique_labels = np.unique(self.labels_)
@@ -369,27 +487,40 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             # Apply cluster prefix if specified
             if self.cluster_prefix is not None:
                 self.labels_ = self._apply_cluster_prefix(self.labels_)
-            
-    def _cut_tree_dynamic(self):
-        """Perform dynamic tree cutting."""
+
+    def _cut_tree_hybrid(self):
+        """Hybrid adaptive tree cut using dendrogram structure and distance matrix.
+
+        Calls ``dynamicTreeCut.cutreeHybrid`` which first identifies cluster
+        cores from dendrogram branches, then refines assignments with a
+        PAM-like stage using pairwise distances.
+        """
         try:
             import dynamicTreeCut
         except ImportError:
             raise ImportError(
-                "Dynamic tree cutting requires dynamicTreeCut. "
+                "Hybrid tree cutting requires the dynamicTreeCut package. "
                 "Install it with: pip install dynamicTreeCut"
             )
-        
-        # Prepare parameters, handling None values appropriately
+
         params = {
             'minClusterSize': self.min_cluster_size,
             'deepSplit': self.deep_split,
+            'pamStage': self.pam_stage,
+            'pamRespectsDendro': self.pam_respects_dendro,
+            'useMedoids': self.use_medoids,
+            'respectSmallClusters': self.respect_small_clusters,
+            'verbose': 0,
         }
-        
-        # Only add cutHeight if it's specified
+
         if self.cut_threshold is not None:
             params['cutHeight'] = self.cut_threshold
-        
+
+        if self.max_pam_dist is not None:
+            params['maxPamDist'] = self.max_pam_dist
+        elif self.cut_threshold is not None:
+            params['maxPamDist'] = self.cut_threshold
+
         try:
             # dynamicTreeCut uses np.in1d which was removed in NumPy 2.0
             _in1d_patched = not hasattr(np, 'in1d')
@@ -401,7 +532,7 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
                 self.distance_matrix_.data,
                 **params
             )
-            
+
             if isinstance(results, dict) and 'labels' in results:
                 self.labels_ = results['labels']
             else:
@@ -412,10 +543,139 @@ class HierarchicalClustering(BaseEstimator, ClusterMixin):
             self.labels_ = self.labels_ - 1
 
         except Exception as e:
-            raise RuntimeError(f"Dynamic tree cutting failed: {e}")
+            raise RuntimeError(f"Hybrid tree cutting failed: {e}")
         finally:
             if _in1d_patched:
                 del np.in1d
+
+    def _cut_tree_dynamic_tree(self):
+        """Dynamic tree cut using dendrogram structure only (no distance matrix).
+
+        A pure-dendrogram method that identifies clusters by variable-height
+        branch pruning.  Faster than hybrid but may misassign outlying objects
+        since it cannot consult pairwise distances.
+
+        Based on ``cutreeDynamicTree`` from the R ``dynamicTreeCut`` package.
+        """
+        from scipy.cluster.hierarchy import fcluster as _fcluster
+
+        n = self.linkage_matrix_.shape[0] + 1
+        heights = self.linkage_matrix_[:, 2]
+
+        max_tree_height = self.cut_threshold if self.cut_threshold is not None else 1.0
+        if max_tree_height > np.max(heights):
+            max_tree_height = 0.99 * np.max(heights)
+
+        static_labels = _fcluster(self.linkage_matrix_, max_tree_height, criterion='distance')
+
+        # Remove clusters smaller than min_cluster_size
+        counts = Counter(static_labels)
+        for label, count in counts.items():
+            if count < self.min_cluster_size:
+                static_labels[static_labels == label] = 0
+        # Mark removed as unassigned
+        static_labels[static_labels == 0] = -1
+
+        if not self.deep_split:
+            # Renumber clusters by descending size
+            self.labels_ = self._renumber_labels(static_labels)
+            return
+
+        # Deep split: iteratively check branches for substructure
+        dendro_order = self.dendrogram_['leaves']
+
+        ordered_heights = np.zeros(n)
+        merge = np.zeros((n - 1, 2), dtype=int)
+        for i in range(n - 1):
+            merge[i, 0] = int(self.linkage_matrix_[i, 0])
+            merge[i, 1] = int(self.linkage_matrix_[i, 1])
+
+        for i in range(n):
+            idx = i
+            for j in range(n - 1):
+                if merge[j, 0] == idx or merge[j, 1] == idx:
+                    ordered_heights[i] = heights[j]
+                    break
+
+        ordered_labels = static_labels[dendro_order]
+        ordered_h = ordered_heights[dendro_order]
+
+        unique_clusters = [c for c in np.unique(ordered_labels) if c != -1]
+        new_labels = ordered_labels.copy()
+        next_label = max(unique_clusters) + 1 if unique_clusters else 1
+
+        changed = True
+        while changed:
+            changed = False
+            current_clusters = [c for c in np.unique(new_labels) if c != -1]
+            for cl in current_clusters:
+                mask = new_labels == cl
+                indices = np.where(mask)[0]
+                if len(indices) < 2 * self.min_cluster_size:
+                    continue
+
+                cl_heights = ordered_h[indices]
+                mean_h = np.mean(cl_heights)
+
+                above = cl_heights >= mean_h
+                below = ~above
+
+                runs = []
+                current_run_start = 0
+                current_is_above = above[0]
+                for k in range(1, len(above)):
+                    if above[k] != current_is_above:
+                        runs.append((current_run_start, k - 1, current_is_above))
+                        current_run_start = k
+                        current_is_above = above[k]
+                runs.append((current_run_start, len(above) - 1, current_is_above))
+
+                # Find split points: transitions from below to above
+                split_points = []
+                for k in range(1, len(runs)):
+                    if not runs[k - 1][2] and runs[k][2]:
+                        if runs[k - 1][1] - runs[k - 1][0] + 1 >= self.min_cluster_size // 3:
+                            split_points.append(runs[k][0])
+
+                if len(split_points) == 0:
+                    continue
+
+                segments = []
+                prev = 0
+                for sp in split_points:
+                    segments.append(indices[prev:sp])
+                    prev = sp
+                segments.append(indices[prev:])
+
+                valid_segments = [s for s in segments if len(s) >= self.min_cluster_size]
+                if len(valid_segments) <= 1:
+                    continue
+
+                # Reassign
+                changed = True
+                for seg in valid_segments:
+                    new_labels[seg] = next_label
+                    next_label += 1
+                leftover = np.setdiff1d(indices, np.concatenate(valid_segments))
+                if len(leftover) > 0:
+                    new_labels[leftover] = -1
+
+        # Map back from dendrogram order to original order
+        result = np.full(n, -1, dtype=int)
+        for i, orig_idx in enumerate(dendro_order):
+            result[orig_idx] = new_labels[i]
+
+        self.labels_ = self._renumber_labels(result)
+
+    @staticmethod
+    def _renumber_labels(labels):
+        """Renumber cluster labels by descending size, keeping -1 for unassigned."""
+        counts = Counter(l for l in labels if l != -1)
+        if not counts:
+            return labels
+        sorted_clusters = [c for c, _ in counts.most_common()]
+        mapping = {old: new for new, old in enumerate(sorted_clusters)}
+        return np.array([mapping[l] if l != -1 else -1 for l in labels])
             
     def _cut_tree_height(self):
         """Cut tree at specified height."""
