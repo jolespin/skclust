@@ -47,13 +47,9 @@ setup(
     include_package_data=True,
     install_requires=install_requires,
     extras_require={
-        "fast": ["fastcluster>=1.2.0"],
-        "tree": ["scikit-bio>=0.5.6"],
         "dynamic": ["dynamicTreeCut>=0.1.0"],
         "network": ["ensemble-networkx>=0.1.0"],
         "all": [
-            "fastcluster>=1.2.0",
-            "scikit-bio>=0.5.6",
             "dynamicTreeCut>=0.1.0",
             "ensemble-networkx>=0.1.0",
         ],
