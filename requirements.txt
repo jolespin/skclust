@@ -7,6 +7,7 @@ scikit-bio>=0.5.6
 python-igraph
 loguru
 fastcluster>=1.2.0
+kneed>=0.8.0
 
 # Optional dependencies
 # =====================

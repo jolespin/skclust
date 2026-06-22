@@ -1,4 +1,14 @@
 # Change Log
+* [2026.6.22] - Added `detect_optimal_k`, `sensitivity`, `aggregation`, `direction`, and `curve` parameters to `KNeighborsCosineGraph` for automatic k selection via knee detection
+* [2026.6.22] - Added `KNeighborsCosineGraph.detect_knee` method for running or re-running knee detection with updated parameters without refitting KNN
+* [2026.6.22] - Added `KNeighborsCosineGraph.to_igraph` method for building directed igraph at detected k, explicit k, or full neighborhood with label support
+* [2026.6.22] - Added `KNeighborsCosineGraph.plot` method for k-similarity elbow diagnostic with IQR and knee visualization
+* [2026.6.22] - Added `k_similarity_curve_`, `k_similarity_q25_`, `k_similarity_q75_`, `kneedle_`, `k_`, and `max_k_` attributes to `KNeighborsCosineGraph`
+* [2026.6.20] - Added `SharedNearestNeighborsGraph` to `skclust.neighbors`
+* [2026.6.20] - Changed `KNeighborsCosineSimilarity` to `KNeighborsCosineGraph` and dropped `.distances_`
+* [2026.6.20] - Added `utils` module with new `adjacency_to_igraph` and `choose_minimum_cluster_size` functions
+* [2026.6.20] - Added `kneed` as required dependency
+* [2026.6.20] - **Breaking change**: changed default `partition_type` in `ConsensusLeidenClustering` from `RBConfigurationVertexPartition` to `CPMVertexPartition`.  Users must specify `resolution_parameter` but a `auto` is also supported which takes the median edge weight with a warning to the logger.
 * [2026.6.19] - **Breaking change**: replaced `cut_method='dynamic'` with `cut_method='hybrid'` and `cut_method='tree'` in `HierarchicalClustering` to match the two algorithms in the R `dynamicTreeCut` package. The R package's `cutreeDynamic` is just a wrapper that dispatches to `cutreeHybrid` (dendrogram + distance matrix + PAM) or `cutreeDynamicTree` (dendrogram only) — there is no distinct "dynamic" algorithm. `'dynamic'` is no longer accepted; valid `cut_method` values are `'hybrid'`, `'tree'`, `'height'`, and `'maxclust'`.
 * [2026.6.19] - **Breaking change**: changed `HierarchicalClustering` defaults to match the R `dynamicTreeCut` package — `min_cluster_size` 3→20, `deep_split` 2→1.
 * [2026.6.19] - Added hybrid-specific PAM parameters to `HierarchicalClustering`: `pam_stage` (default `True`), `pam_respects_dendro` (default `True`), `use_medoids` (default `False`), `max_pam_dist` (default `None` → `cutHeight`), `respect_small_clusters` (default `True`). All defaults match the R `dynamicTreeCut` package.
