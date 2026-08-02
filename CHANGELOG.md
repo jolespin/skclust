@@ -1,6 +1,8 @@
 # Change Log
+* [2026.6.22] - Refactored `HierarchicalClustering` into `BaseHierarchicalClustering` (ABC) + `HierarchicalClustering` (fastcluster/dynamicTreeCut) + `ConnectivityHierarchicalClustering` (sklearn `AgglomerativeClustering` with sparse connectivity support). All shared logic (tree cutting, plotting, tracks, summary) lives in the base class; subclasses implement `_prepare_input` and `_perform_clustering`.
 * [2026.6.22] - Added `detect_optimal_k`, `sensitivity`, `aggregation`, `direction`, and `curve` parameters to `KNeighborsCosineGraph` for automatic k selection via knee detection
 * [2026.6.22] - Added `KNeighborsCosineGraph.detect_knee` method for running or re-running knee detection with updated parameters without refitting KNN
+* [2026.6.22] - Added `KNeighborsCosineGraph.to_kneighbors_graph` method for connectivity and distance graph arrays
 * [2026.6.22] - Added `KNeighborsCosineGraph.to_igraph` method for building directed igraph at detected k, explicit k, or full neighborhood with label support
 * [2026.6.22] - Added `KNeighborsCosineGraph.plot` method for k-similarity elbow diagnostic with IQR and knee visualization
 * [2026.6.22] - Added `k_similarity_curve_`, `k_similarity_q25_`, `k_similarity_q75_`, `kneedle_`, `k_`, and `max_k_` attributes to `KNeighborsCosineGraph`

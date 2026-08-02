@@ -184,7 +184,7 @@ def kneighbors_to_snn_graph(indices, k=None, skip_self=True):
     Parameters
     ----------
     indices : np.ndarray, shape (n_samples, K_max)
-        Neighbor indices, e.g. from KNeighborsCosineSimilarity.indices_
+        Neighbor indices, e.g. from KNeighborsCosineGraph.indices_
     k : int or None, default=None
         Number of neighbors to use. If None, uses all available neighbors.
     skip_self : bool, default=True
@@ -219,8 +219,8 @@ def kneighbors_to_snn_graph(indices, k=None, skip_self=True):
        
     Examples
     --------
-    >>> from skclust.neighbors import KNeighborsCosineSimilarity, kneighbors_to_snn_graph
-    >>> knn = KNeighborsCosineSimilarity(n_neighbors=100, backend="faiss")
+    >>> from skclust.neighbors import KNeighborsCosineGraph, kneighbors_to_snn_graph
+    >>> knn = KNeighborsCosineGraph(n_neighbors=100, backend="faiss")
     >>> knn.fit(X)
     >>> A_snn = kneighbors_to_snn_graph(knn.indices_, k=75)
     """
@@ -787,9 +787,9 @@ def _search_index(index, X_query, k, backend, X_fit=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KNeighborsCosineSimilarity (v1)
+# KNeighborsCosineGraph (v1)
 # ══════════════════════════════════════════════════════════════════════════════
-# class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
+# class KNeighborsCosineGraph(BaseEstimator, TransformerMixin):
 #     """
 #     K-Nearest Neighbors using cosine similarity.
 
@@ -1381,6 +1381,63 @@ class KNeighborsCosineGraph(BaseEstimator, TransformerMixin):
         edges = list(zip(sources, targets, weights))
         graph = ig.Graph.TupleList(edges, weights=True, directed=True)
         return graph
+
+    def to_kneighbors_graph(self, k=None, mode="connectivity", include_self=False):
+        """
+        Convert KNN indices to a sparse connectivity or distance matrix.
+
+        Equivalent to ``sklearn.neighbors.kneighbors_graph``.
+
+        Parameters
+        ----------
+        k : int or None
+            Number of neighbors. None uses ``k_`` if available,
+            otherwise ``max_k_``. Does not modify state.
+        mode : {'connectivity', 'distance'}, default='connectivity'
+            ``'connectivity'`` returns binary adjacency.
+            ``'distance'`` returns cosine distances (1 - similarity) as weights.
+        include_self : bool, default=False
+            If True, include self-connections (diagonal entries).
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix, shape (n_samples, n_samples)
+            Asymmetric sparse matrix (A[i,j] = 1 or distance if j is
+            a k-neighbor of i).
+        """
+        from scipy.sparse import csr_matrix
+
+        check_is_fitted(self, ["indices_"])
+
+        if mode not in ("connectivity", "distance"):
+            raise ValueError(
+                f"mode must be 'connectivity' or 'distance', got '{mode}'"
+            )
+
+        if k is None:
+            k = self.k_ if self.k_ is not None else self.max_k_
+        if k > self.max_k_:
+            raise ValueError(f"k={k} exceeds max_k_={self.max_k_}")
+
+        n = self.n_samples_fit_
+
+        if include_self:
+            idx_slice = slice(0, k + 1)
+        else:
+            idx_slice = slice(1, k + 1)
+
+        neighbor_idx = self.indices_[:, idx_slice]
+        n_per_row = neighbor_idx.shape[1]
+
+        rows = np.repeat(np.arange(n), n_per_row)
+        cols = neighbor_idx.ravel()
+
+        if mode == "connectivity":
+            data = np.ones(len(rows), dtype=np.float64)
+        else:
+            data = np.clip(1 - self.similarities_[:, idx_slice].ravel(), 0, 2)
+
+        return csr_matrix((data, (rows, cols)), shape=(n, n))
 
     def plot(self, ax=None, figsize=(8, 5),
              xlabel=None, ylabel=None, title=None,
