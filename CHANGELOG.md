@@ -1,4 +1,8 @@
 # Change Log
+* [2026.8.3] - Added `r_squared_` attribute and `"R-squared"` key in `permanova_` Series to `ClusteredDistances`. R² (proportion of variance explained) is derived from the PERMANOVA pseudo-F statistic via R² = 1 / (1 + (n − g) / ((g − 1) × F)).
+* [2026.8.3] - Added `skbio.DistanceMatrix` support to `ClusteredDistances.fit()`. Labeled DistanceMatrix IDs are validated against `y.index` for both content and order; unlabeled DistanceMatrix objects are accepted positionally. Requires `metric="precomputed"` explicitly.
+* [2026.8.3] - **Breaking change**: renamed `labels` parameter to `y` in `ClusteredDistances.fit()` and `fit_transform()` to follow the sklearn API convention.
+* [2026.8.3] - **Breaking change**: `ClusteredDistances` no longer auto-overrides `metric` to `"precomputed"` when X is a square `pd.DataFrame` with matching index/columns. A `ValueError` is now raised if `metric != "precomputed"` in this case.
 * [2026.6.22] - Refactored `HierarchicalClustering` into `BaseHierarchicalClustering` (ABC) + `HierarchicalClustering` (fastcluster/dynamicTreeCut) + `ConnectivityHierarchicalClustering` (sklearn `AgglomerativeClustering` with sparse connectivity support). All shared logic (tree cutting, plotting, tracks, summary) lives in the base class; subclasses implement `_prepare_input` and `_perform_clustering`.
 * [2026.6.22] - Added `detect_optimal_k`, `sensitivity`, `aggregation`, `direction`, and `curve` parameters to `KNeighborsCosineGraph` for automatic k selection via knee detection
 * [2026.6.22] - Added `KNeighborsCosineGraph.detect_knee` method for running or re-running knee detection with updated parameters without refitting KNN
