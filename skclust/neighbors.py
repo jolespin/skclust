@@ -2247,8 +2247,13 @@ class EnsembleKNeighborsClassifier(BaseEstimator, ClassifierMixin):
         X = check_array(X)
 
         S = X @ self.X_train_.T
-        neighbor_indices = np.argsort(-S, axis=1)
-        sorted_similarities = np.take_along_axis(S, neighbor_indices, axis=1)
+        max_k = max(self.k_values)
+        # O(n) partition to find top-max_k, then O(max_k log max_k) sort within
+        top_k_unsorted = np.argpartition(-S, max_k, axis=1)[:, :max_k]
+        top_k_sims_unsorted = np.take_along_axis(S, top_k_unsorted, axis=1)
+        sort_within = np.argsort(-top_k_sims_unsorted, axis=1)
+        neighbor_indices = np.take_along_axis(top_k_unsorted, sort_within, axis=1)
+        sorted_similarities = np.take_along_axis(top_k_sims_unsorted, sort_within, axis=1)
 
         n_samples = X.shape[0]
         n_classes = len(self.classes_)
