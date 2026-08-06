@@ -1,4 +1,5 @@
 # Change Log
+* [2026.8.6] - Added `EnsembleKNeighborsClassifier` to `skclust.neighbors` — a KNN classifier that ensembles predictions across multiple k values using a shared cosine similarity matrix and single argsort. Supports `weights="distance"` (similarity-weighted) and `weights="uniform"` voting. Provides `predict`, `predict_proba`, and `predict_proba_per_k` methods. Fully compatible with scikit-learn's estimator API (`BaseEstimator`, `ClassifierMixin`).
 * [2026.8.3] - Added `r_squared_` attribute and `"R-squared"` key in `permanova_` Series to `ClusteredDistances`. R² (proportion of variance explained) is derived from the PERMANOVA pseudo-F statistic via R² = 1 / (1 + (n − g) / ((g − 1) × F)).
 * [2026.8.3] - Added `skbio.DistanceMatrix` support to `ClusteredDistances.fit()`. Labeled DistanceMatrix IDs are validated against `y.index` for both content and order; unlabeled DistanceMatrix objects are accepted positionally. Requires `metric="precomputed"` explicitly.
 * [2026.8.3] - **Breaking change**: renamed `labels` parameter to `y` in `ClusteredDistances.fit()` and `fit_transform()` to follow the sklearn API convention.
