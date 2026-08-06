@@ -9,11 +9,11 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 import scipy.sparse as sps
-from sklearn.base import clone, BaseEstimator, TransformerMixin
+from sklearn.base import clone, BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.neighbors import KNeighborsTransformer
 from scipy.spatial.distance import squareform
 from sklearn.metrics import pairwise_distances
-from sklearn.utils.validation import check_is_fitted, check_array
+from sklearn.utils.validation import check_is_fitted, check_array, check_X_y
 from tqdm import tqdm
 from loguru import logger
 from .utils import adjacency_to_igraph
@@ -2133,3 +2133,177 @@ class FaissKNNTransformer(BaseEstimator, TransformerMixin):
 
     def fit_transform(self, X, y=None):
         return self.fit(X, y).transform(X)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EnsembleKNeighborsClassifier
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EnsembleKNeighborsClassifier(BaseEstimator, ClassifierMixin):
+    """
+    KNN classifier that ensembles predictions across multiple k values.
+
+    Computes a single cosine similarity matrix (via dot product on
+    L2-normalized embeddings) and a single argsort, then slices the
+    top-k neighbors for each k value. Class probabilities are averaged
+    across all k values to produce the final prediction.
+
+    Parameters
+    ----------
+    k_values : list of int
+        The k values to ensemble over (e.g., [3, 5, 7, 11]).
+    metric : str, default="cosine"
+        Similarity metric. Only "cosine" is currently supported.
+    weights : {"distance", "uniform"}, default="distance"
+        How to weight neighbors within each k.
+        - "distance": weight each neighbor by its cosine similarity.
+        - "uniform": all neighbors contribute equally.
+
+    Attributes
+    ----------
+    X_train_ : ndarray of shape (n_samples_train, n_features)
+        Training embeddings (assumed L2-normalized).
+    y_train_ : ndarray of shape (n_samples_train,)
+        Training labels.
+    classes_ : ndarray
+        Unique class labels sorted in ascending order.
+    class_to_index_ : dict
+        Mapping from class label to column index in probability vectors.
+    """
+
+    def __init__(self, k_values, metric="cosine", weights="distance"):
+        self.k_values = k_values
+        self.metric = metric
+        self.weights = weights
+
+    def _validate_params(self):
+        if self.metric != "cosine":
+            raise NotImplementedError(
+                f"Only metric='cosine' is supported, got '{self.metric}'"
+            )
+        if self.weights not in ("uniform", "distance"):
+            raise ValueError(
+                f"weights must be 'uniform' or 'distance', got '{self.weights}'"
+            )
+        k_arr = np.asarray(self.k_values)
+        if k_arr.ndim != 1 or len(k_arr) == 0:
+            raise ValueError("k_values must be a non-empty 1D list of integers")
+        if not np.issubdtype(k_arr.dtype, np.integer) or np.any(k_arr <= 0):
+            raise ValueError("All k_values must be positive integers")
+        if len(set(self.k_values)) != len(self.k_values):
+            raise ValueError("k_values must not contain duplicates")
+
+    def fit(self, X, y):
+        """
+        Store training data and derive class metadata.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training embeddings (assumed L2-normalized).
+        y : array-like of shape (n_samples,)
+            Training labels.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        X, y = check_X_y(X, y)
+
+        if max(self.k_values) > X.shape[0]:
+            raise ValueError(
+                f"max(k_values)={max(self.k_values)} exceeds "
+                f"n_samples_train={X.shape[0]}"
+            )
+
+        self.X_train_ = X
+        self.y_train_ = y
+        self.classes_ = np.unique(y)
+        self.class_to_index_ = {c: i for i, c in enumerate(self.classes_)}
+
+        logger.info(
+            f"EnsembleKNeighborsClassifier.fit | "
+            f"n_samples={X.shape[0]}, n_features={X.shape[1]}, "
+            f"n_classes={len(self.classes_)}, k_values={self.k_values}"
+        )
+        return self
+
+    def predict_proba_per_k(self, X):
+        """
+        Compute class probabilities for each k value independently.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes, n_k_values)
+            Class probability vectors for each sample and each k.
+        """
+        check_is_fitted(self)
+        X = check_array(X)
+
+        S = X @ self.X_train_.T
+        neighbor_indices = np.argsort(-S, axis=1)
+        sorted_similarities = np.take_along_axis(S, neighbor_indices, axis=1)
+
+        n_samples = X.shape[0]
+        n_classes = len(self.classes_)
+        n_k = len(self.k_values)
+        label_indices = np.array([self.class_to_index_[c] for c in self.y_train_])
+
+        proba = np.zeros((n_samples, n_classes, n_k), dtype=np.float64)
+
+        for ki, k in enumerate(self.k_values):
+            top_k_indices = neighbor_indices[:, :k]
+            top_k_labels = label_indices[top_k_indices]
+
+            if self.weights == "uniform":
+                for c_idx in range(n_classes):
+                    proba[:, c_idx, ki] = np.mean(top_k_labels == c_idx, axis=1)
+            else:
+                top_k_sims = sorted_similarities[:, :k]
+                for c_idx in range(n_classes):
+                    mask = top_k_labels == c_idx
+                    proba[:, c_idx, ki] = np.sum(top_k_sims * mask, axis=1)
+                row_sums = proba[:, :, ki].sum(axis=1, keepdims=True)
+                row_sums = np.where(row_sums == 0, 1.0, row_sums)
+                proba[:, :, ki] /= row_sums
+
+        return proba
+
+    def predict_proba(self, X):
+        """
+        Compute class probabilities averaged across all k values.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes)
+            Mean class probability vectors.
+        """
+        return self.predict_proba_per_k(X).mean(axis=2)
+
+    def predict(self, X):
+        """
+        Predict class labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,)
+            Predicted class labels.
+        """
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
