@@ -6,7 +6,10 @@ Cluster validation metrics for continuous and binary features.
 These functions evaluate cluster quality by measuring within-cluster compactness
 and between-cluster separation.
 """
+from __future__ import annotations
 from typing import Optional, Union
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import squareform
@@ -17,6 +20,22 @@ from scipy.stats import (
 from tqdm.auto import tqdm
 from loguru import logger
 # from scipy.stats.contingency import association
+
+ 
+
+def pielou_evenness(sizes: np.ndarray) -> float:
+    """
+    Pielou's evenness J = H / log(S) for a cluster-size distribution.
+
+    H is the Shannon entropy of the size proportions and S the number of
+    clusters. J is 1.0 when all clusters are equal in size and approaches 0 as
+    one cluster dominates. Undefined (NaN) for fewer than two clusters.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    n_clusters = sizes.shape[0]
+    if n_clusters < 2:
+        return float("nan")
+    return float(entropy(sizes, base=2) / np.log2(n_clusters))
 
 
 # ============================================================================

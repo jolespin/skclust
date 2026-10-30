@@ -101,9 +101,9 @@ def cosine_distances_to_representatives(
     if _X_is_df:
         X_l2 = X_l2.values
     if _labels_is_series:
-        labels_values = labels.values
+        y_values = labels.values
     else:
-        labels_values = np.asarray(labels)
+        y_values = np.asarray(labels)
     if _Xrep_is_df:
         X_representatives_l2 = X_representatives_l2.values
     if _replabels_is_series:
@@ -119,8 +119,8 @@ def cosine_distances_to_representatives(
     X_representatives_l2 = np.asarray(X_representatives_l2, dtype=np.float32)
 
     # --- Shape checks ---
-    assert X_l2.shape[0] == len(labels_values), \
-        f"X_l2 rows ({X_l2.shape[0]}) != labels length ({len(labels_values)})"
+    assert X_l2.shape[0] == len(y_values), \
+        f"X_l2 rows ({X_l2.shape[0]}) != labels length ({len(y_values)})"
     assert X_l2.shape[1] == X_representatives_l2.shape[1], \
         f"Embedding dimensions differ: {X_l2.shape[1]} vs {X_representatives_l2.shape[1]}"
     assert X_representatives_l2.shape[0] == len(representative_labels) == len(representative_types), \
@@ -147,20 +147,20 @@ def cosine_distances_to_representatives(
 
         group_to_idx = pd.Series(np.arange(len(rep_labels)), index=rep_labels)
         
-        missing = set(labels_values) - set(rep_labels)
+        missing = set(y_values) - set(rep_labels)
         if missing:
             raise ValueError(
                 f"Representative type '{rep_type}' is missing for {len(missing)} group(s): "
                 f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
             )
         
-        aligned_idx = group_to_idx.loc[labels_values].values
+        aligned_idx = group_to_idx.loc[y_values].values
         X_rep_aligned = X_rep[aligned_idx]
         
         distances = 1.0 - np.sum(X_l2 * X_rep_aligned, axis=1)
         results[rep_type] = distances
 
-    df_distances = pd.DataFrame(results, index=obs_index if obs_index is not None else np.arange(len(labels_values)))
+    df_distances = pd.DataFrame(results, index=obs_index if obs_index is not None else np.arange(len(y_values)))
     df_distances.index.name = index_name
     
     return df_distances
@@ -285,8 +285,10 @@ class ClusteredDistances:
     metric : str, default "cosine"
         Distance metric: "cosine" (requires L2-normalized rows),
         "jaccard" (requires binary 0/1 rows), or "precomputed"
-        (X is a square distance matrix). A square pd.DataFrame with
-        matching index and columns is auto-detected as precomputed.
+        (X is a square distance matrix, pd.DataFrame, or skbio
+        DistanceMatrix). Passing a square pd.DataFrame with matching
+        index/columns or a skbio DistanceMatrix requires
+        ``metric="precomputed"`` explicitly.
     check : bool, default True
         Validate input (L2-norm for cosine, binary for jaccard,
         symmetry for precomputed).
@@ -322,6 +324,14 @@ class ClusteredDistances:
     permanova_ : pd.Series or None
         Output of ``skbio.stats.distance.permanova``, or None if
         ``n_permutations`` was not set.
+    p_value_ : float
+        PERMANOVA p-value (shortcut for ``permanova_["p-value"]``).
+        Only set when ``n_permutations`` is not None.
+    r_squared_ : float
+        Proportion of variance explained by the grouping, derived
+        from the PERMANOVA pseudo-F statistic:
+        R² = 1 / (1 + (n − g) / ((g − 1) × F)).
+        Only set when ``n_permutations`` is not None.
     labels_ : np.ndarray or pd.Series
         Cluster labels as passed to ``fit``.
     n_samples_ : int
@@ -365,6 +375,11 @@ class ClusteredDistances:
     is sensitive to dispersion differences in unbalanced designs.
     It should not be interpreted as a drop-in p-value for the
     rank-biserial correlation.
+
+    When PERMANOVA is run, R² (proportion of total variance explained
+    by the grouping) is derived from the pseudo-F statistic and stored
+    in ``.r_squared_`` and in the ``permanova_`` Series under key
+    ``"R-squared"``.
 
     **Confounding**
 
@@ -556,70 +571,115 @@ class ClusteredDistances:
     # ------------------------------------------------------------------
     def fit(
         self,
-        X: Union[np.ndarray, pd.DataFrame],
-        labels: Union[np.ndarray, pd.Series],
+        X: Union[np.ndarray, pd.DataFrame, DistanceMatrix],
+        y: Union[np.ndarray, pd.Series],
     ) -> "ClusteredDistances":
         """
         Compute cluster distance summaries and effect sizes.
 
         Parameters
         ----------
-        X : np.ndarray or pd.DataFrame, shape (n, d) or (n, n)
-            Data matrix or precomputed distance matrix.
-        labels : np.ndarray or pd.Series, shape (n,)
-            Cluster labels aligned with rows of X.
+        X : np.ndarray, pd.DataFrame, or skbio.DistanceMatrix
+            Data matrix, precomputed distance matrix, or skbio
+            DistanceMatrix. A DistanceMatrix is always treated as
+            precomputed regardless of the ``metric`` parameter.
+        y : np.ndarray or pd.Series, shape (n,)
+            Cluster labels aligned with rows of X. When X is a
+            DistanceMatrix with non-default IDs and y is a Series,
+            ``y.index`` must match the DistanceMatrix IDs.
 
         Returns
         -------
         self
         """
+        # -- Handle skbio DistanceMatrix --
+        _X_is_dm = isinstance(X, DistanceMatrix)
+        if _X_is_dm:
+            dm_ids = list(X.ids)
+            dm_default_ids = [str(i) for i in range(X.shape[0])]
+            _dm_is_labeled = dm_ids != dm_default_ids
+
+            if isinstance(y, pd.Series) and _dm_is_labeled:
+                dm_index = pd.Index(dm_ids)
+                if not dm_index.equals(y.index):
+                    if set(dm_ids) == set(y.index):
+                        raise ValueError(
+                            "DistanceMatrix IDs and y.index contain the "
+                            "same values but in different order. Reindex "
+                            "y to match the DistanceMatrix ID order."
+                        )
+                    raise ValueError(
+                        f"DistanceMatrix IDs and y.index do not match. "
+                        f"DistanceMatrix has {len(dm_ids)} IDs, y has "
+                        f"{len(y.index)} entries, with "
+                        f"{len(dm_index.difference(y.index))} in "
+                        f"DistanceMatrix only and "
+                        f"{len(y.index.difference(dm_index))} in y only."
+                    )
+
+            self._dm_input_ = X
+            X = pd.DataFrame(
+                X.data,
+                index=dm_ids,
+                columns=dm_ids,
+            ) if _dm_is_labeled else X.data
+
+            if _dm_is_labeled and not isinstance(y, pd.Series):
+                y = pd.Series(np.asarray(y), index=dm_ids)
+
         # -- Type concordance --
         _X_is_df = isinstance(X, pd.DataFrame)
-        _labels_is_series = isinstance(labels, pd.Series)
-        if _X_is_df and not _labels_is_series:
-            raise TypeError("X is a DataFrame but labels is not a Series")
-        if _labels_is_series and not _X_is_df:
-            raise TypeError("labels is a Series but X is not a DataFrame")
+        _y_is_series = isinstance(y, pd.Series)
+        if _X_is_df and not _y_is_series:
+            raise TypeError("X is a DataFrame but y is not a Series")
+        if _y_is_series and not _X_is_df:
+            raise TypeError("y is a Series but X is not a DataFrame")
 
         # -- Resolve metric (auto-detect precomputed) --
         metric = self.metric
-        if (
+        if _X_is_dm:
+            if metric != "precomputed":
+                raise ValueError(
+                    f"X is a skbio DistanceMatrix but metric='{metric}'. "
+                    f"Set metric='precomputed' when passing a DistanceMatrix."
+                )
+        elif (
             _X_is_df
             and X.shape[0] == X.shape[1]
             and X.index.equals(X.columns)
         ):
             if metric != "precomputed":
-                logger.info(
-                    f"X is a square DataFrame with matching index/columns; "
-                    f"overriding metric='{metric}' → 'precomputed'"
+                raise ValueError(
+                    f"X is a square DataFrame with matching index/columns "
+                    f"but metric='{metric}'. Set metric='precomputed' when "
+                    f"passing a precomputed distance matrix."
                 )
-                metric = "precomputed"
 
         # -- Index alignment --
         index = None
-        if _X_is_df and _labels_is_series:
-            if not X.index.equals(labels.index):
+        if _X_is_df and _y_is_series:
+            if not X.index.equals(y.index):
                 raise ValueError(
-                    f"X.index and labels.index do not match. "
-                    f"X has {len(X.index)} entries, labels has "
-                    f"{len(labels.index)} entries, with "
-                    f"{len(X.index.difference(labels.index))} in X only and "
-                    f"{len(labels.index.difference(X.index))} in labels only."
+                    f"X.index and y.index do not match. "
+                    f"X has {len(X.index)} entries, y has "
+                    f"{len(y.index)} entries, with "
+                    f"{len(X.index.difference(y.index))} in X only and "
+                    f"{len(y.index.difference(X.index))} in y only."
                 )
             index = X.index
 
         # -- Store metadata --
         self.n_samples_ = X.shape[0]
         self.n_features_ = X.shape[1] if metric != "precomputed" else None
-        self.labels_ = labels
+        self.labels_ = y
 
         # -- Coerce to numpy --
         X_values = X.values if _X_is_df else np.asarray(X)
-        labels_values = labels.values if _labels_is_series else np.asarray(labels)
+        y_values = y.values if _y_is_series else np.asarray(y)
 
-        assert X_values.shape[0] == labels_values.shape[0], (
+        assert X_values.shape[0] == y_values.shape[0], (
             f"X rows ({X_values.shape[0]}) != "
-            f"labels length ({labels_values.shape[0]})"
+            f"y length ({y_values.shape[0]})"
         )
 
         # -- Validate --
@@ -636,20 +696,23 @@ class ClusteredDistances:
 
         # -- Per-cluster loop --
         _summary_metrics = ["n_pairs", "mean", "median", "std", "mad"]
-        unique_labels = np.unique(labels_values)
+        unique_labels = np.unique(y_values)
 
         results = {}
         effect_sizes = {}
         u_statistics = {}
         p_values_naive = {}
 
-        for id_cluster in tqdm(unique_labels, desc="Clusters", unit="cluster"):
-            mask = labels_values == id_cluster
+        n_clusters = len(unique_labels)
+
+        cluster_dists = {}
+
+        for id_cluster in tqdm(unique_labels, desc=f"Pairwise distances ({n_clusters} clusters)", unit="cluster"):
+            mask = y_values == id_cluster
             n_cluster = int(mask.sum())
 
             row = {("size", "n"): n_cluster}
 
-            # Intra-cluster
             intra_dists = self._compute_intra(X_values, mask, metric, id_cluster)
             if intra_dists is None:
                 for m in _summary_metrics:
@@ -658,7 +721,6 @@ class ClusteredDistances:
                 for m, v in self._summarize(intra_dists).items():
                     row[("intra-cluster", m)] = v
 
-            # Inter-cluster
             inter_dists = self._compute_inter(X_values, mask, metric, id_cluster)
             if inter_dists is None:
                 for m in _summary_metrics:
@@ -667,7 +729,12 @@ class ClusteredDistances:
                 for m, v in self._summarize(inter_dists).items():
                     row[("inter-cluster", m)] = v
 
-            # Mann-Whitney U + rank-biserial
+            cluster_dists[id_cluster] = (intra_dists, inter_dists)
+            results[id_cluster] = row
+
+        for id_cluster in tqdm(unique_labels, desc=f"Rank-biserial correlation effect sizes ({n_clusters} clusters)", unit="cluster"):
+            intra_dists, inter_dists = cluster_dists[id_cluster]
+
             if intra_dists is not None and inter_dists is not None:
                 stat, pval = mannwhitneyu(
                     intra_dists, inter_dists, alternative="two-sided",
@@ -681,8 +748,7 @@ class ClusteredDistances:
                 u_statistics[id_cluster] = np.nan
                 p_values_naive[id_cluster] = np.nan
 
-            del intra_dists, inter_dists
-            results[id_cluster] = row
+        del cluster_dists
 
         # -- Assemble results DataFrame --
         df_results = pd.DataFrame.from_dict(results, orient="index")
@@ -716,31 +782,60 @@ class ClusteredDistances:
 
         # -- PERMANOVA --
         if self.n_permutations is not None:
+            logger.info(
+                f"Running PERMANOVA with {self.n_permutations} permutations "
+                f"({self.n_samples_} samples, {n_clusters} groups)"
+            )
             ids = list(index) if index is not None else list(range(self.n_samples_))
 
-            if metric == "precomputed":
+            if _X_is_dm:
+                dm = self._dm_input_
+                grouping_ids = list(dm.ids)
+            elif metric == "precomputed":
                 dm = DistanceMatrix(X_values, ids=ids)
+                grouping_ids = ids
             elif metric == "cosine":
                 full_dm = pairwise_cosine_distances(
                     X_values, check=False, redundant_form=True,
                 )
                 dm = DistanceMatrix(full_dm, ids=ids)
                 del full_dm
+                grouping_ids = ids
             elif metric == "jaccard":
                 full_dm = pairwise_jaccard_distances(
                     X_values, check=False, redundant_form=True,
                 )
                 dm = DistanceMatrix(full_dm, ids=ids)
                 del full_dm
+                grouping_ids = ids
 
-            grouping = pd.Series(labels_values, index=ids, name="group")
+            grouping = pd.Series(y_values, index=grouping_ids, name="group")
             self.permanova_ = permanova(
                 dm, grouping, permutations=self.n_permutations,seed=self.random_state,
             )
             self.p_value_ = self.permanova_["p-value"]
+
+            F = self.permanova_["test statistic"]
+            n = self.permanova_["sample size"]
+            g = self.permanova_["number of groups"]
+            if F == 0:
+                self.r_squared_ = 0.0
+            else:
+                self.r_squared_ = 1.0 / (1.0 + (n - g) / ((g - 1) * F))
+
+            self.permanova_["R-squared"] = self.r_squared_
+            self.permanova_ = self.permanova_[
+                ["method name", "test statistic name", "sample size",
+                 "number of groups", "test statistic", "p-value",
+                 "R-squared", "number of permutations"]
+            ]
+
             del dm
         else:
             self.permanova_ = None
+
+        if hasattr(self, "_dm_input_"):
+            del self._dm_input_
 
         # -- Runtime caveat --
         logger.warning(
@@ -756,17 +851,17 @@ class ClusteredDistances:
 
     def fit_transform(
         self,
-        X: Union[np.ndarray, pd.DataFrame],
-        labels: Union[np.ndarray, pd.Series],
+        X: Union[np.ndarray, pd.DataFrame, DistanceMatrix],
+        y: Union[np.ndarray, pd.Series],
     ) -> pd.DataFrame:
         """
         Fit and return the cluster summary table.
 
         Parameters
         ----------
-        X : np.ndarray or pd.DataFrame
+        X : np.ndarray, pd.DataFrame, or skbio.DistanceMatrix
             Data matrix or precomputed distance matrix.
-        labels : np.ndarray or pd.Series
+        y : np.ndarray or pd.Series
             Cluster labels.
 
         Returns
@@ -774,4 +869,4 @@ class ClusteredDistances:
         pd.DataFrame
             Same as ``self.results_``.
         """
-        return self.fit(X, labels).results_
+        return self.fit(X, y).results_

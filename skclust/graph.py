@@ -13,6 +13,8 @@ from sklearn.base import BaseEstimator, ClusterMixin
 from tqdm.auto import tqdm
 from loguru import logger
 
+from .metrics import pielou_evenness
+
 
 # ============================================================================
 # Leiden workers (module level for multiprocessing pickling)
@@ -179,23 +181,6 @@ def _compute_quality(graph, labels, partition_type, resolution_parameter, weight
     return partition_type(graph, **partition_kws).quality()
 
 
-def _pielou_evenness(sizes: np.ndarray) -> float:
-    """
-    Pielou's evenness J = H / ln(S) for a cluster-size distribution.
-
-    H is the Shannon entropy of the size proportions and S the number of
-    clusters. J is 1.0 when all clusters are equal in size and approaches 0 as
-    one cluster dominates. Undefined (NaN) for fewer than two clusters.
-    """
-    sizes = np.asarray(sizes, dtype=float)
-    n_clusters = sizes.shape[0]
-    if n_clusters < 2:
-        return float("nan")
-    proportions = sizes / sizes.sum()
-    entropy = -(proportions * np.log(proportions)).sum()
-    return float(entropy / np.log(n_clusters))
-
-
 # ============================================================================
 # Consensus Leiden clustering
 # ============================================================================
@@ -225,9 +210,9 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
     random_state : int, default=0
         Seeds are random_state .. random_state + n_iter - 1.
     partition_type : leidenalg partition class, default=None
-        None => RBConfigurationVertexPartition. Any leidenalg partition type is
-        supported (e.g. CPMVertexPartition, ModularityVertexPartition).
-    resolution_parameter : float, default=1.0
+        None => CPMVertexPartition. Any leidenalg partition type is
+        supported (e.g. RBConfigurationVertexPartition, ModularityVertexPartition).
+    resolution_parameter : float
         Passed through to any partition type whose constructor accepts it
         (RBConfiguration, CPM, ...). Ignored by types that do not (Modularity,
         Significance, Surprise).
@@ -295,9 +280,9 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
         self,
         n_iter: int = 10,
         weight: Optional[str] = None,
+        resolution_parameter: float = "auto",
         random_state: int = 0,
         partition_type=None,
-        resolution_parameter: float = 1.0,
         n_iterations: int = -1,
         minimum_cluster_size: int = 1,
         cluster_prefix: str = "leiden_",
@@ -350,6 +335,22 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
 
         start_time = time.time()
 
+        # Resolve resolution_parameter
+        if self.resolution_parameter == "auto":
+            logger.warning(
+                "resolution_parameter='auto' resolved to median edge weight ({:.4f}). "
+                "This is a conservative default; consider a resolution sweep with "
+                "domain-informed selection for production analyses.".format(self.resolution_parameter_)
+            )
+            if self.weight is not None:
+                self.resolution_parameter_ = float(np.median(X.es[self.weight]))
+            else:
+                n = X.vcount()
+                self.resolution_parameter_ = X.ecount() / (n * (n - 1) / 2)
+            self._log(f"Auto resolution_parameter: {self.resolution_parameter_:.4f}", "info")
+        else:
+            self.resolution_parameter_ = self.resolution_parameter
+
         # --- Phase 1: validate input -------------------------------------
         self._log("Validating input graph", "info")
         if not isinstance(X, ig.Graph):
@@ -369,13 +370,13 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
         # --- Phase 2: set up Leiden --------------------------------------
         self._log("Setting up Leiden algorithm", "debug")
         try:
-            from leidenalg import RBConfigurationVertexPartition
+            from leidenalg import CPMVertexPartition
         except ModuleNotFoundError:
             raise ImportError("Install leidenalg: pip install leidenalg")
 
         partition_type = (
             self.partition_type if self.partition_type is not None
-            else RBConfigurationVertexPartition
+            else CPMVertexPartition
         )
         leiden_kws = self.leiden_kws or {}
         leiden_kws_full = {
@@ -618,7 +619,7 @@ class ConsensusLeidenClustering(BaseEstimator, ClusterMixin):
                     if self.n_edges_initial_ else float("nan")
                 ),
                 "discard_rate": n_discarded / self.n_nodes_initial_,
-                "pielou_evenness": _pielou_evenness(self.cluster_sizes_.to_numpy()),
+                "pielou_evenness": pielou_evenness(self.cluster_sizes_.to_numpy()),
                 "partition_type": partition_type.__name__,
                 "quality_metric": partition_type.__name__.replace("VertexPartition", ""),
                 "resolution_parameter": leiden_kws_full.get("resolution_parameter", float("nan")),

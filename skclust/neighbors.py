@@ -9,12 +9,18 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 import scipy.sparse as sps
-from sklearn.base import clone, BaseEstimator, TransformerMixin
-from sklearn.neighbors import KNeighborsTransformer
+from sklearn.base import clone, BaseEstimator, ClassifierMixin, TransformerMixin
+from sklearn.neighbors import (
+    KNeighborsClassifier,
+    KNeighborsTransformer,
+    NearestNeighbors,
+)
 from scipy.spatial.distance import squareform
 from sklearn.metrics import pairwise_distances
-from sklearn.utils.validation import check_is_fitted, check_array
+from sklearn.utils.validation import check_is_fitted, check_array, check_X_y
 from tqdm import tqdm
+from loguru import logger
+from .utils import adjacency_to_igraph
 
 try:
     from deslib.util.faiss_knn_wrapper import FaissKNNClassifier as _FaissKNNClassifier
@@ -182,7 +188,7 @@ def kneighbors_to_snn_graph(indices, k=None, skip_self=True):
     Parameters
     ----------
     indices : np.ndarray, shape (n_samples, K_max)
-        Neighbor indices, e.g. from KNeighborsCosineSimilarity.indices_
+        Neighbor indices, e.g. from KNeighborsCosineGraph.indices_
     k : int or None, default=None
         Number of neighbors to use. If None, uses all available neighbors.
     skip_self : bool, default=True
@@ -217,8 +223,8 @@ def kneighbors_to_snn_graph(indices, k=None, skip_self=True):
        
     Examples
     --------
-    >>> from skclust.neighbors import KNeighborsCosineSimilarity, kneighbors_to_snn_graph
-    >>> knn = KNeighborsCosineSimilarity(n_neighbors=100, backend="faiss")
+    >>> from skclust.neighbors import KNeighborsCosineGraph, kneighbors_to_snn_graph
+    >>> knn = KNeighborsCosineGraph(n_neighbors=100, backend="faiss")
     >>> knn.fit(X)
     >>> A_snn = kneighbors_to_snn_graph(knn.indices_, k=75)
     """
@@ -785,41 +791,369 @@ def _search_index(index, X_query, k, backend, X_fit=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KNeighborsCosineSimilarity
+# KNeighborsCosineGraph (v1)
 # ══════════════════════════════════════════════════════════════════════════════
+# class KNeighborsCosineGraph(BaseEstimator, TransformerMixin):
+#     """
+#     K-Nearest Neighbors using cosine similarity.
 
-class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
+#     Parameters
+#     ----------
+#     n_neighbors : int
+#         Number of neighbors to find.
+#     mode : {'exact', 'ivf', 'pq'}, default='exact'
+#         Search strategy.
+#     backend : {'auto', 'faiss', 'sklearn'}, default='auto'
+#         Which library to use. 'auto' prefers FAISS, falls back to sklearn.
+#     n_voronoi_cells : int or 'auto', default='auto'
+#         Number of IVF cells. If 'auto', uses sqrt(n_samples).
+#     n_probes : int, default=1
+#         Number of cells to search in IVF.
+#     n_subvectors : int or None, default=None
+#         Number of sub-vectors for PQ. If None, uses d//16.
+#     n_bits : int, default=8
+#         Bits per sub-vector for PQ.
+
+#     Attributes
+#     ----------
+#     backend_ : str
+#     index_ : faiss.Index or None
+#     similarities_ : np.ndarray, shape (n_samples_fit, n_neighbors)
+#     indices_ : np.ndarray, shape (n_samples_fit, n_neighbors)
+#     """
+
+#     def __init__(
+#         self,
+#         n_neighbors,
+#         mode="exact",
+#         backend="auto",
+#         n_voronoi_cells="auto",
+#         n_probes=1,
+#         n_subvectors=None,
+#         n_bits=8,
+#     ):
+#         self.n_neighbors = n_neighbors
+#         self.mode = mode
+#         self.backend = backend
+#         self.n_voronoi_cells = n_voronoi_cells
+#         self.n_probes = n_probes
+#         self.n_subvectors = n_subvectors
+#         self.n_bits = n_bits
+
+#     def fit(self, X, y=None):
+#         """
+#         Fit the k-NN model.
+
+#         Parameters
+#         ----------
+#         X : array-like, shape (n_samples, n_features)
+#             L2-normalized training data.
+#         y : Ignored
+#         """
+#         self.index_labels_ = None
+#         if isinstance(X, pd.DataFrame):
+#             self.index_labels_ = X.index
+#         X_arr, row_index = _to_numpy_with_index(X)
+#         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+
+
+#         self.n_samples_fit_ = X_arr.shape[0]
+#         self.n_features_in_ = X_arr.shape[1]
+#         self.backend_ = _determine_backend(self.backend)
+
+#         if self.backend_ == "faiss":
+#             self.index_ = _build_faiss_index(
+#                 X_arr,
+#                 mode=self.mode,
+#                 n_voronoi_cells=self.n_voronoi_cells,
+#                 n_probes=self.n_probes,
+#                 n_subvectors=self.n_subvectors,
+#                 n_bits=self.n_bits,
+#             )
+#             self.X_fit_ = None
+#         else:
+#             if self.mode != "exact":
+#                 warnings.warn(
+#                     f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.",
+#                     UserWarning,
+#                 )
+#             self.X_fit_ = X_arr
+#             self.index_ = None
+
+#         self.similarities_, self.indices_ = self.transform(X_arr)
+#         return self
+
+#     def transform(self, X):
+#         """
+#         Find k-nearest neighbors.
+
+#         Parameters
+#         ----------
+#         X : array-like, shape (n_samples, n_features)
+#             L2-normalized query vectors.
+
+#         Returns
+#         -------
+#         similarities : np.ndarray, shape (n_samples, n_neighbors)
+#         indices : np.ndarray, shape (n_samples, n_neighbors)
+#         """
+#         check_is_fitted(self)
+#         X_arr, _ = _to_numpy_with_index(X)
+#         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+
+#         if X_arr.shape[1] != self.n_features_in_:
+#             raise ValueError(f"X has {X_arr.shape[1]} features, expected {self.n_features_in_}.")
+#         if self.n_neighbors > self.n_samples_fit_:
+#             raise ValueError(
+#                 f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})."
+#             )
+
+#         return _search_index(
+#             self.index_, X_arr, self.n_neighbors, self.backend_,
+#             X_fit=self.X_fit_,
+#         )
+
+#     def fit_transform(self, X, y=None):
+#         """Fit and return neighbors for training data."""
+#         self.fit(X, y)
+#         return self.similarities_, self.indices_
+
+#     def to_igraph(self, index="auto", include_self=False):
+#         """
+#         Convert fitted k-NN results to igraph.
+
+#         Parameters
+#         ----------
+#         index : array-like or 'auto'
+#             Node labels. 'auto' uses DataFrame index if available, else integers.
+#         include_self : bool, default=False
+
+#         Returns
+#         -------
+#         ig.Graph
+#         """
+#         check_is_fitted(self, ["similarities_", "indices_"])
+
+#         if index == "auto":
+#             index = getattr(self, "index_labels_", None)
+#         elif isinstance(index, pd.Index):
+#             index = list(index)
+
+#         return kneighbors_to_igraph(
+#             self.similarities_,
+#             self.indices_,
+#             index=index,
+#             include_self=include_self,
+#         )
+
+# # ============================================================================
+# # KNeighborsCosineGraph (v2)
+# # ============================================================================
+# class KNeighborsCosineGraph(BaseEstimator, TransformerMixin):
+#     """
+#     K-Nearest Neighbors graph using cosine similarity.
+ 
+#     Uses FAISS (preferred) or sklearn backend. Stores similarities
+#     as the native output format for cosine.
+ 
+#     Parameters
+#     ----------
+#     n_neighbors : int
+#         Number of neighbors (includes self as neighbor 0).
+#     mode : str
+#         "exact", "ivf", or "pq".
+#     backend : str
+#         "auto", "faiss", or "sklearn".
+#     n_voronoi_cells : int or "auto"
+#     n_probes : int
+#     n_subvectors : int or None
+#     n_bits : int
+ 
+#     Attributes
+#     ----------
+#     similarities_ : np.ndarray, shape (n_samples, n_neighbors)
+#         Cosine similarities (column 0 = self).
+#     indices_ : np.ndarray, shape (n_samples, n_neighbors)
+#         Neighbor indices (column 0 = self).
+#     labels_ : pd.Index or None
+#         Node labels from DataFrame index.
+#     """
+ 
+#     def __init__(
+#         self,
+#         n_neighbors,
+#         mode="exact",
+#         backend="auto",
+#         n_voronoi_cells="auto",
+#         n_probes=1,
+#         n_subvectors=None,
+#         n_bits=8,
+#     ):
+#         self.n_neighbors = n_neighbors
+#         self.mode = mode
+#         self.backend = backend
+#         self.n_voronoi_cells = n_voronoi_cells
+#         self.n_probes = n_probes
+#         self.n_subvectors = n_subvectors
+#         self.n_bits = n_bits
+ 
+#     def fit(self, X, y=None):
+#         """
+#         Fit KNN and compute neighbors for training data.
+ 
+#         Parameters
+#         ----------
+#         X : pd.DataFrame or np.ndarray, shape (n_samples, n_features)
+#             L2-normalized data.
+#         """
+#         self.labels_ = X.index if isinstance(X, pd.DataFrame) else None
+ 
+#         X_arr, _ = _to_numpy_with_index(X)
+#         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+ 
+#         self.n_samples_fit_ = X_arr.shape[0]
+#         self.n_features_in_ = X_arr.shape[1]
+#         self.backend_ = _determine_backend(self.backend)
+ 
+#         if self.backend_ == "faiss":
+#             self.index_ = _build_faiss_index(
+#                 X_arr, mode=self.mode,
+#                 n_voronoi_cells=self.n_voronoi_cells,
+#                 n_probes=self.n_probes,
+#                 n_subvectors=self.n_subvectors,
+#                 n_bits=self.n_bits,
+#             )
+#             self.X_fit_ = None
+#         else:
+#             if self.mode != "exact":
+#                 warnings.warn(f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.")
+#             self.X_fit_ = X_arr
+#             self.index_ = None
+ 
+#         self.similarities_, self.indices_ = _search_index(
+#             self.index_, X_arr, self.n_neighbors, self.backend_,
+#             X_fit=self.X_fit_,
+#         )
+#         return self
+ 
+#     def transform(self, X):
+#         """Find neighbors for new data. Returns (similarities, indices)."""
+#         check_is_fitted(self)
+#         X_arr, _ = _to_numpy_with_index(X)
+#         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
+ 
+#         if X_arr.shape[1] != self.n_features_in_:
+#             raise ValueError(f"X has {X_arr.shape[1]} features, expected {self.n_features_in_}.")
+ 
+#         return _search_index(
+#             self.index_, X_arr, self.n_neighbors, self.backend_,
+#             X_fit=self.X_fit_,
+#         )
+ 
+#     def fit_transform(self, X, y=None):
+#         self.fit(X, y)
+#         return self.similarities_, self.indices_
+ 
+#     def __repr__(self):
+#         return f"KNeighborsCosineGraph(n_neighbors={self.n_neighbors})"
+
+# ============================================================================
+# KNeighborsCosineGraph
+# ============================================================================
+class KNeighborsCosineGraph(BaseEstimator, TransformerMixin):
     """
-    K-Nearest Neighbors using cosine similarity.
+    K-Nearest Neighbors graph using cosine similarity with automatic
+    k selection via knee detection.
+
+    Uses FAISS (preferred) or sklearn backend. Stores similarities
+    as the native output format for cosine.
 
     Parameters
     ----------
     n_neighbors : int
-        Number of neighbors to find.
-    mode : {'exact', 'ivf', 'pq'}, default='exact'
-        Search strategy.
-    backend : {'auto', 'faiss', 'sklearn'}, default='auto'
-        Which library to use. 'auto' prefers FAISS, falls back to sklearn.
-    n_voronoi_cells : int or 'auto', default='auto'
-        Number of IVF cells. If 'auto', uses sqrt(n_samples).
-    n_probes : int, default=1
-        Number of cells to search in IVF.
-    n_subvectors : int or None, default=None
-        Number of sub-vectors for PQ. If None, uses d//16.
-    n_bits : int, default=8
-        Bits per sub-vector for PQ.
+        Maximum number of neighbors to compute (includes self as neighbor 0).
+        Acts as k_max for knee detection and parameter sweeps.
+    detect_optimal_k : bool, default=True
+        If True, run knee detection during fit() to select optimal k.
+        If False, skip knee detection; to_igraph() uses full n_neighbors.
+    sensitivity : float
+        Kneedle sensitivity for knee detection (higher = less sensitive).
+    aggregation : {'median', 'mean'}, default='median'
+        Aggregation function for the k-similarity curve used in knee detection.
+    direction : {'increasing', 'decreasing', 'auto'}, default='decreasing'
+        Direction of the k-similarity curve for KneeLocator.
+        'auto' uses kneed.find_shape to infer the direction.
+    curve : {'concave', 'convex', 'auto'}, default='convex'
+        Curvature of the k-similarity curve for KneeLocator.
+        'auto' uses kneed.find_shape to infer the curvature.
+    mode : str
+        "exact", "ivf", or "pq".
+    backend : str
+        "auto", "faiss", or "sklearn".
+    n_voronoi_cells : int or "auto"
+    n_probes : int
+    n_subvectors : int or None
+    n_bits : int
 
     Attributes
     ----------
-    backend_ : str
-    index_ : faiss.Index or None
-    similarities_ : np.ndarray, shape (n_samples_fit, n_neighbors)
-    indices_ : np.ndarray, shape (n_samples_fit, n_neighbors)
+    similarities_ : np.ndarray, shape (n_samples, n_neighbors)
+        Cosine similarities (column 0 = self).
+    indices_ : np.ndarray, shape (n_samples, n_neighbors)
+        Neighbor indices (column 0 = self).
+    labels_ : pd.Index or None
+        Node labels from DataFrame index.
+    k_ : int or None
+        Selected k from knee detection, or None if not detected.
+    max_k_ : int
+        Maximum usable k (n_neighbors - 1, excluding self).
+    k_similarity_curve_ : pd.Series
+        Aggregated similarity to k-th neighbor for each k.
+    k_similarity_q25_ : np.ndarray or None
+        25th percentile of k-th neighbor similarity.
+    k_similarity_q75_ : np.ndarray or None
+        75th percentile of k-th neighbor similarity.
+    kneedle_ : KneeLocator or None
+        Kneedle object (if knee detection was run).
+
+    Examples
+    --------
+    >>> # Auto k detection (default)
+    >>> knn = KNeighborsCosineGraph(n_neighbors=150)
+    >>> knn.fit(X_l2)
+    >>> graph = knn.to_igraph()       # uses detected k_
+    >>>
+    >>> # Skip knee detection; to_igraph uses full neighborhood
+    >>> knn = KNeighborsCosineGraph(n_neighbors=150, detect_optimal_k=False)
+    >>> knn.fit(X_l2)
+    >>> graph = knn.to_igraph()       # uses max_k_ (149)
+    >>> graph = knn.to_igraph(k=30)   # explicit k
+    >>>
+    >>> # Run knee detection later
+    >>> knn.detect_knee()
+    >>> graph = knn.to_igraph()       # now uses detected k_
+    >>>
+    >>> # Re-run with different sensitivity
+    >>> knn.detect_knee(sensitivity=3.0)
+    >>>
+    >>> # Parameter sweep (stateless)
+    >>> for k in [20, 30, 50]:
+    ...     graph = knn.to_igraph(k=k)
     """
+
+    _VALID_AGGREGATIONS = {"median", "mean"}
+    _VALID_DIRECTIONS = {"increasing", "decreasing", "auto"}
+    _VALID_CURVES = {"concave", "convex", "auto"}
 
     def __init__(
         self,
         n_neighbors,
+        detect_optimal_k=True,
+        sensitivity=1.0,
+        aggregation="median",
+        direction="decreasing",
+        curve="convex",
         mode="exact",
         backend="auto",
         n_voronoi_cells="auto",
@@ -827,7 +1161,25 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         n_subvectors=None,
         n_bits=8,
     ):
+        if aggregation not in self._VALID_AGGREGATIONS:
+            raise ValueError(
+                f"aggregation must be one of {self._VALID_AGGREGATIONS}, got '{aggregation}'"
+            )
+        if direction not in self._VALID_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {self._VALID_DIRECTIONS}, got '{direction}'"
+            )
+        if curve not in self._VALID_CURVES:
+            raise ValueError(
+                f"curve must be one of {self._VALID_CURVES}, got '{curve}'"
+            )
+
         self.n_neighbors = n_neighbors
+        self.detect_optimal_k = detect_optimal_k
+        self.sensitivity = sensitivity
+        self.aggregation = aggregation
+        self.direction = direction
+        self.curve = curve
         self.mode = mode
         self.backend = backend
         self.n_voronoi_cells = n_voronoi_cells
@@ -837,30 +1189,26 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         """
-        Fit the k-NN model.
+        Fit KNN, compute neighbors, build k-similarity curve, and detect knee.
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
-            L2-normalized training data.
-        y : Ignored
+        X : pd.DataFrame or np.ndarray, shape (n_samples, n_features)
+            L2-normalized data.
         """
-        self.index_labels_ = None
-        if isinstance(X, pd.DataFrame):
-            self.index_labels_ = X.index
-        X_arr, row_index = _to_numpy_with_index(X)
+        self.labels_ = X.index if isinstance(X, pd.DataFrame) else None
+
+        X_arr, _ = _to_numpy_with_index(X)
         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
-
-
 
         self.n_samples_fit_ = X_arr.shape[0]
         self.n_features_in_ = X_arr.shape[1]
+        self.max_k_ = self.n_neighbors - 1  # exclude self (column 0)
         self.backend_ = _determine_backend(self.backend)
 
         if self.backend_ == "faiss":
             self.index_ = _build_faiss_index(
-                X_arr,
-                mode=self.mode,
+                X_arr, mode=self.mode,
                 n_voronoi_cells=self.n_voronoi_cells,
                 n_probes=self.n_probes,
                 n_subvectors=self.n_subvectors,
@@ -869,40 +1217,322 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
             self.X_fit_ = None
         else:
             if self.mode != "exact":
-                warnings.warn(
-                    f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.",
-                    UserWarning,
-                )
+                warnings.warn(f"sklearn backend only supports exact search, ignoring mode='{self.mode}'.")
             self.X_fit_ = X_arr
             self.index_ = None
 
-        self.similarities_, self.indices_ = self.transform(X_arr)
+        self.similarities_, self.indices_ = _search_index(
+            self.index_, X_arr, self.n_neighbors, self.backend_,
+            X_fit=self.X_fit_,
+        )
+
+        # Build k-similarity curve (always, for detect_knee if called later)
+        self._build_k_similarity_curve()
+
+        # Resolve k
+        self.k_ = None
+        self.kneedle_ = None
+        if self.detect_optimal_k:
+            self.detect_knee()
+
         return self
 
-    def transform(self, X):
+    def _build_k_similarity_curve(self):
+        """Compute aggregated similarity to k-th neighbor (with IQR) for each k."""
+        k_values = np.arange(1, self.max_k_ + 1)
+        data = self.similarities_[:, 1:]  # skip self (column 0)
+
+        if self.aggregation == "median":
+            agg_values = np.median(data, axis=0)
+        else:
+            agg_values = np.mean(data, axis=0)
+
+        self.k_similarity_curve_ = pd.Series(
+            agg_values,
+            index=k_values,
+            name=f"{self.aggregation}_kth_neighbor_similarity",
+        )
+        self.k_similarity_curve_.index.name = "k"
+
+        # IQR
+        self.k_similarity_q25_ = np.percentile(data, 25, axis=0)
+        self.k_similarity_q75_ = np.percentile(data, 75, axis=0)
+
+    def detect_knee(self, sensitivity=None, aggregation=None, direction=None, curve=None):
         """
-        Find k-nearest neighbors.
+        (Re)run knee detection, optionally updating parameters.
+
+        Call after fit() to try different sensitivity or curve settings
+        without recomputing the KNN.
 
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
-            L2-normalized query vectors.
+        sensitivity : float or None
+            New Kneedle sensitivity. None keeps current.
+        aggregation : {'median', 'mean'} or None
+            New aggregation. Rebuilds the k-similarity curve if changed.
+        direction : {'increasing', 'decreasing', 'auto'} or None
+            New direction. None keeps current.
+        curve : {'concave', 'convex', 'auto'} or None
+            New curvature. None keeps current.
 
         Returns
         -------
-        similarities : np.ndarray, shape (n_samples, n_neighbors)
-        indices : np.ndarray, shape (n_samples, n_neighbors)
+        self
         """
+        check_is_fitted(self, ["similarities_"])
+
+        if aggregation is not None and aggregation != self.aggregation:
+            if aggregation not in self._VALID_AGGREGATIONS:
+                raise ValueError(
+                    f"aggregation must be one of {self._VALID_AGGREGATIONS}, got '{aggregation}'"
+                )
+            self.aggregation = aggregation
+            self._build_k_similarity_curve()
+        if sensitivity is not None:
+            self.sensitivity = sensitivity
+        if direction is not None:
+            if direction not in self._VALID_DIRECTIONS:
+                raise ValueError(
+                    f"direction must be one of {self._VALID_DIRECTIONS}, got '{direction}'"
+                )
+            self.direction = direction
+        if curve is not None:
+            if curve not in self._VALID_CURVES:
+                raise ValueError(
+                    f"curve must be one of {self._VALID_CURVES}, got '{curve}'"
+                )
+            self.curve = curve
+
+        from kneed import KneeLocator
+
+        _direction = self.direction
+        _curve = self.curve
+
+        if _direction == "auto" or _curve == "auto":
+            from kneed import find_shape
+            auto_direction, auto_curve = find_shape(
+                self.k_similarity_curve_.index.values,
+                self.k_similarity_curve_.values,
+            )
+            if _direction == "auto":
+                _direction = auto_direction
+            if _curve == "auto":
+                _curve = auto_curve
+
+        logger.info(f"Curve shape: direction={_direction}, curve={_curve}")
+
+        self.kneedle_ = KneeLocator(
+            self.k_similarity_curve_.index.values,
+            self.k_similarity_curve_.values,
+            curve=_curve,
+            direction=_direction,
+            S=self.sensitivity,
+        )
+
+        if self.kneedle_.knee is None:
+            logger.warning("No knee detected, defaulting to midpoint")
+            self.k_ = int(self.k_similarity_curve_.index[len(self.k_similarity_curve_) // 2])
+        else:
+            self.k_ = int(self.kneedle_.knee)
+
+        logger.info(f"Auto k={self.k_} (sensitivity={self.sensitivity})")
+        return self
+
+    def to_igraph(self, k=None):
+        """
+        Build directed igraph from KNN at given k.
+
+        KNN graphs are inherently directed: A having B as a neighbor
+        does not imply B has A as a neighbor.
+
+        Parameters
+        ----------
+        k : int or None
+            Number of neighbors. None uses self.k_ if available,
+            otherwise falls back to max_k_ (full neighborhood).
+            Does not modify state when k is specified explicitly.
+
+        Returns
+        -------
+        ig.Graph
+            Directed graph with edges weighted by cosine similarity.
+        """
+        import igraph as ig
+
+        check_is_fitted(self, ["similarities_", "indices_"])
+
+        if k is None:
+            k = self.k_ if self.k_ is not None else self.max_k_
+
+        if k > self.max_k_:
+            raise ValueError(f"k={k} exceeds max_k_={self.max_k_}")
+
+        # Skip self (column 0), take k neighbors
+        I = self.indices_[:, 1:k + 1]
+        D = self.similarities_[:, 1:k + 1]
+        n = I.shape[0]
+
+        sources = np.repeat(np.arange(n), k)
+        targets = I.flatten()
+        weights = D.flatten()
+
+        if self.labels_ is not None:
+            labels_array = np.asarray(self.labels_)
+            sources = labels_array[sources]
+            targets = labels_array[targets]
+
+        edges = list(zip(sources, targets, weights))
+        graph = ig.Graph.TupleList(edges, weights=True, directed=True)
+        return graph
+
+    def to_kneighbors_graph(self, k=None, mode="connectivity", include_self=False):
+        """
+        Convert KNN indices to a sparse connectivity or distance matrix.
+
+        Equivalent to ``sklearn.neighbors.kneighbors_graph``.
+
+        Parameters
+        ----------
+        k : int or None
+            Number of neighbors. None uses ``k_`` if available,
+            otherwise ``max_k_``. Does not modify state.
+        mode : {'connectivity', 'distance'}, default='connectivity'
+            ``'connectivity'`` returns binary adjacency.
+            ``'distance'`` returns cosine distances (1 - similarity) as weights.
+        include_self : bool, default=False
+            If True, include self-connections (diagonal entries).
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix, shape (n_samples, n_samples)
+            Asymmetric sparse matrix (A[i,j] = 1 or distance if j is
+            a k-neighbor of i).
+        """
+        from scipy.sparse import csr_matrix
+
+        check_is_fitted(self, ["indices_"])
+
+        if mode not in ("connectivity", "distance"):
+            raise ValueError(
+                f"mode must be 'connectivity' or 'distance', got '{mode}'"
+            )
+
+        if k is None:
+            k = self.k_ if self.k_ is not None else self.max_k_
+        if k > self.max_k_:
+            raise ValueError(f"k={k} exceeds max_k_={self.max_k_}")
+
+        n = self.n_samples_fit_
+
+        if include_self:
+            idx_slice = slice(0, k + 1)
+        else:
+            idx_slice = slice(1, k + 1)
+
+        neighbor_idx = self.indices_[:, idx_slice]
+        n_per_row = neighbor_idx.shape[1]
+
+        rows = np.repeat(np.arange(n), n_per_row)
+        cols = neighbor_idx.ravel()
+
+        if mode == "connectivity":
+            data = np.ones(len(rows), dtype=np.float64)
+        else:
+            data = np.clip(1 - self.similarities_[:, idx_slice].ravel(), 0, 2)
+
+        return csr_matrix((data, (rows, cols)), shape=(n, n))
+
+    def plot(self, ax=None, figsize=(8, 5),
+             xlabel=None, ylabel=None, title=None,
+             curve_color="black", iqr_color="steelblue",
+             vline_color="firebrick"):
+        """
+        Diagnostic plot: k-similarity elbow with IQR and detected knee.
+
+        Requires that knee detection has been run (either via
+        detect_optimal_k=True during fit, or by calling detect_knee()).
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None
+            Axes to plot on. If None, creates a new figure.
+        figsize : tuple, default=(8, 5)
+            Figure size if creating new axes.
+        xlabel : str or None
+            X-axis label. Default: '$N_{Neighbors}$ [k]'.
+        ylabel : str or None
+            Y-axis label. Default: '{Aggregation} cosine similarity to k-th neighbor'.
+        title : str or None
+            Plot title.
+        curve_color : str, default='black'
+            Color for the aggregation curve.
+        iqr_color : str, default='steelblue'
+            Color for the IQR fill.
+        vline_color : str, default='firebrick'
+            Color for the knee vertical line.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+        """
+        import matplotlib.pyplot as plt
+
+        if self.kneedle_ is None:
+            raise ValueError(
+                "Knee detection has not been run. "
+                "Use detect_optimal_k=True during fit or call detect_knee() first."
+            )
+
+        if self.k_similarity_curve_ is None:
+            self._build_k_similarity_curve()
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+
+        k_vals = self.k_similarity_curve_.index.values
+
+        ax.plot(
+            k_vals, self.k_similarity_curve_.values,
+            color=curve_color, linewidth=2,
+            label=self.aggregation.capitalize(),
+        )
+
+        if self.k_similarity_q25_ is not None:
+            ax.fill_between(
+                k_vals,
+                self.k_similarity_q25_,
+                self.k_similarity_q75_,
+                alpha=0.2, color=iqr_color, label="IQR",
+            )
+
+        if self.k_ is not None:
+            ax.axvline(
+                self.k_, color=vline_color, linestyle="--",
+                linewidth=1.5, label=f"Knee (k={self.k_})",
+            )
+
+        ax.set_xlabel(xlabel or "$N_{Neighbors}$ [k]")
+        ax.set_ylabel(
+            ylabel or f"{self.aggregation.capitalize()} cosine similarity to k-th neighbor"
+        )
+        if title is not None:
+            ax.set_title(title)
+
+        ax.legend(frameon=False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        return ax
+
+    def transform(self, X):
+        """Find neighbors for new data. Returns (similarities, indices)."""
         check_is_fitted(self)
         X_arr, _ = _to_numpy_with_index(X)
         X_arr = check_array(X_arr, dtype=np.float32, ensure_2d=True)
 
         if X_arr.shape[1] != self.n_features_in_:
             raise ValueError(f"X has {X_arr.shape[1]} features, expected {self.n_features_in_}.")
-        if self.n_neighbors > self.n_samples_fit_:
-            raise ValueError(
-                f"n_neighbors ({self.n_neighbors}) > n_samples ({self.n_samples_fit_})."
-            )
 
         return _search_index(
             self.index_, X_arr, self.n_neighbors, self.backend_,
@@ -910,36 +1540,430 @@ class KNeighborsCosineSimilarity(BaseEstimator, TransformerMixin):
         )
 
     def fit_transform(self, X, y=None):
-        """Fit and return neighbors for training data."""
         self.fit(X, y)
         return self.similarities_, self.indices_
 
-    def to_igraph(self, index="auto", include_self=False):
+    def __repr__(self):
+        if hasattr(self, "k_") and self.k_ is not None:
+            k_str = f"k_={self.k_}"
+        elif hasattr(self, "max_k_"):
+            k_str = f"max_k_={self.max_k_}"
+        else:
+            k_str = "unfitted"
+        return (
+            f"KNeighborsCosineGraph(n_neighbors={self.n_neighbors}, {k_str}, "
+            f"detect_optimal_k={self.detect_optimal_k})"
+        )
+ 
+ 
+# ============================================================================
+# SharedNearestNeighborsGraph
+# ============================================================================
+class SharedNearestNeighborsGraph:
+    """
+    Shared Nearest Neighbor graph from precomputed KNN.
+ 
+    Parameters
+    ----------
+    indices : np.ndarray, shape (n_samples, max_k)
+        KNN neighbor indices.
+    distances : np.ndarray, shape (n_samples, max_k)
+        Distances to neighbors (for knee detection).
+    labels : pd.Index, list, or np.ndarray, optional
+        Node names/IDs.
+    k : int or None
+        Number of neighbors for SNN. None = auto via knee detection.
+    sensitivity : float
+        Kneedle sensitivity for knee detection (higher = less sensitive).
+    aggregation : {'median', 'mean'}, default='median'
+        Aggregation function for the k-distance curve used in knee detection.
+    direction : {'increasing', 'decreasing', 'auto'}, default='increasing'
+        Direction of the k-distance curve for KneeLocator.
+        'auto' uses kneed.find_shape to infer the direction.
+    curve : {'concave', 'convex', 'auto'}, default='concave'
+        Curvature of the k-distance curve for KneeLocator.
+        'auto' uses kneed.find_shape to infer the curvature.
+    skip_self : bool
+        If True, column 0 contains self-references and is excluded.
+ 
+    Attributes (set by fit)
+    -----------------------
+    k_ : int
+        Selected k.
+    k_distance_curve_ : pd.Series
+        Aggregated distance to k-th neighbor.
+    k_distance_q25_ : np.ndarray or None
+        25th percentile of k-th neighbor distance (for IQR plotting).
+    k_distance_q75_ : np.ndarray or None
+        75th percentile of k-th neighbor distance (for IQR plotting).
+    kneedle_ : KneeLocator or None
+        Kneedle object (if k was auto-detected).
+    snn_adjacency_ : scipy.sparse.csr_matrix
+        SNN Jaccard-weighted adjacency matrix.
+    graph_ : ig.Graph
+        Undirected weighted igraph.
+ 
+    Examples
+    --------
+    >>> knn = KNeighborsCosineGraph(n_neighbors=150)
+    >>> knn.fit(X_l2)
+    >>>
+    >>> # Auto k with median aggregation (default)
+    >>> snn = SharedNearestNeighborsGraph.from_kneighbors_cosine_graph(knn)
+    >>> graph = snn.fit_transform()
+    >>>
+    >>> # Auto k with mean aggregation
+    >>> snn = SharedNearestNeighborsGraph.from_kneighbors_cosine_graph(knn, aggregation="mean")
+    >>> graph = snn.fit_transform()
+    >>>
+    >>> # Specified k
+    >>> snn = SharedNearestNeighborsGraph.from_kneighbors_cosine_graph(knn, k=30)
+    >>> graph = snn.fit_transform()
+    >>>
+    >>> # Parameter sweep (stateless)
+    >>> snn = SharedNearestNeighborsGraph.from_kneighbors_cosine_graph(knn)
+    >>> for k in [20, 30, 50]:
+    ...     graph = snn.to_igraph(k=k)
+    ...     leiden.fit(graph)
+    """
+ 
+    _VALID_AGGREGATIONS = {"median", "mean"}
+    _VALID_DIRECTIONS = {"increasing", "decreasing", "auto"}
+    _VALID_CURVES = {"concave", "convex", "auto"}
+
+    def __init__(self, indices, distances, labels=None, k=None, sensitivity=1.0,
+                 aggregation="median", direction="increasing", curve="concave",
+                 skip_self=True):
+        if aggregation not in self._VALID_AGGREGATIONS:
+            raise ValueError(
+                f"aggregation must be one of {self._VALID_AGGREGATIONS}, got '{aggregation}'"
+            )
+        if direction not in self._VALID_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {self._VALID_DIRECTIONS}, got '{direction}'"
+            )
+        if curve not in self._VALID_CURVES:
+            raise ValueError(
+                f"curve must be one of {self._VALID_CURVES}, got '{curve}'"
+            )
+
+        self.indices_ = np.asarray(indices)
+        self.distances_ = np.asarray(distances)
+        self.skip_self_ = skip_self
+        self.n_samples_ = self.indices_.shape[0]
+        self.k = k
+        self.sensitivity = sensitivity
+        self.aggregation = aggregation
+        self.direction = direction
+        self.curve = curve
+ 
+        offset = 1 if skip_self else 0
+        self.max_k_ = self.indices_.shape[1] - offset
+        self._offset = offset
+ 
+        if labels is not None:
+            self.labels_ = labels if isinstance(labels, pd.Index) else pd.Index(labels)
+        else:
+            self.labels_ = pd.Index(range(self.n_samples_))
+ 
+        if len(self.labels_) != self.n_samples_:
+            raise ValueError(
+                f"labels length ({len(self.labels_)}) != n_samples ({self.n_samples_})"
+            )
+ 
+        # Set by fit
+        self.k_ = None
+        self.k_distance_curve_ = None
+        self.k_distance_q25_ = None
+        self.k_distance_q75_ = None
+        self.kneedle_ = None
+        self.snn_adjacency_ = None
+        self.graph_ = None
+ 
+    @classmethod
+    def from_kneighbors_cosine_graph(cls, knn, k=None, sensitivity=1.0,
+                                      aggregation="median", direction="increasing",
+                                      curve="concave"):
         """
-        Convert fitted k-NN results to igraph.
+        Construct from a fitted KNeighborsCosineGraph.
+
+        Converts similarities -> distances (1 - similarity) internally.
 
         Parameters
         ----------
-        index : array-like or 'auto'
-            Node labels. 'auto' uses DataFrame index if available, else integers.
-        include_self : bool, default=False
+        knn : KNeighborsCosineGraph
+            Fitted KNN model.
+        k : int or None
+            Number of neighbors. None = auto.
+        sensitivity : float
+            Kneedle sensitivity.
+        aggregation : {'median', 'mean'}, default='median'
+            Aggregation function for knee detection.
+        direction : {'increasing', 'decreasing', 'auto'}, default='increasing'
+            Direction of the k-distance curve for KneeLocator.
+            'auto' uses kneed.find_shape to infer the direction.
+        curve : {'concave', 'convex', 'auto'}, default='concave'
+            Curvature of the k-distance curve for KneeLocator.
+            'auto' uses kneed.find_shape to infer the curvature.
 
+        Returns
+        -------
+        SharedNearestNeighborsGraph
+        """
+        check_is_fitted(knn, ["indices_", "similarities_"])
+        return cls(
+            indices=knn.indices_,
+            distances=np.clip(1 - knn.similarities_, 0, 2),
+            labels=getattr(knn, "labels_", None),
+            k=k,
+            sensitivity=sensitivity,
+            aggregation=aggregation,
+            direction=direction,
+            curve=curve,
+            skip_self=True,
+        )
+ 
+    def _build_k_distance_curve(self):
+        """Compute aggregated distance to k-th neighbor (with IQR) for each k."""
+        k_values = np.arange(1, self.max_k_ + 1)
+        data = self.distances_[:, self._offset:]
+
+        if self.aggregation == "median":
+            agg_values = np.median(data, axis=0)
+        else:
+            agg_values = np.mean(data, axis=0)
+
+        self.k_distance_curve_ = pd.Series(
+            agg_values, 
+            index=k_values, 
+            name=f"{self.aggregation}_kth_neighbor_distance",
+        )
+        self.k_distance_curve_.index.name = "k"
+
+        # IQR
+        self.k_distance_q25_ = np.percentile(data, 25, axis=0)
+        self.k_distance_q75_ = np.percentile(data, 75, axis=0)
+ 
+    def _build_snn(self, k):
+        """Build SNN Jaccard-weighted sparse matrix at given k."""
+        if k > self.max_k_:
+            raise ValueError(f"k={k} exceeds max_k_={self.max_k_}")
+        return kneighbors_to_snn_graph(
+            self.indices_, k=k, skip_self=self.skip_self_,
+        )
+ 
+    def fit(self):
+        """
+        Build the SNN graph and igraph.
+ 
+        If k is None, auto-detects via knee in k-distance curve.
+        Curve shape is determined by self.direction and self.curve;
+        'auto' defers to kneed.find_shape.
+ 
+        Returns
+        -------
+        self
+        """
+        # k-distance curve (always computed for plotting)
+        self._build_k_distance_curve()
+ 
+        # Resolve k
+        if self.k is None:
+            from kneed import KneeLocator
+
+            direction = self.direction
+            curve = self.curve
+
+            if direction == "auto" or curve == "auto":
+                from kneed import find_shape
+                auto_direction, auto_curve = find_shape(
+                    self.k_distance_curve_.index.values,
+                    self.k_distance_curve_.values,
+                )
+                if direction == "auto":
+                    direction = auto_direction
+                if curve == "auto":
+                    curve = auto_curve
+
+            logger.info(f"Curve shape: direction={direction}, curve={curve}")
+
+            self.kneedle_ = KneeLocator(
+                self.k_distance_curve_.index.values,
+                self.k_distance_curve_.values,
+                curve=curve,
+                direction=direction,
+                S=self.sensitivity,
+            )
+            if self.kneedle_.knee is None:
+                logger.warning("No knee detected, defaulting to midpoint")
+                self.k_ = int(self.k_distance_curve_.index[len(self.k_distance_curve_) // 2])
+            else:
+                self.k_ = int(self.kneedle_.knee)
+            logger.info(f"Auto k={self.k_} (knee detection, sensitivity={self.sensitivity})")
+        else:
+            self.k_ = int(self.k)
+            logger.info(f"User-specified k={self.k_}")
+ 
+        # Build SNN and igraph
+        self.snn_adjacency_ = self._build_snn(self.k_)
+        self.graph_ = adjacency_to_igraph(
+            self.snn_adjacency_, labels=self.labels_,
+        )
+ 
+        n_edges = self.graph_.ecount()
+        logger.info(f"SNN graph: {self.n_samples_} nodes, {n_edges} edges")
+ 
+        return self
+ 
+    def fit_transform(self):
+        """Fit and return the igraph."""
+        return self.fit().graph_
+ 
+    def to_igraph(self, k):
+        """
+        Build igraph at arbitrary k without modifying state.
+ 
+        For parameter sweeps — does not change self.k_ or self.graph_.
+ 
+        Parameters
+        ----------
+        k : int
+            Number of neighbors.
+ 
         Returns
         -------
         ig.Graph
         """
-        check_is_fitted(self, ["similarities_", "indices_"])
+        A_snn = self._build_snn(k)
+        return adjacency_to_igraph(A_snn, labels=self.labels_)
 
-        if index == "auto":
-            index = getattr(self, "index_labels_", None)
-        elif isinstance(index, pd.Index):
-            index = list(index)
+    def plot(self, axes=None, figsize=(13, 5),
+             xlabel_left=None, ylabel_left=None, title_left=None,
+             xlabel_right=None, ylabel_right=None, title_right=None,
+             curve_color="black", iqr_color="steelblue",
+             vline_color="firebrick", hist_color="steelblue",
+             n_bins=100, panel_labels=True):
+        """
+        Two-panel diagnostic: k-distance elbow (left) and Jaccard distribution (right).
 
-        return kneighbors_to_igraph(
-            self.similarities_,
-            self.indices_,
-            index=index,
-            include_self=include_self,
+        Parameters
+        ----------
+        axes : array-like of matplotlib.axes.Axes or None
+            Two axes [left, right]. If None, creates a new figure.
+        figsize : tuple, default=(13, 5)
+            Figure size if creating new axes.
+        xlabel_left : str or None
+            Left panel x-label. Default: '$N_{Neighbors}$ [k]'.
+        ylabel_left : str or None
+            Left panel y-label. Default: '{Aggregation} distance to k-th neighbor'.
+        title_left : str or None
+            Left panel title. Default: None.
+        xlabel_right : str or None
+            Right panel x-label. Default: 'Jaccard similarity'.
+        ylabel_right : str or None
+            Right panel y-label. Default: '$N_{Edges}$'.
+        title_right : str or None
+            Right panel title. Default: None.
+        curve_color : str, default='black'
+            Color for the aggregation curve.
+        iqr_color : str, default='steelblue'
+            Color for the IQR fill.
+        vline_color : str, default='firebrick'
+            Color for the knee vertical line.
+        hist_color : str, default='steelblue'
+            Color for the Jaccard histogram.
+        n_bins : int, default=100
+            Number of histogram bins.
+        panel_labels : bool, default=True
+            Whether to add A/B panel labels.
+
+        Returns
+        -------
+        np.ndarray of matplotlib.axes.Axes
+        """
+        import matplotlib.pyplot as plt
+
+        if self.k_distance_curve_ is None:
+            self._build_k_distance_curve()
+
+        if axes is None:
+            fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        ax_left, ax_right = axes[0], axes[1]
+
+        # ── Panel A: K-distance elbow ──
+        k_vals = self.k_distance_curve_.index.values
+
+        ax_left.plot(
+            k_vals, self.k_distance_curve_.values,
+            color=curve_color, linewidth=2,
+            label=self.aggregation.capitalize(),
+        )
+        ax_left.fill_between(
+            k_vals, self.k_distance_q25_, self.k_distance_q75_,
+            alpha=0.2, color=iqr_color, label="IQR",
+        )
+
+        if self.k_ is not None:
+            ax_left.axvline(
+                self.k_, color=vline_color, linestyle="--",
+                linewidth=1.5, label=f"Knee (k={self.k_})",
+            )
+
+        if xlabel_left is None:
+            xlabel_left = "$N_{Neighbors}$ [k]"
+        if ylabel_left is None:
+            ylabel_left = f"{self.aggregation.capitalize()} distance to k-th neighbor"
+
+        ax_left.set_xlabel(xlabel_left)
+        ax_left.set_ylabel(ylabel_left)
+        if title_left is not None:
+            ax_left.set_title(title_left)
+        ax_left.legend(frameon=False)
+
+        # ── Panel B: Jaccard distribution ──
+        if self.snn_adjacency_ is not None:
+            A_upper = sps.triu(self.snn_adjacency_, k=1)
+            ax_right.hist(A_upper.data, bins=n_bins, color=hist_color, edgecolor="none")
+            n_edges = A_upper.nnz
+            ax_right.text(
+                0.95, 0.95,
+                f"Edges at k={self.k_}: {n_edges:,}",
+                transform=ax_right.transAxes,
+                ha="right", va="top", fontsize=10,
+            )
+
+        if xlabel_right is None:
+            xlabel_right = "Jaccard similarity"
+        if ylabel_right is None:
+            ylabel_right = "$N_{Edges}$"
+
+        ax_right.set_xlabel(xlabel_right)
+        ax_right.set_ylabel(ylabel_right)
+        if title_right is not None:
+            ax_right.set_title(title_right)
+
+        # ── Formatting ──
+        if panel_labels:
+            for ax, label in zip(axes, ["A", "B"]):
+                ax.text(
+                    -0.12, 1.05, label,
+                    transform=ax.transAxes,
+                    fontsize=16, fontweight="bold",
+                )
+
+        for ax in axes:
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        axes[0].get_figure().tight_layout()
+        return axes
+ 
+    def __repr__(self):
+        k_str = f"k={self.k_}" if self.k_ is not None else f"k={self.k} (unfitted)"
+        return (
+            f"SharedNearestNeighborsGraph(n_samples={self.n_samples_}, "
+            f"max_k={self.max_k_}, {k_str}, aggregation='{self.aggregation}')"
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1113,3 +2137,907 @@ class FaissKNNTransformer(BaseEstimator, TransformerMixin):
 
     def fit_transform(self, X, y=None):
         return self.fit(X, y).transform(X)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EnsembleKNeighborsClassifier
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EnsembleKNeighborsClassifier(BaseEstimator, ClassifierMixin):
+    """
+    KNN classifier that ensembles predictions across multiple k values.
+
+    Computes a single cosine similarity matrix (via dot product on
+    L2-normalized embeddings) and a single argsort, then slices the
+    top-k neighbors for each k value. Class probabilities are averaged
+    across all k values to produce the final prediction.
+
+    Parameters
+    ----------
+    k_values : list of int
+        The k values to ensemble over (e.g., [3, 5, 7, 11]).
+    metric : str, default="cosine"
+        Similarity metric. Only "cosine" is currently supported.
+    weights : {"distance", "uniform"}, default="distance"
+        How to weight neighbors within each k.
+        - "distance": weight each neighbor by its cosine similarity.
+        - "uniform": all neighbors contribute equally.
+
+    Attributes
+    ----------
+    X_train_ : ndarray of shape (n_samples_train, n_features)
+        Training embeddings (assumed L2-normalized).
+    y_train_ : ndarray of shape (n_samples_train,)
+        Training labels.
+    classes_ : ndarray
+        Unique class labels sorted in ascending order.
+    class_to_index_ : dict
+        Mapping from class label to column index in probability vectors.
+    """
+
+    def __init__(self, k_values, metric="cosine", weights="distance"):
+        self.k_values = k_values
+        self.metric = metric
+        self.weights = weights
+
+    def _validate_params(self):
+        if self.metric != "cosine":
+            raise NotImplementedError(
+                f"Only metric='cosine' is supported, got '{self.metric}'"
+            )
+        if self.weights not in ("uniform", "distance"):
+            raise ValueError(
+                f"weights must be 'uniform' or 'distance', got '{self.weights}'"
+            )
+        k_arr = np.asarray(self.k_values)
+        if k_arr.ndim != 1 or len(k_arr) == 0:
+            raise ValueError("k_values must be a non-empty 1D list of integers")
+        if not np.issubdtype(k_arr.dtype, np.integer) or np.any(k_arr <= 0):
+            raise ValueError("All k_values must be positive integers")
+        if len(set(self.k_values)) != len(self.k_values):
+            raise ValueError("k_values must not contain duplicates")
+
+    def fit(self, X, y):
+        """
+        Store training data and derive class metadata.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training embeddings (assumed L2-normalized).
+        y : array-like of shape (n_samples,)
+            Training labels.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        X, y = check_X_y(X, y)
+
+        if max(self.k_values) > X.shape[0]:
+            raise ValueError(
+                f"max(k_values)={max(self.k_values)} exceeds "
+                f"n_samples_train={X.shape[0]}"
+            )
+
+        self.X_train_ = X
+        self.y_train_ = y
+        self.classes_ = np.unique(y)
+        self.class_to_index_ = {c: i for i, c in enumerate(self.classes_)}
+
+        logger.info(
+            f"EnsembleKNeighborsClassifier.fit | "
+            f"n_samples={X.shape[0]}, n_features={X.shape[1]}, "
+            f"n_classes={len(self.classes_)}, k_values={self.k_values}"
+        )
+        return self
+
+    def predict_proba_per_k(self, X):
+        """
+        Compute class probabilities for each k value independently.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes, n_k_values)
+            Class probability vectors for each sample and each k.
+        """
+        check_is_fitted(self)
+        X = check_array(X)
+
+        S = X @ self.X_train_.T
+        max_k = max(self.k_values)
+        # O(n) partition to find top-max_k, then O(max_k log max_k) sort within
+        top_k_unsorted = np.argpartition(-S, max_k, axis=1)[:, :max_k]
+        top_k_sims_unsorted = np.take_along_axis(S, top_k_unsorted, axis=1)
+        sort_within = np.argsort(-top_k_sims_unsorted, axis=1)
+        neighbor_indices = np.take_along_axis(top_k_unsorted, sort_within, axis=1)
+        sorted_similarities = np.take_along_axis(top_k_sims_unsorted, sort_within, axis=1)
+
+        n_samples = X.shape[0]
+        n_classes = len(self.classes_)
+        n_k = len(self.k_values)
+        label_indices = np.array([self.class_to_index_[c] for c in self.y_train_])
+
+        proba = np.zeros((n_samples, n_classes, n_k), dtype=np.float64)
+
+        for ki, k in enumerate(self.k_values):
+            top_k_indices = neighbor_indices[:, :k]
+            top_k_labels = label_indices[top_k_indices]
+
+            if self.weights == "uniform":
+                for c_idx in range(n_classes):
+                    proba[:, c_idx, ki] = np.mean(top_k_labels == c_idx, axis=1)
+            else:
+                top_k_sims = sorted_similarities[:, :k]
+                for c_idx in range(n_classes):
+                    mask = top_k_labels == c_idx
+                    proba[:, c_idx, ki] = np.sum(top_k_sims * mask, axis=1)
+                row_sums = proba[:, :, ki].sum(axis=1, keepdims=True)
+                row_sums = np.where(row_sums == 0, 1.0, row_sums)
+                proba[:, :, ki] /= row_sums
+
+        return proba
+
+    def predict_proba(self, X):
+        """
+        Compute class probabilities averaged across all k values.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes)
+            Mean class probability vectors.
+        """
+        return self.predict_proba_per_k(X).mean(axis=2)
+
+    def predict(self, X):
+        """
+        Predict class labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Query embeddings (assumed L2-normalized).
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,)
+            Predicted class labels.
+        """
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KNeighborsThresholdClassifier
+# ══════════════════════════════════════════════════════════════════════════════
+class KNeighborsThresholdClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Distance-weighted KNN classifier with per-class reject option
+    and margin-based confidence reporting.
+
+    Wraps sklearn's KNeighborsClassifier and NearestNeighbors but hides
+    the precomputed-graph optimization behind a clean API: users pass
+    raw feature matrices, the class handles neighbor indexing internally.
+
+    Per-class probability thresholds are calibrated via one-vs-rest F1
+    maximization, optionally under user-supplied perturbation. Predictions
+    below the class-specific threshold are rejected rather than assigned.
+
+    Parameters
+    ----------
+    n_neighbors : int, default=5
+        Number of neighbors for classification.
+    metric : str, default="cosine"
+        Distance metric for neighbor search. Passed to
+        sklearn.neighbors.NearestNeighbors. Must not be "precomputed"
+        (see Notes).
+    weights : str, default="distance"
+        Weight function. "distance" uses inverse distance;
+        "uniform" weights all neighbors equally.
+    n_jobs : int, default=-1
+        Parallel jobs for neighbor search. -1 uses all cores.
+    calibration_batch_size : int, default=8192
+        Batch size for processing calibration queries. Controls
+        memory usage during calibrate().
+
+    Attributes
+    ----------
+    classes_ : ndarray
+        Sorted unique classes from training y.
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features in training X.
+    is_calibrated : bool
+        True after calibrate() has been called.
+    class_to_threshold : pd.Series or None
+        Per-class threshold (index=classes_). None before calibration.
+    fallback_threshold_ : float or None
+        Median threshold used for small classes. None before calibration.
+
+    Notes
+    -----
+    metric="precomputed" is not supported. The class uses precomputed
+    graphs internally as an optimization — the NearestNeighbors index
+    computes distances once, and the KNN classifier receives a
+    precomputed sparse graph. The user always passes raw features.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from skclust.neighbors import KNeighborsThresholdClassifier
+    >>> X = np.random.standard_normal((100, 10))
+    >>> y = np.array(["A", "B", "C"])[np.random.randint(0, 3, 100)]
+    >>> clf = KNeighborsThresholdClassifier(n_neighbors=5)
+    >>> clf.fit(X, y)
+    KNeighborsThresholdClassifier(...)
+    >>> clf.calibrate()
+    KNeighborsThresholdClassifier(...)
+    >>> df = clf.predict(X[:5])
+    """
+
+    def __init__(
+        self,
+        n_neighbors=5,
+        metric="cosine",
+        weights="distance",
+        n_jobs=-1,
+        calibration_batch_size=8192,
+    ):
+        if metric == "precomputed":
+            raise ValueError(
+                "metric='precomputed' is not supported. Pass raw features; "
+                "the precomputed neighbor graph is handled internally."
+            )
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.weights = weights
+        self.n_jobs = n_jobs
+        self.calibration_batch_size = calibration_batch_size
+
+    # ---- fit ----------------------------------------------------------------
+    def fit(self, X, y):
+        """
+        Fit the classifier on training data.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Training features. If a DataFrame, its index is stored.
+        y : array-like of shape (n_samples,)
+            Training labels.
+ 
+        Returns
+        -------
+        self
+        """
+        self._fit_index = X.index if isinstance(X, pd.DataFrame) else None
+ 
+        X, y = check_X_y(X, y)
+        # CHANGED: no np.float64 cast. check_X_y already guarantees a numeric 2D
+        # array; upcasting float32 embeddings doubles resident memory and pickle
+        # size with no effect on cosine distances. ascontiguousarray is a no-op
+        # when check_X_y already returned a C-contiguous array, so the fitted
+        # index and self._X_fit share one buffer.
+        self._X_fit = np.ascontiguousarray(X)
+        self._y_fit = np.asarray(y)
+        self.n_features_in_ = X.shape[1]
+        n_train = X.shape[0]
+ 
+        cat = pd.Categorical(self._y_fit)
+        self.classes_ = np.asarray(cat.categories)
+        self.n_classes_ = len(self.classes_)
+        self._y_codes = cat.codes.copy().astype(np.int32)
+ 
+        self._nn_index = NearestNeighbors(
+            n_neighbors=self.n_neighbors,
+            metric=self.metric,
+            n_jobs=self.n_jobs,
+        )
+        self._nn_index.fit(self._X_fit)
+ 
+        self._graph_fit = sps.eye(n_train, format="csr") * 1e-6
+        self._knn = KNeighborsClassifier(
+            n_neighbors=self.n_neighbors,
+            metric="precomputed",
+            weights=self.weights,
+            n_jobs=self.n_jobs,
+        )
+        self._knn.fit(self._graph_fit, self._y_fit)
+        assert np.array_equal(self._knn.classes_, self.classes_)
+ 
+        self.is_calibrated = False
+        self.class_to_threshold = None
+        self.class_is_calibrated_ = None
+        self.class_meets_precision_target_ = None
+        self.calibration_objective_ = None
+        self.calibration_record_ = None
+        self._code_to_threshold = None
+        self.fallback_threshold_ = None
+ 
+        logger.info(
+            f"KNeighborsThresholdClassifier.fit | "
+            f"n_samples={n_train}, n_features={self.n_features_in_}, "
+            f"n_classes={self.n_classes_}, n_neighbors={self.n_neighbors}, "
+            f"dtype={self._X_fit.dtype}"
+        )
+        return self
+ 
+    # ---- predict_proba ------------------------------------------------------
+    # UNCHANGED. Present only so a block paste does not delete it.
+    def predict_proba(self, X):
+        """
+        Predict class probabilities for query samples.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Query features. If a DataFrame, returns a DataFrame with
+            the input's index as rows and classes_ as columns.
+ 
+        Returns
+        -------
+        proba : pd.DataFrame or np.ndarray of shape (n_samples, n_classes)
+            Class probabilities. DataFrame if input was a DataFrame,
+            ndarray otherwise.
+        """
+        check_is_fitted(self, ["_knn", "_nn_index"])
+        return_df = isinstance(X, pd.DataFrame)
+        query_index = X.index if return_df else None
+        X = check_array(X)
+        graph = self._neighbor_graph(X)
+        proba = self._knn.predict_proba(graph)
+        if return_df:
+            return pd.DataFrame(proba, index=query_index, columns=self.classes_)
+        return proba
+ 
+    # ---- predict ------------------------------------------------------------
+    def predict(self, X):
+        """
+        Predict class labels with confidence and margin reporting.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Query features. If a DataFrame, the output preserves its index.
+ 
+        Returns
+        -------
+        df_predictions : pd.DataFrame
+            See predict_from_proba for column documentation.
+        """
+        # CHANGED: delegate. One neighbor search, one place where the
+        # prediction table is defined.
+        return self.predict_from_proba(self.predict_proba(X))
+ 
+    def predict_from_proba(self, proba):
+        """
+        Build the prediction table from an existing probability matrix.
+ 
+        CHANGED (new method). Lets a caller that already holds probabilities
+        — for AUPRC, calibration curves, tier breakdowns — get the prediction
+        table without paying for a second neighbor search over the full
+        reference set.
+ 
+        Parameters
+        ----------
+        proba : pd.DataFrame or ndarray of shape (n_samples, n_classes)
+            Output of predict_proba. A DataFrame's index is preserved.
+ 
+        Returns
+        -------
+        df_predictions : pd.DataFrame
+            Columns:
+            - predicted_class: top predicted class
+            - probability: probability of predicted class
+            - runner_up_class: second most probable class
+            - runner_up_probability: probability of runner-up
+            - margin: probability - runner_up_probability
+ 
+            If calibrated, additional columns:
+            - threshold: per-class threshold for the predicted class
+            - passed: bool, whether probability >= threshold
+            - assigned_class: predicted_class where passed, else NaN
+        """
+        check_is_fitted(self, ["classes_"])
+        query_index = proba.index if isinstance(proba, pd.DataFrame) else None
+        proba = np.asarray(proba, dtype=np.float64)
+        if proba.ndim != 2 or proba.shape[1] != self.n_classes_:
+            raise ValueError(
+                f"proba must be (n_samples, {self.n_classes_}); got {proba.shape}"
+            )
+        n_samples = proba.shape[0]
+ 
+        if self.n_classes_ >= 2:
+            top2 = np.argpartition(proba, -2, axis=1)[:, -2:]
+            top2_proba = np.take_along_axis(proba, top2, axis=1)
+            order = np.argsort(top2_proba, axis=1)
+            top2_sorted_idx = np.take_along_axis(top2, order, axis=1)
+            top2_sorted_proba = np.take_along_axis(top2_proba, order, axis=1)
+ 
+            predicted_code = top2_sorted_idx[:, 1]
+            probability = top2_sorted_proba[:, 1]
+            runner_up_probability = top2_sorted_proba[:, 0]
+            runner_up_class = self.classes_[top2_sorted_idx[:, 0]]
+        else:
+            predicted_code = np.zeros(n_samples, dtype=np.intp)
+            probability = proba[:, 0]
+            runner_up_probability = np.zeros(n_samples)
+            runner_up_class = np.full(n_samples, np.nan, dtype=object)
+ 
+        predicted_class = self.classes_[predicted_code]
+ 
+        df_predictions = pd.DataFrame(
+            {
+                "predicted_class": predicted_class,
+                "probability": probability,
+                "runner_up_class": runner_up_class,
+                "runner_up_probability": runner_up_probability,
+                "margin": probability - runner_up_probability,
+            },
+            index=query_index,
+        )
+ 
+        if self.is_calibrated:
+            thresholds = self._code_to_threshold[predicted_code]
+            passed = probability >= thresholds
+            assigned_class = predicted_class.copy().astype(object)
+            assigned_class[~passed] = np.nan
+            df_predictions["threshold"] = thresholds
+            df_predictions["passed"] = passed
+            df_predictions["assigned_class"] = assigned_class
+ 
+        return df_predictions
+ 
+    # ---- calibrate ----------------------------------------------------------
+    def calibrate(
+        self,
+        X=None,
+        y=None,
+        perturbation_fn=None,
+        n_replicates=10,
+        n_per_class=None,
+        min_positives=20,
+        n_grid=101,
+        objective="f1",
+        target_precision=0.95,
+        random_state=None,
+    ):
+        """
+        Learn per-class probability thresholds that maximize per-class F1.
+ 
+        Parameters
+        ----------
+        X : array-like or None
+            Calibration features. None = use training data (LOO mode).
+        y : array-like or None
+            Calibration labels. None = use training labels.
+            Ignored when X is None.
+        perturbation_fn : callable or None
+            CHANGED signature: (X_batch, y_batch, rng, positions) -> X_perturbed.
+ 
+            Called once per batch (previously once per replicate, which
+            contradicted the documented `X_batch` contract and made GPU
+            re-embedding of a large calibration set an OOM risk).
+ 
+            - X_batch  : (batch_size, n_features_in_) clean query features
+            - y_batch  : original labels for the batch
+            - rng      : np.random.Generator
+            - positions: integer row positions of the batch within the
+                         calibration matrix — the *training* matrix in LOO
+                         mode. Use these to index auxiliary per-sample data
+                         the classifier never sees.
+ 
+            Must return (batch_size, n_features_in_). The return may be
+            generated from any upstream representation; it does not have to
+            be a transform of X_batch. A pipeline that perturbs in a
+            different space, re-embeds, and re-normalizes is expressible
+            here — ignore X_batch and rebuild the batch from `positions`.
+        n_replicates : int, default=10
+            Number of independent perturbation draws per sample.
+        n_per_class : int or None
+            Max calibration samples per class for balance, resampled each
+            replicate. None = use all available samples.
+        min_positives : int, default=20
+            Classes with fewer calibration positives use the fallback
+            threshold. NOTE: counts rows pooled across replicates, not
+            distinct samples. With n_replicates=10 a class holding 3
+            samples contributes 30 rows and clears a threshold of 20 on an
+            effective n of 3. Set min_positives relative to n_replicates,
+            and read class_is_calibrated_ alongside per-class counts.
+        n_grid : int, default=101
+            Threshold grid resolution (0.0 to 1.0 inclusive). Note that with
+            small n_neighbors the vote share is quantized to ~n_neighbors
+            levels, so grid resolution far finer than 1/n_neighbors is wasted.
+        objective : {"f1", "precision_target"}, default="f1"
+            CHANGED (new). What the per-class threshold optimizes.
+            "f1" weights precision and recall equally — usually NOT what a
+            reject option is for. "precision_target" maximizes recall subject
+            to a per-class precision floor, which is the objective that yields
+            a stateable guarantee. See _calibrate_thresholds.
+        target_precision : float, default=0.95
+            CHANGED (new). Precision floor when objective="precision_target".
+        random_state : int or None
+            Seed for RNG (balance sampling + perturbation).
+ 
+        Returns
+        -------
+        self
+        """
+        check_is_fitted(self, ["_nn_index", "_knn"])
+        rng = np.random.default_rng(random_state)
+ 
+        if X is None and y is None:
+            X_cal = self._X_fit
+            y_cal = self._y_fit
+            y_codes_cal = self._y_codes
+            loo_mode = True
+            logger.info("KNeighborsThresholdClassifier.calibrate | LOO mode")
+        elif X is not None and y is not None:
+            X_cal = check_array(X)
+            y_cal = np.asarray(y)
+            cat = pd.Categorical(y_cal, categories=self.classes_)
+            y_codes_cal = cat.codes.copy().astype(np.int32)
+            if (y_codes_cal == -1).any():
+                unknown = set(y_cal[y_codes_cal == -1])
+                raise ValueError(
+                    f"Calibration set contains classes not seen during fit: {unknown}"
+                )
+            loo_mode = False
+            logger.warning(
+                f"KNeighborsThresholdClassifier.calibrate | external mode, "
+                f"n_cal={X_cal.shape[0]} | self-matches are NOT excluded. If "
+                f"these samples are also in the training set, use LOO mode "
+                f"(X=None, y=None) or thresholds will calibrate against "
+                f"near-zero-distance self neighbors."
+            )
+        else:
+            raise ValueError(
+                "Provide both X and y for external calibration, "
+                "or neither for LOO."
+            )
+ 
+        if perturbation_fn is None and n_replicates > 1:
+            logger.warning(
+                "No perturbation_fn; replicates are identical. "
+                "Consider n_replicates=1."
+            )
+ 
+        n_cal = X_cal.shape[0]
+        all_true_codes = []
+        all_predicted_codes = []
+        all_max_proba = []
+ 
+        for rep in range(n_replicates):
+            if n_per_class is not None:
+                sample_idx = self._balanced_sample(y_codes_cal, n_per_class, rng)
+            else:
+                sample_idx = np.arange(n_cal)
+ 
+            # CHANGED: perturbation now happens inside the batch loop, and the
+            # batch's row positions are handed to the callback.
+            for start in range(0, len(sample_idx), self.calibration_batch_size):
+                positions = sample_idx[start : start + self.calibration_batch_size]
+                X_batch = X_cal[positions]
+                self_pos_batch = positions if loo_mode else None
+ 
+                if perturbation_fn is not None:
+                    X_batch = perturbation_fn(
+                        X_batch, y_cal[positions], rng, positions,
+                    )
+                    X_batch = check_array(X_batch)
+                    if X_batch.shape != (len(positions), self.n_features_in_):
+                        raise ValueError(
+                            f"perturbation_fn returned {X_batch.shape}; expected "
+                            f"{(len(positions), self.n_features_in_)}"
+                        )
+ 
+                graph = self._neighbor_graph(X_batch, self_positions=self_pos_batch)
+                proba = self._knn.predict_proba(graph)
+ 
+                all_true_codes.append(y_codes_cal[positions])
+                all_predicted_codes.append(np.argmax(proba, axis=1))
+                all_max_proba.append(np.max(proba, axis=1))
+ 
+            logger.info(
+                f"KNeighborsThresholdClassifier.calibrate | "
+                f"replicate {rep + 1}/{n_replicates} complete"
+            )
+ 
+        # CHANGED: cache the pooled calibration predictions. Generating them
+        # is the entire cost when perturbation_fn re-embeds; fitting thresholds
+        # from them is milliseconds. See refit_thresholds.
+        self.calibration_record_ = dict(
+            true_codes=np.concatenate(all_true_codes),
+            predicted_codes=np.concatenate(all_predicted_codes),
+            max_probability=np.concatenate(all_max_proba),
+        )
+        return self.refit_thresholds(
+            objective=objective,
+            target_precision=target_precision,
+            min_positives=min_positives,
+            n_grid=n_grid,
+        )
+ 
+    # ---- refit_thresholds ---------------------------------------------------
+    def refit_thresholds(
+        self,
+        objective="f1",
+        target_precision=0.95,
+        min_positives=20,
+        n_grid=101,
+    ):
+        """
+        CHANGED (new method). Re-derive per-class thresholds from the stored
+        calibration record, without repeating the perturbation pass.
+ 
+        Lets objectives be compared for free once calibrate() has run once.
+ 
+        Parameters
+        ----------
+        objective : {"f1", "precision_target"}, default="f1"
+        target_precision : float, default=0.95
+        min_positives : int, default=20
+        n_grid : int, default=101
+ 
+        Returns
+        -------
+        self
+        """
+        if getattr(self, "calibration_record_", None) is None:
+            raise ValueError("No calibration record — call calibrate() first.")
+        record = self.calibration_record_
+ 
+        (
+            self._code_to_threshold,
+            self.fallback_threshold_,
+            self.class_is_calibrated_,
+            self.class_meets_precision_target_,
+        ) = self._calibrate_thresholds(
+            record["true_codes"],
+            record["predicted_codes"],
+            record["max_probability"],
+            min_positives=min_positives,
+            n_grid=n_grid,
+            objective=objective,
+            target_precision=target_precision,
+        )
+ 
+        self.class_to_threshold = pd.Series(
+            self._code_to_threshold, index=self.classes_, name="threshold",
+        )
+        self.calibration_objective_ = objective
+        self.is_calibrated = True
+ 
+        message = (
+            f"KNeighborsThresholdClassifier.refit_thresholds | "
+            f"objective={objective} | calibrated "
+            f"{int(self.class_is_calibrated_.sum())}/{self.n_classes_} classes "
+            f"directly; fallback={self.fallback_threshold_:.3f}"
+        )
+        if objective == "precision_target":
+            message += (
+                f"; {int(self.class_meets_precision_target_.sum())}"
+                f"/{int(self.class_is_calibrated_.sum())} calibrated classes reached "
+                f"precision>={target_precision:.2f} (rest kept F1-optimal)"
+            )
+        logger.info(message)
+        return self
+ 
+    # ---- score --------------------------------------------------------------
+    def score(self, X, y):
+        """
+        Compute macro-F1 score.
+ 
+        If calibrated, uses rejection-aware scoring: predictions below
+        the class threshold are rejected (cost recall, not precision).
+        If not calibrated, uses standard macro-F1.
+ 
+        CHANGED: the macro average now spans only classes present in y.
+        Averaging over all fitted classes made the score depend on how many
+        classes happen to be absent from the evaluation slice, which is not
+        a property of the model.
+        """
+        check_is_fitted(self, ["_knn", "_nn_index"])
+        X, y = check_X_y(X, y)
+ 
+        graph = self._neighbor_graph(X)
+        proba = self._knn.predict_proba(graph)
+        predicted_codes = np.argmax(proba, axis=1)
+        max_probability = np.max(proba, axis=1)
+ 
+        cat = pd.Categorical(y, categories=self.classes_)
+        true_codes = cat.codes.copy().astype(np.int32)
+        if (true_codes == -1).any():
+            raise ValueError("y contains classes not seen during fit")
+        labels = np.unique(true_codes)
+ 
+        if self.is_calibrated:
+            return self._score_with_rejection(
+                true_codes, predicted_codes, max_probability, labels,
+            )
+        return self._macro_f1(true_codes, predicted_codes, labels)
+ 
+    # ---- private helpers ----------------------------------------------------
+    def _neighbor_graph(self, X_query, self_positions=None):
+        """
+        Build sparse (n_query, n_train) distance graph.
+ 
+        CHANGED: self-exclusion is vectorized. The previous per-query Python
+        loop dominated calibration cost once queries reached ~1e5 rows. The
+        redundant re-sort is also gone: kneighbors returns ascending
+        distances and dropping one column preserves that order, which is
+        what sklearn's precomputed-graph path requires.
+        """
+        n_train = self._X_fit.shape[0]
+        n_query = X_query.shape[0]
+        k = self.n_neighbors
+ 
+        extra = int(self_positions is not None)
+        distances, indices = self._nn_index.kneighbors(
+            X_query, n_neighbors=k + extra,
+        )
+ 
+        if extra:
+            is_self = indices == np.asarray(self_positions)[:, None]
+            # self-match outside the k+1 window: drop the farthest instead
+            is_self[~is_self.any(axis=1), -1] = True
+            distances = distances[~is_self].reshape(n_query, k)
+            indices = indices[~is_self].reshape(n_query, k)
+ 
+        indptr = np.arange(0, (n_query + 1) * k, k)
+        return sps.csr_matrix(
+            (distances.ravel(), indices.ravel(), indptr),
+            shape=(n_query, n_train),
+        )
+ 
+    def _balanced_sample(self, y_codes, n_per_class, rng):
+        """Sample up to n_per_class from each class."""
+        indices = []
+        for c in range(self.n_classes_):
+            class_idx = np.where(y_codes == c)[0]
+            if len(class_idx) == 0:
+                continue
+            n_take = min(len(class_idx), n_per_class)
+            indices.append(rng.choice(class_idx, size=n_take, replace=False))
+        return np.concatenate(indices)
+ 
+    def _calibrate_thresholds(
+        self, true_codes, predicted_codes, max_probability,
+        min_positives, n_grid, objective="f1", target_precision=0.95,
+    ):
+        """
+        Per-class threshold on a grid.
+ 
+        objective="f1"
+            Threshold maximizing per-class F1, ties breaking toward the higher
+            (more conservative) threshold. Weights precision and recall
+            equally, which is usually not what a reject option is for.
+        objective="precision_target"
+            Smallest threshold whose per-class precision reaches
+            target_precision — i.e. maximize recall subject to a precision
+            floor. Classes that cannot reach the target at any threshold keep
+            their F1-optimal threshold and are flagged in the returned
+            meets_target mask; this is what prevents the degenerate
+            "reject everything for perfect precision" solution.
+ 
+        CHANGED: vectorized over the grid and restricted to rows predicted as
+        the class. The previous nested loop was O(n_classes * n_grid * n_rows)
+        full-array boolean passes — for a few hundred classes and ~1e5
+        pooled calibration rows that is billions of element operations.
+ 
+        Returns
+        -------
+        code_to_threshold : ndarray of shape (n_classes,)
+        fallback : float
+        is_calibrated : ndarray of bool, shape (n_classes,)
+            CHANGED: an explicit mask. Counting directly-calibrated classes
+            as (threshold != fallback) silently undercounts whenever a real
+            threshold happens to equal the fallback value.
+        meets_target : ndarray of bool, shape (n_classes,)
+            True where objective="precision_target" was satisfiable.
+            All False when objective="f1".
+        """
+        if objective not in ("f1", "precision_target"):
+            raise ValueError(
+                f"objective must be 'f1' or 'precision_target'; got {objective!r}"
+            )
+ 
+        grid = np.linspace(0.0, 1.0, n_grid)
+        code_to_threshold = np.full(self.n_classes_, np.nan)
+        meets_target = np.zeros(self.n_classes_, dtype=bool)
+ 
+        for c in range(self.n_classes_):
+            is_positive = true_codes == c
+            n_positives = int(is_positive.sum())
+            if n_positives < min_positives:
+                continue
+ 
+            is_predicted = predicted_codes == c
+            # (n_grid, n_predicted_as_c)
+            keep = max_probability[is_predicted][None, :] >= grid[:, None]
+            positive_predicted = is_positive[is_predicted][None, :]
+ 
+            tp = (keep & positive_predicted).sum(axis=1)
+            fp = (keep & ~positive_predicted).sum(axis=1)
+            fn = n_positives - tp
+            f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+            # reversed argmax => highest threshold among ties
+            threshold_f1 = grid[n_grid - 1 - int(np.argmax(f1[::-1]))]
+ 
+            if objective == "f1":
+                code_to_threshold[c] = threshold_f1
+                continue
+ 
+            predicted_positive = tp + fp
+            precision = np.divide(
+                tp, predicted_positive,
+                out=np.zeros(n_grid, dtype=np.float64),
+                where=predicted_positive > 0,
+            )
+            feasible = (precision >= target_precision) & (tp > 0)
+            if feasible.any():
+                # first True on an ascending grid = smallest feasible threshold
+                # = maximum recall subject to the precision floor
+                code_to_threshold[c] = grid[int(np.argmax(feasible))]
+                meets_target[c] = True
+            else:
+                code_to_threshold[c] = threshold_f1
+ 
+        is_calibrated = np.isfinite(code_to_threshold)
+        if is_calibrated.any():
+            fallback = float(np.nanmedian(code_to_threshold))
+        else:
+            fallback = 0.5
+            logger.warning(
+                f"No class reached min_positives={min_positives}; every "
+                f"threshold falls back to {fallback}."
+            )
+ 
+        code_to_threshold = np.where(is_calibrated, code_to_threshold, fallback)
+        return code_to_threshold, fallback, is_calibrated, meets_target
+ 
+    def _score_with_rejection(
+        self, true_codes, predicted_codes, max_probability, labels,
+    ):
+        """Rejection-aware macro-F1. CHANGED: bincount instead of a class loop."""
+        passed = max_probability >= self._code_to_threshold[predicted_codes]
+        assigned = predicted_codes[passed]
+        is_correct = assigned == true_codes[passed]
+ 
+        tp = np.bincount(assigned[is_correct], minlength=self.n_classes_)
+        predicted_positive = np.bincount(assigned, minlength=self.n_classes_)
+        actual_positive = np.bincount(true_codes, minlength=self.n_classes_)
+ 
+        fp = predicted_positive - tp
+        fn = actual_positive - tp
+        f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+        return float(f1[labels].mean())
+ 
+    def _macro_f1(self, true_codes, predicted_codes, labels):
+        """
+        Standard macro-F1 without rejection.
+ 
+        CHANGED: bincount instead of a class loop; no longer a staticmethod
+        since it needs n_classes_ for the bincount width.
+        """
+        is_correct = predicted_codes == true_codes
+        tp = np.bincount(predicted_codes[is_correct], minlength=self.n_classes_)
+        predicted_positive = np.bincount(predicted_codes, minlength=self.n_classes_)
+        actual_positive = np.bincount(true_codes, minlength=self.n_classes_)
+ 
+        fp = predicted_positive - tp
+        fn = actual_positive - tp
+        f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+        return float(f1[labels].mean())
