@@ -10,7 +10,11 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sps
 from sklearn.base import clone, BaseEstimator, ClassifierMixin, TransformerMixin
-from sklearn.neighbors import KNeighborsTransformer
+from sklearn.neighbors import (
+    KNeighborsClassifier,
+    KNeighborsTransformer,
+    NearestNeighbors,
+)
 from scipy.spatial.distance import squareform
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_is_fitted, check_array, check_X_y
@@ -2312,3 +2316,728 @@ class EnsembleKNeighborsClassifier(BaseEstimator, ClassifierMixin):
         """
         proba = self.predict_proba(X)
         return self.classes_[np.argmax(proba, axis=1)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KNeighborsThresholdClassifier
+# ══════════════════════════════════════════════════════════════════════════════
+class KNeighborsThresholdClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Distance-weighted KNN classifier with per-class reject option
+    and margin-based confidence reporting.
+
+    Wraps sklearn's KNeighborsClassifier and NearestNeighbors but hides
+    the precomputed-graph optimization behind a clean API: users pass
+    raw feature matrices, the class handles neighbor indexing internally.
+
+    Per-class probability thresholds are calibrated via one-vs-rest F1
+    maximization, optionally under user-supplied perturbation. Predictions
+    below the class-specific threshold are rejected rather than assigned.
+
+    Parameters
+    ----------
+    n_neighbors : int, default=5
+        Number of neighbors for classification.
+    metric : str, default="cosine"
+        Distance metric for neighbor search. Passed to
+        sklearn.neighbors.NearestNeighbors. Must not be "precomputed"
+        (see Notes).
+    weights : str, default="distance"
+        Weight function. "distance" uses inverse distance;
+        "uniform" weights all neighbors equally.
+    n_jobs : int, default=-1
+        Parallel jobs for neighbor search. -1 uses all cores.
+    calibration_batch_size : int, default=8192
+        Batch size for processing calibration queries. Controls
+        memory usage during calibrate().
+
+    Attributes
+    ----------
+    classes_ : ndarray
+        Sorted unique classes from training y.
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features in training X.
+    is_calibrated : bool
+        True after calibrate() has been called.
+    class_to_threshold : pd.Series or None
+        Per-class threshold (index=classes_). None before calibration.
+    fallback_threshold_ : float or None
+        Median threshold used for small classes. None before calibration.
+
+    Notes
+    -----
+    metric="precomputed" is not supported. The class uses precomputed
+    graphs internally as an optimization — the NearestNeighbors index
+    computes distances once, and the KNN classifier receives a
+    precomputed sparse graph. The user always passes raw features.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from skclust.neighbors import KNeighborsThresholdClassifier
+    >>> X = np.random.standard_normal((100, 10))
+    >>> y = np.array(["A", "B", "C"])[np.random.randint(0, 3, 100)]
+    >>> clf = KNeighborsThresholdClassifier(n_neighbors=5)
+    >>> clf.fit(X, y)
+    KNeighborsThresholdClassifier(...)
+    >>> clf.calibrate()
+    KNeighborsThresholdClassifier(...)
+    >>> df = clf.predict(X[:5])
+    """
+
+    def __init__(
+        self,
+        n_neighbors=5,
+        metric="cosine",
+        weights="distance",
+        n_jobs=-1,
+        calibration_batch_size=8192,
+    ):
+        if metric == "precomputed":
+            raise ValueError(
+                "metric='precomputed' is not supported. Pass raw features; "
+                "the precomputed neighbor graph is handled internally."
+            )
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.weights = weights
+        self.n_jobs = n_jobs
+        self.calibration_batch_size = calibration_batch_size
+
+    # ---- fit ----------------------------------------------------------------
+    def fit(self, X, y):
+        """
+        Fit the classifier on training data.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Training features. If a DataFrame, its index is stored.
+        y : array-like of shape (n_samples,)
+            Training labels.
+ 
+        Returns
+        -------
+        self
+        """
+        self._fit_index = X.index if isinstance(X, pd.DataFrame) else None
+ 
+        X, y = check_X_y(X, y)
+        # CHANGED: no np.float64 cast. check_X_y already guarantees a numeric 2D
+        # array; upcasting float32 embeddings doubles resident memory and pickle
+        # size with no effect on cosine distances. ascontiguousarray is a no-op
+        # when check_X_y already returned a C-contiguous array, so the fitted
+        # index and self._X_fit share one buffer.
+        self._X_fit = np.ascontiguousarray(X)
+        self._y_fit = np.asarray(y)
+        self.n_features_in_ = X.shape[1]
+        n_train = X.shape[0]
+ 
+        cat = pd.Categorical(self._y_fit)
+        self.classes_ = np.asarray(cat.categories)
+        self.n_classes_ = len(self.classes_)
+        self._y_codes = cat.codes.copy().astype(np.int32)
+ 
+        self._nn_index = NearestNeighbors(
+            n_neighbors=self.n_neighbors,
+            metric=self.metric,
+            n_jobs=self.n_jobs,
+        )
+        self._nn_index.fit(self._X_fit)
+ 
+        self._graph_fit = sps.eye(n_train, format="csr") * 1e-6
+        self._knn = KNeighborsClassifier(
+            n_neighbors=self.n_neighbors,
+            metric="precomputed",
+            weights=self.weights,
+            n_jobs=self.n_jobs,
+        )
+        self._knn.fit(self._graph_fit, self._y_fit)
+        assert np.array_equal(self._knn.classes_, self.classes_)
+ 
+        self.is_calibrated = False
+        self.class_to_threshold = None
+        self.class_is_calibrated_ = None
+        self.class_meets_precision_target_ = None
+        self.calibration_objective_ = None
+        self.calibration_record_ = None
+        self._code_to_threshold = None
+        self.fallback_threshold_ = None
+ 
+        logger.info(
+            f"KNeighborsThresholdClassifier.fit | "
+            f"n_samples={n_train}, n_features={self.n_features_in_}, "
+            f"n_classes={self.n_classes_}, n_neighbors={self.n_neighbors}, "
+            f"dtype={self._X_fit.dtype}"
+        )
+        return self
+ 
+    # ---- predict_proba ------------------------------------------------------
+    # UNCHANGED. Present only so a block paste does not delete it.
+    def predict_proba(self, X):
+        """
+        Predict class probabilities for query samples.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Query features. If a DataFrame, returns a DataFrame with
+            the input's index as rows and classes_ as columns.
+ 
+        Returns
+        -------
+        proba : pd.DataFrame or np.ndarray of shape (n_samples, n_classes)
+            Class probabilities. DataFrame if input was a DataFrame,
+            ndarray otherwise.
+        """
+        check_is_fitted(self, ["_knn", "_nn_index"])
+        return_df = isinstance(X, pd.DataFrame)
+        query_index = X.index if return_df else None
+        X = check_array(X)
+        graph = self._neighbor_graph(X)
+        proba = self._knn.predict_proba(graph)
+        if return_df:
+            return pd.DataFrame(proba, index=query_index, columns=self.classes_)
+        return proba
+ 
+    # ---- predict ------------------------------------------------------------
+    def predict(self, X):
+        """
+        Predict class labels with confidence and margin reporting.
+ 
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame of shape (n_samples, n_features)
+            Query features. If a DataFrame, the output preserves its index.
+ 
+        Returns
+        -------
+        df_predictions : pd.DataFrame
+            See predict_from_proba for column documentation.
+        """
+        # CHANGED: delegate. One neighbor search, one place where the
+        # prediction table is defined.
+        return self.predict_from_proba(self.predict_proba(X))
+ 
+    def predict_from_proba(self, proba):
+        """
+        Build the prediction table from an existing probability matrix.
+ 
+        CHANGED (new method). Lets a caller that already holds probabilities
+        — for AUPRC, calibration curves, tier breakdowns — get the prediction
+        table without paying for a second neighbor search over the full
+        reference set.
+ 
+        Parameters
+        ----------
+        proba : pd.DataFrame or ndarray of shape (n_samples, n_classes)
+            Output of predict_proba. A DataFrame's index is preserved.
+ 
+        Returns
+        -------
+        df_predictions : pd.DataFrame
+            Columns:
+            - predicted_class: top predicted class
+            - probability: probability of predicted class
+            - runner_up_class: second most probable class
+            - runner_up_probability: probability of runner-up
+            - margin: probability - runner_up_probability
+ 
+            If calibrated, additional columns:
+            - threshold: per-class threshold for the predicted class
+            - passed: bool, whether probability >= threshold
+            - assigned_class: predicted_class where passed, else NaN
+        """
+        check_is_fitted(self, ["classes_"])
+        query_index = proba.index if isinstance(proba, pd.DataFrame) else None
+        proba = np.asarray(proba, dtype=np.float64)
+        if proba.ndim != 2 or proba.shape[1] != self.n_classes_:
+            raise ValueError(
+                f"proba must be (n_samples, {self.n_classes_}); got {proba.shape}"
+            )
+        n_samples = proba.shape[0]
+ 
+        if self.n_classes_ >= 2:
+            top2 = np.argpartition(proba, -2, axis=1)[:, -2:]
+            top2_proba = np.take_along_axis(proba, top2, axis=1)
+            order = np.argsort(top2_proba, axis=1)
+            top2_sorted_idx = np.take_along_axis(top2, order, axis=1)
+            top2_sorted_proba = np.take_along_axis(top2_proba, order, axis=1)
+ 
+            predicted_code = top2_sorted_idx[:, 1]
+            probability = top2_sorted_proba[:, 1]
+            runner_up_probability = top2_sorted_proba[:, 0]
+            runner_up_class = self.classes_[top2_sorted_idx[:, 0]]
+        else:
+            predicted_code = np.zeros(n_samples, dtype=np.intp)
+            probability = proba[:, 0]
+            runner_up_probability = np.zeros(n_samples)
+            runner_up_class = np.full(n_samples, np.nan, dtype=object)
+ 
+        predicted_class = self.classes_[predicted_code]
+ 
+        df_predictions = pd.DataFrame(
+            {
+                "predicted_class": predicted_class,
+                "probability": probability,
+                "runner_up_class": runner_up_class,
+                "runner_up_probability": runner_up_probability,
+                "margin": probability - runner_up_probability,
+            },
+            index=query_index,
+        )
+ 
+        if self.is_calibrated:
+            thresholds = self._code_to_threshold[predicted_code]
+            passed = probability >= thresholds
+            assigned_class = predicted_class.copy().astype(object)
+            assigned_class[~passed] = np.nan
+            df_predictions["threshold"] = thresholds
+            df_predictions["passed"] = passed
+            df_predictions["assigned_class"] = assigned_class
+ 
+        return df_predictions
+ 
+    # ---- calibrate ----------------------------------------------------------
+    def calibrate(
+        self,
+        X=None,
+        y=None,
+        perturbation_fn=None,
+        n_replicates=10,
+        n_per_class=None,
+        min_positives=20,
+        n_grid=101,
+        objective="f1",
+        target_precision=0.95,
+        random_state=None,
+    ):
+        """
+        Learn per-class probability thresholds that maximize per-class F1.
+ 
+        Parameters
+        ----------
+        X : array-like or None
+            Calibration features. None = use training data (LOO mode).
+        y : array-like or None
+            Calibration labels. None = use training labels.
+            Ignored when X is None.
+        perturbation_fn : callable or None
+            CHANGED signature: (X_batch, y_batch, rng, positions) -> X_perturbed.
+ 
+            Called once per batch (previously once per replicate, which
+            contradicted the documented `X_batch` contract and made GPU
+            re-embedding of a large calibration set an OOM risk).
+ 
+            - X_batch  : (batch_size, n_features_in_) clean query features
+            - y_batch  : original labels for the batch
+            - rng      : np.random.Generator
+            - positions: integer row positions of the batch within the
+                         calibration matrix — the *training* matrix in LOO
+                         mode. Use these to index auxiliary per-sample data
+                         the classifier never sees.
+ 
+            Must return (batch_size, n_features_in_). The return may be
+            generated from any upstream representation; it does not have to
+            be a transform of X_batch. A pipeline that perturbs in a
+            different space, re-embeds, and re-normalizes is expressible
+            here — ignore X_batch and rebuild the batch from `positions`.
+        n_replicates : int, default=10
+            Number of independent perturbation draws per sample.
+        n_per_class : int or None
+            Max calibration samples per class for balance, resampled each
+            replicate. None = use all available samples.
+        min_positives : int, default=20
+            Classes with fewer calibration positives use the fallback
+            threshold. NOTE: counts rows pooled across replicates, not
+            distinct samples. With n_replicates=10 a class holding 3
+            samples contributes 30 rows and clears a threshold of 20 on an
+            effective n of 3. Set min_positives relative to n_replicates,
+            and read class_is_calibrated_ alongside per-class counts.
+        n_grid : int, default=101
+            Threshold grid resolution (0.0 to 1.0 inclusive). Note that with
+            small n_neighbors the vote share is quantized to ~n_neighbors
+            levels, so grid resolution far finer than 1/n_neighbors is wasted.
+        objective : {"f1", "precision_target"}, default="f1"
+            CHANGED (new). What the per-class threshold optimizes.
+            "f1" weights precision and recall equally — usually NOT what a
+            reject option is for. "precision_target" maximizes recall subject
+            to a per-class precision floor, which is the objective that yields
+            a stateable guarantee. See _calibrate_thresholds.
+        target_precision : float, default=0.95
+            CHANGED (new). Precision floor when objective="precision_target".
+        random_state : int or None
+            Seed for RNG (balance sampling + perturbation).
+ 
+        Returns
+        -------
+        self
+        """
+        check_is_fitted(self, ["_nn_index", "_knn"])
+        rng = np.random.default_rng(random_state)
+ 
+        if X is None and y is None:
+            X_cal = self._X_fit
+            y_cal = self._y_fit
+            y_codes_cal = self._y_codes
+            loo_mode = True
+            logger.info("KNeighborsThresholdClassifier.calibrate | LOO mode")
+        elif X is not None and y is not None:
+            X_cal = check_array(X)
+            y_cal = np.asarray(y)
+            cat = pd.Categorical(y_cal, categories=self.classes_)
+            y_codes_cal = cat.codes.copy().astype(np.int32)
+            if (y_codes_cal == -1).any():
+                unknown = set(y_cal[y_codes_cal == -1])
+                raise ValueError(
+                    f"Calibration set contains classes not seen during fit: {unknown}"
+                )
+            loo_mode = False
+            logger.warning(
+                f"KNeighborsThresholdClassifier.calibrate | external mode, "
+                f"n_cal={X_cal.shape[0]} | self-matches are NOT excluded. If "
+                f"these samples are also in the training set, use LOO mode "
+                f"(X=None, y=None) or thresholds will calibrate against "
+                f"near-zero-distance self neighbors."
+            )
+        else:
+            raise ValueError(
+                "Provide both X and y for external calibration, "
+                "or neither for LOO."
+            )
+ 
+        if perturbation_fn is None and n_replicates > 1:
+            logger.warning(
+                "No perturbation_fn; replicates are identical. "
+                "Consider n_replicates=1."
+            )
+ 
+        n_cal = X_cal.shape[0]
+        all_true_codes = []
+        all_predicted_codes = []
+        all_max_proba = []
+ 
+        for rep in range(n_replicates):
+            if n_per_class is not None:
+                sample_idx = self._balanced_sample(y_codes_cal, n_per_class, rng)
+            else:
+                sample_idx = np.arange(n_cal)
+ 
+            # CHANGED: perturbation now happens inside the batch loop, and the
+            # batch's row positions are handed to the callback.
+            for start in range(0, len(sample_idx), self.calibration_batch_size):
+                positions = sample_idx[start : start + self.calibration_batch_size]
+                X_batch = X_cal[positions]
+                self_pos_batch = positions if loo_mode else None
+ 
+                if perturbation_fn is not None:
+                    X_batch = perturbation_fn(
+                        X_batch, y_cal[positions], rng, positions,
+                    )
+                    X_batch = check_array(X_batch)
+                    if X_batch.shape != (len(positions), self.n_features_in_):
+                        raise ValueError(
+                            f"perturbation_fn returned {X_batch.shape}; expected "
+                            f"{(len(positions), self.n_features_in_)}"
+                        )
+ 
+                graph = self._neighbor_graph(X_batch, self_positions=self_pos_batch)
+                proba = self._knn.predict_proba(graph)
+ 
+                all_true_codes.append(y_codes_cal[positions])
+                all_predicted_codes.append(np.argmax(proba, axis=1))
+                all_max_proba.append(np.max(proba, axis=1))
+ 
+            logger.info(
+                f"KNeighborsThresholdClassifier.calibrate | "
+                f"replicate {rep + 1}/{n_replicates} complete"
+            )
+ 
+        # CHANGED: cache the pooled calibration predictions. Generating them
+        # is the entire cost when perturbation_fn re-embeds; fitting thresholds
+        # from them is milliseconds. See refit_thresholds.
+        self.calibration_record_ = dict(
+            true_codes=np.concatenate(all_true_codes),
+            predicted_codes=np.concatenate(all_predicted_codes),
+            max_probability=np.concatenate(all_max_proba),
+        )
+        return self.refit_thresholds(
+            objective=objective,
+            target_precision=target_precision,
+            min_positives=min_positives,
+            n_grid=n_grid,
+        )
+ 
+    # ---- refit_thresholds ---------------------------------------------------
+    def refit_thresholds(
+        self,
+        objective="f1",
+        target_precision=0.95,
+        min_positives=20,
+        n_grid=101,
+    ):
+        """
+        CHANGED (new method). Re-derive per-class thresholds from the stored
+        calibration record, without repeating the perturbation pass.
+ 
+        Lets objectives be compared for free once calibrate() has run once.
+ 
+        Parameters
+        ----------
+        objective : {"f1", "precision_target"}, default="f1"
+        target_precision : float, default=0.95
+        min_positives : int, default=20
+        n_grid : int, default=101
+ 
+        Returns
+        -------
+        self
+        """
+        if getattr(self, "calibration_record_", None) is None:
+            raise ValueError("No calibration record — call calibrate() first.")
+        record = self.calibration_record_
+ 
+        (
+            self._code_to_threshold,
+            self.fallback_threshold_,
+            self.class_is_calibrated_,
+            self.class_meets_precision_target_,
+        ) = self._calibrate_thresholds(
+            record["true_codes"],
+            record["predicted_codes"],
+            record["max_probability"],
+            min_positives=min_positives,
+            n_grid=n_grid,
+            objective=objective,
+            target_precision=target_precision,
+        )
+ 
+        self.class_to_threshold = pd.Series(
+            self._code_to_threshold, index=self.classes_, name="threshold",
+        )
+        self.calibration_objective_ = objective
+        self.is_calibrated = True
+ 
+        message = (
+            f"KNeighborsThresholdClassifier.refit_thresholds | "
+            f"objective={objective} | calibrated "
+            f"{int(self.class_is_calibrated_.sum())}/{self.n_classes_} classes "
+            f"directly; fallback={self.fallback_threshold_:.3f}"
+        )
+        if objective == "precision_target":
+            message += (
+                f"; {int(self.class_meets_precision_target_.sum())}"
+                f"/{int(self.class_is_calibrated_.sum())} calibrated classes reached "
+                f"precision>={target_precision:.2f} (rest kept F1-optimal)"
+            )
+        logger.info(message)
+        return self
+ 
+    # ---- score --------------------------------------------------------------
+    def score(self, X, y):
+        """
+        Compute macro-F1 score.
+ 
+        If calibrated, uses rejection-aware scoring: predictions below
+        the class threshold are rejected (cost recall, not precision).
+        If not calibrated, uses standard macro-F1.
+ 
+        CHANGED: the macro average now spans only classes present in y.
+        Averaging over all fitted classes made the score depend on how many
+        classes happen to be absent from the evaluation slice, which is not
+        a property of the model.
+        """
+        check_is_fitted(self, ["_knn", "_nn_index"])
+        X, y = check_X_y(X, y)
+ 
+        graph = self._neighbor_graph(X)
+        proba = self._knn.predict_proba(graph)
+        predicted_codes = np.argmax(proba, axis=1)
+        max_probability = np.max(proba, axis=1)
+ 
+        cat = pd.Categorical(y, categories=self.classes_)
+        true_codes = cat.codes.copy().astype(np.int32)
+        if (true_codes == -1).any():
+            raise ValueError("y contains classes not seen during fit")
+        labels = np.unique(true_codes)
+ 
+        if self.is_calibrated:
+            return self._score_with_rejection(
+                true_codes, predicted_codes, max_probability, labels,
+            )
+        return self._macro_f1(true_codes, predicted_codes, labels)
+ 
+    # ---- private helpers ----------------------------------------------------
+    def _neighbor_graph(self, X_query, self_positions=None):
+        """
+        Build sparse (n_query, n_train) distance graph.
+ 
+        CHANGED: self-exclusion is vectorized. The previous per-query Python
+        loop dominated calibration cost once queries reached ~1e5 rows. The
+        redundant re-sort is also gone: kneighbors returns ascending
+        distances and dropping one column preserves that order, which is
+        what sklearn's precomputed-graph path requires.
+        """
+        n_train = self._X_fit.shape[0]
+        n_query = X_query.shape[0]
+        k = self.n_neighbors
+ 
+        extra = int(self_positions is not None)
+        distances, indices = self._nn_index.kneighbors(
+            X_query, n_neighbors=k + extra,
+        )
+ 
+        if extra:
+            is_self = indices == np.asarray(self_positions)[:, None]
+            # self-match outside the k+1 window: drop the farthest instead
+            is_self[~is_self.any(axis=1), -1] = True
+            distances = distances[~is_self].reshape(n_query, k)
+            indices = indices[~is_self].reshape(n_query, k)
+ 
+        indptr = np.arange(0, (n_query + 1) * k, k)
+        return sps.csr_matrix(
+            (distances.ravel(), indices.ravel(), indptr),
+            shape=(n_query, n_train),
+        )
+ 
+    def _balanced_sample(self, y_codes, n_per_class, rng):
+        """Sample up to n_per_class from each class."""
+        indices = []
+        for c in range(self.n_classes_):
+            class_idx = np.where(y_codes == c)[0]
+            if len(class_idx) == 0:
+                continue
+            n_take = min(len(class_idx), n_per_class)
+            indices.append(rng.choice(class_idx, size=n_take, replace=False))
+        return np.concatenate(indices)
+ 
+    def _calibrate_thresholds(
+        self, true_codes, predicted_codes, max_probability,
+        min_positives, n_grid, objective="f1", target_precision=0.95,
+    ):
+        """
+        Per-class threshold on a grid.
+ 
+        objective="f1"
+            Threshold maximizing per-class F1, ties breaking toward the higher
+            (more conservative) threshold. Weights precision and recall
+            equally, which is usually not what a reject option is for.
+        objective="precision_target"
+            Smallest threshold whose per-class precision reaches
+            target_precision — i.e. maximize recall subject to a precision
+            floor. Classes that cannot reach the target at any threshold keep
+            their F1-optimal threshold and are flagged in the returned
+            meets_target mask; this is what prevents the degenerate
+            "reject everything for perfect precision" solution.
+ 
+        CHANGED: vectorized over the grid and restricted to rows predicted as
+        the class. The previous nested loop was O(n_classes * n_grid * n_rows)
+        full-array boolean passes — for a few hundred classes and ~1e5
+        pooled calibration rows that is billions of element operations.
+ 
+        Returns
+        -------
+        code_to_threshold : ndarray of shape (n_classes,)
+        fallback : float
+        is_calibrated : ndarray of bool, shape (n_classes,)
+            CHANGED: an explicit mask. Counting directly-calibrated classes
+            as (threshold != fallback) silently undercounts whenever a real
+            threshold happens to equal the fallback value.
+        meets_target : ndarray of bool, shape (n_classes,)
+            True where objective="precision_target" was satisfiable.
+            All False when objective="f1".
+        """
+        if objective not in ("f1", "precision_target"):
+            raise ValueError(
+                f"objective must be 'f1' or 'precision_target'; got {objective!r}"
+            )
+ 
+        grid = np.linspace(0.0, 1.0, n_grid)
+        code_to_threshold = np.full(self.n_classes_, np.nan)
+        meets_target = np.zeros(self.n_classes_, dtype=bool)
+ 
+        for c in range(self.n_classes_):
+            is_positive = true_codes == c
+            n_positives = int(is_positive.sum())
+            if n_positives < min_positives:
+                continue
+ 
+            is_predicted = predicted_codes == c
+            # (n_grid, n_predicted_as_c)
+            keep = max_probability[is_predicted][None, :] >= grid[:, None]
+            positive_predicted = is_positive[is_predicted][None, :]
+ 
+            tp = (keep & positive_predicted).sum(axis=1)
+            fp = (keep & ~positive_predicted).sum(axis=1)
+            fn = n_positives - tp
+            f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+            # reversed argmax => highest threshold among ties
+            threshold_f1 = grid[n_grid - 1 - int(np.argmax(f1[::-1]))]
+ 
+            if objective == "f1":
+                code_to_threshold[c] = threshold_f1
+                continue
+ 
+            predicted_positive = tp + fp
+            precision = np.divide(
+                tp, predicted_positive,
+                out=np.zeros(n_grid, dtype=np.float64),
+                where=predicted_positive > 0,
+            )
+            feasible = (precision >= target_precision) & (tp > 0)
+            if feasible.any():
+                # first True on an ascending grid = smallest feasible threshold
+                # = maximum recall subject to the precision floor
+                code_to_threshold[c] = grid[int(np.argmax(feasible))]
+                meets_target[c] = True
+            else:
+                code_to_threshold[c] = threshold_f1
+ 
+        is_calibrated = np.isfinite(code_to_threshold)
+        if is_calibrated.any():
+            fallback = float(np.nanmedian(code_to_threshold))
+        else:
+            fallback = 0.5
+            logger.warning(
+                f"No class reached min_positives={min_positives}; every "
+                f"threshold falls back to {fallback}."
+            )
+ 
+        code_to_threshold = np.where(is_calibrated, code_to_threshold, fallback)
+        return code_to_threshold, fallback, is_calibrated, meets_target
+ 
+    def _score_with_rejection(
+        self, true_codes, predicted_codes, max_probability, labels,
+    ):
+        """Rejection-aware macro-F1. CHANGED: bincount instead of a class loop."""
+        passed = max_probability >= self._code_to_threshold[predicted_codes]
+        assigned = predicted_codes[passed]
+        is_correct = assigned == true_codes[passed]
+ 
+        tp = np.bincount(assigned[is_correct], minlength=self.n_classes_)
+        predicted_positive = np.bincount(assigned, minlength=self.n_classes_)
+        actual_positive = np.bincount(true_codes, minlength=self.n_classes_)
+ 
+        fp = predicted_positive - tp
+        fn = actual_positive - tp
+        f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+        return float(f1[labels].mean())
+ 
+    def _macro_f1(self, true_codes, predicted_codes, labels):
+        """
+        Standard macro-F1 without rejection.
+ 
+        CHANGED: bincount instead of a class loop; no longer a staticmethod
+        since it needs n_classes_ for the bincount width.
+        """
+        is_correct = predicted_codes == true_codes
+        tp = np.bincount(predicted_codes[is_correct], minlength=self.n_classes_)
+        predicted_positive = np.bincount(predicted_codes, minlength=self.n_classes_)
+        actual_positive = np.bincount(true_codes, minlength=self.n_classes_)
+ 
+        fp = predicted_positive - tp
+        fn = actual_positive - tp
+        f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+        return float(f1[labels].mean())
